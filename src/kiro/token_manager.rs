@@ -502,6 +502,70 @@ pub(crate) async fn get_usage_limits(
     Ok(data)
 }
 
+/// 获取凭据可用的模型列表
+pub(crate) async fn fetch_available_models(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<crate::kiro::model::available_models::ListAvailableModelsResponse> {
+    let machine_id = machine_id::generate_from_credentials(credentials, config)
+        .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
+    let endpoint = endpoint_for_credentials(credentials, config)?;
+    let ctx = RequestContext {
+        credentials,
+        token,
+        machine_id: &machine_id,
+        config,
+    };
+
+    let host = format!(
+        "q.{}.amazonaws.com",
+        credentials.effective_api_region(config)
+    );
+    let mut url = format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host);
+
+    // Social 认证需要 profileArn，IdC 不需要
+    if !matches!(
+        credentials.auth_method.as_deref(),
+        Some("builder-id") | Some("idc")
+    ) {
+        if let Some(arn) = credentials.profile_arn.as_deref() {
+            url.push_str(&format!("&profileArn={}", urlencoding::encode(arn)));
+        }
+    }
+
+    let usage = endpoint.usage_request_parts(&ctx)?;
+    let client = build_client(proxy, 30, config.tls_backend)?;
+    let mut request = client.get(&url);
+    for (name, value) in usage.headers {
+        request = request.header(name, value);
+    }
+
+    let response = request.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        bail!(
+            "ListAvailableModels 失败: {} {}",
+            status,
+            &body_text[..body_text.len().min(200)]
+        );
+    }
+
+    let body_text = response.text().await?;
+    let data: crate::kiro::model::available_models::ListAvailableModelsResponse =
+        serde_json::from_str(&body_text).map_err(|e| {
+            tracing::error!(
+                "ListAvailableModels JSON 解析失败: {}，原始响应前200字符: {}",
+                e,
+                &body_text[..body_text.len().min(200)]
+            );
+            anyhow::anyhow!("JSON 解析失败: {}", e)
+        })?;
+    Ok(data)
+}
+
 // ============================================================================
 // 多凭据 Token 管理器
 // ============================================================================
@@ -714,6 +778,8 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 模型注册表（用于按模型过滤候选凭据，实现模型级凭据亲和性）
+    model_registry: RwLock<Option<Arc<crate::kiro::model_registry::ModelRegistry>>>,
 }
 
 /// 凭据可用性诊断：被禁用的凭据
@@ -940,6 +1006,7 @@ impl MultiTokenManager {
             background_refresher: None,
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            model_registry: RwLock::new(None),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -1159,8 +1226,23 @@ impl MultiTokenManager {
     /// 如果 Token 过期或即将过期，会自动刷新
     /// Token 刷新失败时会尝试下一个可用凭据（不计入失败次数）
     pub async fn acquire_context(&self) -> anyhow::Result<CallContext> {
+        self.acquire_context_for_model(None).await
+    }
+
+    /// 与 `acquire_context` 相同，但可按模型限定候选凭据范围。
+    ///
+    /// `model_id` 为上游真实 modelId（点号格式）。当 registry 中存在
+    /// 声明支持该模型的凭据时，候选集合会被收窄到这些凭据；否则退化为
+    /// 全量候选（见 `model_credential_whitelist`）。
+    pub async fn acquire_context_for_model(
+        &self,
+        model_id: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
         // 检查是否需要自动恢复
         self.check_and_recover();
+
+        // 模型级凭据白名单（None 表示不过滤）
+        let model_whitelist = self.model_credential_whitelist(model_id);
 
         let total = self.total_count();
         let mut tried_ids: Vec<u64> = Vec::new();
@@ -1180,7 +1262,18 @@ impl MultiTokenManager {
             //
             // 这里用 available_count() 判断“可用集合是否已被尝试完”，避免误报
             // "所有凭据均已禁用（x/y）" 这类与事实不符的错误。
-            let enabled_total = self.available_count();
+            // 模型白名单生效时，"可用集合"收窄为白名单内的未禁用凭据，
+            // 否则退出条件会用全量计数，导致白名单内凭据全冷却时无法正确触发等待。
+            let enabled_total = match model_whitelist.as_ref() {
+                Some(w) => {
+                    let entries = self.entries.lock();
+                    entries
+                        .iter()
+                        .filter(|e| !e.disabled && w.contains(&e.id))
+                        .count()
+                }
+                None => self.available_count(),
+            };
             if enabled_total > 0 && tried_ids.len() >= enabled_total {
                 if let Some(wait) = min_wait {
                     // 仅当本轮所有被跳过的凭据都因冷却/限流时，才以 429 + Retry-After 快速返回；
@@ -1281,9 +1374,13 @@ impl MultiTokenManager {
             let candidate_infos: Vec<(u64, u32, bool)> = {
                 let mut entries = self.entries.lock();
 
+                // 候选过滤：未禁用 + 本轮未尝试 + （若有模型白名单）在白名单内
+                let in_whitelist =
+                    |id: u64| model_whitelist.as_ref().is_none_or(|w| w.contains(&id));
+
                 let mut candidates: Vec<(u64, u32, bool)> = entries
                     .iter()
-                    .filter(|e| !e.disabled && !tried_ids.contains(&e.id))
+                    .filter(|e| !e.disabled && !tried_ids.contains(&e.id) && in_whitelist(e.id))
                     .map(|e| (e.id, e.credentials.priority, e.credentials.runtime_only))
                     .collect();
 
@@ -1307,7 +1404,7 @@ impl MultiTokenManager {
 
                     candidates = entries
                         .iter()
-                        .filter(|e| !e.disabled && !tried_ids.contains(&e.id))
+                        .filter(|e| !e.disabled && !tried_ids.contains(&e.id) && in_whitelist(e.id))
                         .map(|e| (e.id, e.credentials.priority, e.credentials.runtime_only))
                         .collect();
                 }
@@ -1406,14 +1503,22 @@ impl MultiTokenManager {
     ///
     /// 如果用户已绑定凭据且该凭据可用，优先使用绑定的凭据
     /// 否则使用默认的 acquire_context() 逻辑并建立新绑定
+    ///
+    /// `model_id` 为上游真实 modelId：用于模型级凭据过滤。当用户绑定的
+    /// 凭据不支持当前模型时，跳过亲和绑定，改由 `acquire_context_for_model`
+    /// 在支持该模型的凭据中重新选择。
     pub async fn acquire_context_for_user(
         &self,
         user_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> anyhow::Result<CallContext> {
+        // 模型级凭据白名单（None 表示不过滤）
+        let model_whitelist = self.model_credential_whitelist(model_id);
+
         // 无 user_id 时走默认逻辑
         let user_id = match user_id {
             Some(id) if !id.is_empty() => id,
-            _ => return self.acquire_context().await,
+            _ => return self.acquire_context_for_model(model_id).await,
         };
 
         // 默认保持用户绑定（用于连续对话）。当绑定凭据“临时不可用”（速率限制/短冷却）时，
@@ -1421,10 +1526,13 @@ impl MultiTokenManager {
         let mut keep_affinity_binding = false;
 
         if let Some(bound_id) = self.affinity.get(user_id) {
+            // 绑定凭据需同时满足：未禁用 + 在模型白名单内（白名单为 None 时不约束）
             let is_enabled = {
                 let entries = self.entries.lock();
                 entries.iter().any(|e| e.id == bound_id && !e.disabled)
-            };
+            } && model_whitelist
+                .as_ref()
+                .is_none_or(|w| w.contains(&bound_id));
 
             if is_enabled {
                 if let Some((reason, remaining)) = self.cooldown_manager.check_cooldown(bound_id) {
@@ -1498,7 +1606,7 @@ impl MultiTokenManager {
             }
         }
 
-        let ctx = self.acquire_context().await?;
+        let ctx = self.acquire_context_for_model(model_id).await?;
         if !keep_affinity_binding {
             self.affinity.set(user_id, ctx.id);
         }
@@ -2361,6 +2469,119 @@ impl MultiTokenManager {
         );
 
         success_count
+    }
+
+    /// 设置模型注册表引用（用于按模型过滤候选凭据）
+    pub fn set_model_registry(
+        &self,
+        registry: Arc<crate::kiro::model_registry::ModelRegistry>,
+    ) {
+        *self.model_registry.write() = Some(registry);
+    }
+
+    /// 计算指定模型的"凭据白名单"
+    ///
+    /// 返回 `Some(set)` 表示该模型由 registry 中这些凭据支持，候选过滤时
+    /// 只应在这些凭据里挑选；返回 `None` 表示不施加模型过滤（registry 未就绪、
+    /// 或无任何凭据声明支持该模型——此时退化为原有的全量候选逻辑，
+    /// 避免因 registry 数据不全而把请求全部挡死）。
+    fn model_credential_whitelist(
+        &self,
+        model_id: Option<&str>,
+    ) -> Option<std::collections::HashSet<u64>> {
+        let model_id = model_id?;
+        let guard = self.model_registry.read();
+        let registry = guard.as_ref()?;
+        let supporting = registry.credentials_supporting(model_id);
+        if supporting.is_empty() {
+            None
+        } else {
+            Some(supporting.into_iter().collect())
+        }
+    }
+
+    /// 初始化模型注册表：为每个启用的凭据拉取可用模型列表
+    pub async fn initialize_model_registry(
+        &self,
+        registry: &crate::kiro::model_registry::ModelRegistry,
+    ) -> usize {
+        let credential_ids: Vec<u64> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .map(|e| e.id)
+                .collect()
+        };
+
+        if credential_ids.is_empty() {
+            return 0;
+        }
+
+        tracing::info!(
+            "正在拉取 {} 个凭据的可用模型列表...",
+            credential_ids.len()
+        );
+
+        let mut success_count = 0;
+
+        for (index, &id) in credential_ids.iter().enumerate() {
+            let result = self.fetch_models_for(id).await;
+            match result {
+                Ok(resp) => {
+                    let count = resp.models.len();
+                    registry.update_credential(id, resp.models);
+                    tracing::info!("凭据 #{} 模型列表拉取成功: {} 个模型", id, count);
+                    success_count += 1;
+                }
+                Err(e) => {
+                    tracing::warn!("凭据 #{} 模型列表拉取失败: {}", id, e);
+                }
+            }
+
+            if index < credential_ids.len() - 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }
+
+        tracing::info!(
+            "模型列表初始化完成: {}/{} 成功",
+            success_count,
+            credential_ids.len()
+        );
+
+        success_count
+    }
+
+    /// 为指定凭据拉取可用模型列表
+    async fn fetch_models_for(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<crate::kiro::model::available_models::ListAvailableModelsResponse> {
+        let config = self.config.read().clone();
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        let token = if credentials.is_api_key_credential() {
+            credentials
+                .kiro_api_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("凭据无 kiroApiKey"))?
+        } else {
+            credentials
+                .access_token
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("凭据 #{} 无有效 access_token", id))?
+        };
+
+        let proxy = self.proxy.read().clone();
+        fetch_available_models(&credentials, &config, &token, proxy.as_ref()).await
     }
 
     // ========================================================================
@@ -3635,7 +3856,7 @@ mod tests {
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
         let first = manager
-            .acquire_context_for_user(Some("user-a"))
+            .acquire_context_for_user(Some("user-a"), None)
             .await
             .unwrap();
         assert_eq!(first.id, 1);
@@ -3647,21 +3868,21 @@ mod tests {
         );
 
         let diverted = manager
-            .acquire_context_for_user(Some("user-a"))
+            .acquire_context_for_user(Some("user-a"), None)
             .await
             .unwrap();
         assert_eq!(diverted.id, 2);
 
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let while_cooling = manager
-            .acquire_context_for_user(Some("user-a"))
+            .acquire_context_for_user(Some("user-a"), None)
             .await
             .unwrap();
         assert_eq!(while_cooling.id, 2);
 
         tokio::time::sleep(std::time::Duration::from_millis(220)).await;
         let rebound = manager
-            .acquire_context_for_user(Some("user-a"))
+            .acquire_context_for_user(Some("user-a"), None)
             .await
             .unwrap();
         assert_eq!(rebound.id, 1);
@@ -3879,5 +4100,87 @@ mod tests {
 
         manager.update_default_endpoint("ide".to_string());
         assert_eq!(manager.config().default_endpoint, "ide");
+    }
+
+    // ========================================================================
+    // Phase 7: 模型级凭据亲和性
+    // ========================================================================
+
+    /// 构造一个仅含指定 modelId 的上游模型条目
+    fn model_entry(id: &str) -> crate::kiro::model::available_models::AvailableModelEntry {
+        crate::kiro::model::available_models::AvailableModelEntry {
+            model_id: id.to_string(),
+            model_name: None,
+            description: None,
+            rate_multiplier: None,
+            rate_unit: None,
+            token_limits: None,
+            supported_input_types: None,
+            prompt_caching: None,
+            model_provider: None,
+            status: None,
+            available_origins: None,
+            additional_model_request_fields_schema: None,
+        }
+    }
+
+    /// 两个凭据各支持不同模型时，acquire_context_for_model 只命中支持该模型的凭据
+    #[tokio::test]
+    async fn test_acquire_context_for_model_filters_by_model_support() {
+        let config = Config::default();
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        // 凭据 #1 支持 model-a，凭据 #2 支持 model-b
+        let registry = Arc::new(crate::kiro::model_registry::ModelRegistry::new());
+        registry.update_credential(1, vec![model_entry("model-a")]);
+        registry.update_credential(2, vec![model_entry("model-b")]);
+        manager.set_model_registry(registry);
+
+        // 指定 model-a：无论选多少次都只能命中凭据 #1
+        for _ in 0..5 {
+            let ctx = manager
+                .acquire_context_for_model(Some("model-a"))
+                .await
+                .unwrap();
+            assert_eq!(ctx.id, 1, "model-a 只应路由到凭据 #1");
+        }
+        // 指定 model-b：只能命中凭据 #2
+        for _ in 0..5 {
+            let ctx = manager
+                .acquire_context_for_model(Some("model-b"))
+                .await
+                .unwrap();
+            assert_eq!(ctx.id, 2, "model-b 只应路由到凭据 #2");
+        }
+    }
+
+    /// 没有任何凭据声明支持该模型时，退化为全量候选（不把请求挡死）
+    #[tokio::test]
+    async fn test_acquire_context_for_model_degrades_when_no_support() {
+        let config = Config::default();
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![cred1], None, None, false).unwrap();
+
+        let registry = Arc::new(crate::kiro::model_registry::ModelRegistry::new());
+        registry.update_credential(1, vec![model_entry("model-a")]);
+        manager.set_model_registry(registry);
+
+        // model-zzz 无凭据支持 → 白名单为 None → 退化为全量候选，仍能拿到 ctx
+        let ctx = manager
+            .acquire_context_for_model(Some("model-zzz"))
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 1);
     }
 }

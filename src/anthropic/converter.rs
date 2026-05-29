@@ -110,20 +110,6 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
-/// Agentic 模型专用系统提示
-///
-/// 指导模型在 agentic 模式下的行为：持续工作、自主决策、减少确认
-const KIRO_AGENTIC_SYSTEM_PROMPT: &str = "\
-You are an autonomous coding agent. Follow these principles:\n\
-1. Work continuously until the task is fully complete.\n\
-2. Use tools proactively without asking for permission.\n\
-3. When encountering errors, debug and fix them autonomously.\n\
-4. Break complex tasks into steps and execute them sequentially.\n\
-5. Verify your work by reading files after writing them.\n\
-6. Never ask the user for confirmation mid-task — just proceed.\n\
-7. If a tool call fails, try alternative approaches before giving up.\n\
-8. Prefer making changes directly over explaining what you would do.";
-
 fn non_empty_content_or_space(content: String, has_non_text_payload: bool) -> String {
     // 尽量保留真实结构，不在早期转换阶段为非文本载荷主动补 "."。
     // 含非文本载荷时保留原始文本，最终是否需要兜底由调用方决定。
@@ -144,55 +130,65 @@ fn count_images_in_content(content: &serde_json::Value) -> usize {
     }
 }
 
-/// Kiro 上游使用的规范模型 ID
-const KIRO_MODEL_SONNET_4_5: &str = "claude-sonnet-4.5";
-const KIRO_MODEL_SONNET_4_6: &str = "claude-sonnet-4.6";
-const KIRO_MODEL_OPUS_4_5: &str = "claude-opus-4.5";
-const KIRO_MODEL_OPUS_4_6: &str = "claude-opus-4.6";
-const KIRO_MODEL_OPUS_4_7: &str = "claude-opus-4.7";
-const KIRO_MODEL_HAIKU_4_5: &str = "claude-haiku-4.5";
+/// Kiro 上游使用的规范模型 ID（点号格式）
+/// 这些常量仅用于测试中的 legacy 兼容，实际映射由 normalize_version 通用处理
 
 fn normalize_model_name(model: &str) -> String {
-    let model = model.to_lowercase();
-    let model = model.strip_suffix("-thinking").unwrap_or(&model);
-    let model = model.strip_suffix("-agentic").unwrap_or(model);
-    model.to_string()
+    model.to_lowercase()
 }
 
-/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
+/// 模型映射：将客户端模型名映射到 Kiro 上游 modelId
 ///
-/// 映射规则：
-/// - sonnet 且包含 4.6/4-6 → claude-sonnet-4.6，否则 → claude-sonnet-4.5
-/// - opus 且包含 4.5/4-5 → claude-opus-4.5，包含 4.7/4-7 → claude-opus-4.7，否则 → claude-opus-4.6
-/// - 所有 haiku → claude-haiku-4.5
-/// - `-thinking` / `-agentic` 后缀会被剥离后再映射
-pub fn map_model(model: &str) -> Option<String> {
-    let normalized_model = normalize_model_name(model);
+/// 上游 `ListAvailableModels` 是唯一权威来源：
+/// - 有 registry：调用 `resolve_client_model` 反查上游真实 modelId
+///   （以客户端名比对上游 ID 的「原样」与「点号转横杠」两种形式）。
+///   上游没有的模型（含带日期的旧名 `claude-sonnet-4-5-20250929`）返回 None。
+/// - 无 registry（拉取失败 / 测试）：best effort，仅做 Claude 版本号
+///   横杠转点号，其余原样返回。
+pub fn map_model(
+    model: &str,
+    registry: Option<&crate::kiro::model_registry::ModelRegistry>,
+) -> Option<String> {
+    let normalized = normalize_model_name(model);
 
-    if normalized_model.contains("sonnet") {
-        if normalized_model.contains("4-6") || normalized_model.contains("4.6") {
-            Some(KIRO_MODEL_SONNET_4_6.to_string())
-        } else {
-            Some(KIRO_MODEL_SONNET_4_5.to_string())
-        }
-    } else if normalized_model.contains("opus") {
-        if normalized_model.contains("4-5") || normalized_model.contains("4.5") {
-            Some(KIRO_MODEL_OPUS_4_5.to_string())
-        } else if normalized_model.contains("4-7") || normalized_model.contains("4.7") {
-            Some(KIRO_MODEL_OPUS_4_7.to_string())
-        } else {
-            Some(KIRO_MODEL_OPUS_4_6.to_string())
-        }
-    } else if normalized_model.contains("haiku") {
-        Some(KIRO_MODEL_HAIKU_4_5.to_string())
-    } else {
-        None
+    if let Some(reg) = registry {
+        return reg.resolve_client_model(&normalized);
     }
+
+    // 无 registry 时 best effort：Claude 模型横杠版本号转点号，其余原样返回
+    Some(best_effort_claude_dotted(&normalized))
 }
 
-/// 判断模型名是否为 agentic 变体
-pub fn is_agentic_model(model: &str) -> bool {
-    model.to_lowercase().ends_with("-agentic")
+/// best effort：把 `claude-{family}-{major}-{minor}` 的版本号横杠转点号
+/// （仅用于无 registry 的兜底/测试，正常路径不会走到）
+fn best_effort_claude_dotted(model: &str) -> String {
+    if !model.starts_with("claude-") || model.contains('.') {
+        return model.to_string();
+    }
+    // 从右向左找 "-{minor}-? " 结构：family-major-minor
+    let bytes = model.as_bytes();
+    let mut i = model.len();
+    while i > 0 && bytes[i - 1].is_ascii_digit() {
+        i -= 1;
+    }
+    if i == 0 || i == model.len() || bytes[i - 1] != b'-' {
+        return model.to_string();
+    }
+    let minor_start = i;
+    let dash_pos = i - 1;
+    i = dash_pos;
+    while i > 0 && bytes[i - 1].is_ascii_digit() {
+        i -= 1;
+    }
+    if i == dash_pos || i == 0 || bytes[i - 1] != b'-' {
+        return model.to_string();
+    }
+    format!(
+        "{}-{}.{}",
+        &model[..i - 1],
+        &model[i..dash_pos],
+        &model[minor_start..]
+    )
 }
 
 /// 转换结果
@@ -204,6 +200,8 @@ pub struct ConversionResult {
     pub compression_stats: Option<CompressionStats>,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
+    /// 映射后的上游 modelId（点号格式），用于模型级凭据过滤
+    pub model_id: String,
 }
 
 /// 转换错误
@@ -334,9 +332,10 @@ fn create_placeholder_tool(name: &str) -> KiroTool {
 pub fn convert_request(
     req: &MessagesRequest,
     compression_config: &CompressionConfig,
+    model_registry: Option<&crate::kiro::model_registry::ModelRegistry>,
 ) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
-    let model_id = map_model(&req.model)
+    let model_id = map_model(&req.model, model_registry)
         .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
 
     // 2. 检查消息列表
@@ -435,7 +434,6 @@ pub fn convert_request(
             model_id: &model_id,
             compression_config,
             total_image_count,
-            is_agentic: is_agentic_model(&req.model),
             remaining_image_budget: &mut remaining_image_budget,
             tool_name_map: &mut tool_name_map,
         },
@@ -576,6 +574,7 @@ pub fn convert_request(
         conversation_state,
         compression_stats,
         tool_name_map,
+        model_id,
     })
 }
 
@@ -1025,7 +1024,7 @@ fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
                 .unwrap_or("high");
             // 白名单归一化：仅接受 low/medium/high，非法值回退 high
             let effort = match raw_effort {
-                "low" | "medium" | "high" => raw_effort,
+                "low" | "medium" | "high" | "xhigh" | "max" => raw_effort,
                 _ => {
                     tracing::warn!("未知的 thinking effort 值 '{}', 回退为 'high'", raw_effort);
                     "high"
@@ -1056,7 +1055,6 @@ struct BuildHistoryContext<'a> {
     model_id: &'a str,
     compression_config: &'a CompressionConfig,
     total_image_count: usize,
-    is_agentic: bool,
     remaining_image_budget: &'a mut usize,
     tool_name_map: &'a mut HashMap<String, String>,
 }
@@ -1072,7 +1070,6 @@ fn build_history(
         model_id,
         compression_config,
         total_image_count,
-        is_agentic,
         remaining_image_budget,
         tool_name_map,
     } = ctx;
@@ -1133,16 +1130,6 @@ fn build_history(
         history.push(Message::User(user_msg));
 
         let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
-        history.push(Message::Assistant(assistant_msg));
-    }
-
-    // Agentic 模型：追加专用系统提示
-    if is_agentic {
-        let user_msg = HistoryUserMessage::new(KIRO_AGENTIC_SYSTEM_PROMPT, model_id);
-        history.push(Message::User(user_msg));
-
-        let assistant_msg =
-            HistoryAssistantMessage::new("I will work autonomously following these principles.");
         history.push(Message::Assistant(assistant_msg));
     }
 
@@ -1474,145 +1461,119 @@ mod tests {
     use super::*;
     use crate::model::config::CompressionConfig;
 
-    #[test]
-    fn test_map_model_sonnet() {
-        assert_eq!(
-            map_model("claude-sonnet-4-20250514").unwrap(),
-            KIRO_MODEL_SONNET_4_5
-        );
-        assert_eq!(
-            map_model("claude-3-5-sonnet-20241022").unwrap(),
-            KIRO_MODEL_SONNET_4_5
-        );
-        assert_eq!(
-            map_model("claude-sonnet-4-6").unwrap(),
-            KIRO_MODEL_SONNET_4_6
-        );
-        assert_eq!(
-            map_model("claude-sonnet-4.6").unwrap(),
-            KIRO_MODEL_SONNET_4_6
-        );
+    const KIRO_MODEL_SONNET_4_6: &str = "claude-sonnet-4.6";
+    const KIRO_MODEL_OPUS_4_5: &str = "claude-opus-4.5";
+    const KIRO_MODEL_OPUS_4_8: &str = "claude-opus-4.8";
+
+    /// 构造一个带固定上游模型集合的 registry，模拟 ListAvailableModels 返回
+    fn test_registry() -> crate::kiro::model_registry::ModelRegistry {
+        use crate::kiro::model::available_models::AvailableModelEntry;
+        let ids = [
+            "auto",
+            "claude-opus-4.8",
+            "claude-opus-4.5",
+            "claude-sonnet-4.6",
+            "claude-haiku-4.5",
+            "deepseek-3.2",
+            "minimax-m2.1",
+            "glm-5",
+        ];
+        let models = ids
+            .iter()
+            .map(|id| AvailableModelEntry {
+                model_id: id.to_string(),
+                model_name: None,
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                token_limits: None,
+                supported_input_types: None,
+                prompt_caching: None,
+                model_provider: None,
+                status: None,
+                available_origins: None,
+                additional_model_request_fields_schema: None,
+            })
+            .collect();
+        let reg = crate::kiro::model_registry::ModelRegistry::new();
+        reg.update_credential(1, models);
+        reg
     }
 
     #[test]
-    fn test_map_model_opus() {
+    fn test_map_model_claude_dash_to_dot() {
+        let reg = test_registry();
+        // 横杠版本号 → 上游点号 modelId
         assert_eq!(
-            map_model("claude-opus-4-20250514").unwrap(),
-            KIRO_MODEL_OPUS_4_6
+            map_model("claude-opus-4-8", Some(&reg)).unwrap(),
+            KIRO_MODEL_OPUS_4_8
         );
         assert_eq!(
-            map_model("claude-opus-4-20260206").unwrap(),
-            KIRO_MODEL_OPUS_4_6
-        );
-        assert_eq!(
-            map_model("claude-opus-4-5-20250514").unwrap(),
+            map_model("claude-opus-4-5", Some(&reg)).unwrap(),
             KIRO_MODEL_OPUS_4_5
         );
-        assert_eq!(map_model("claude-opus-4.5").unwrap(), KIRO_MODEL_OPUS_4_5);
-        assert_eq!(map_model("claude-opus-4-6").unwrap(), KIRO_MODEL_OPUS_4_6);
-        assert_eq!(map_model("claude-opus-4-7").unwrap(), KIRO_MODEL_OPUS_4_7);
-        assert_eq!(map_model("claude-opus-4.7").unwrap(), KIRO_MODEL_OPUS_4_7);
+        assert_eq!(
+            map_model("claude-sonnet-4-6", Some(&reg)).unwrap(),
+            KIRO_MODEL_SONNET_4_6
+        );
+        // 已是点号也能命中
+        assert_eq!(
+            map_model("claude-opus-4.8", Some(&reg)).unwrap(),
+            KIRO_MODEL_OPUS_4_8
+        );
     }
 
     #[test]
-    fn test_map_model_haiku() {
+    fn test_map_model_non_claude_passthrough() {
+        let reg = test_registry();
+        // 非 Claude 模型原样匹配上游 ID
+        assert_eq!(map_model("deepseek-3.2", Some(&reg)).unwrap(), "deepseek-3.2");
+        assert_eq!(map_model("minimax-m2.1", Some(&reg)).unwrap(), "minimax-m2.1");
+        assert_eq!(map_model("glm-5", Some(&reg)).unwrap(), "glm-5");
+        assert_eq!(map_model("auto", Some(&reg)).unwrap(), "auto");
+        // 非 Claude 的横杠形式也能反查（deepseek-3-2 → deepseek-3.2）
+        assert_eq!(map_model("deepseek-3-2", Some(&reg)).unwrap(), "deepseek-3.2");
+    }
+
+    #[test]
+    fn test_map_model_dated_name_strips_to_upstream() {
+        let reg = test_registry();
+        // 带日期后缀的合法名：剥日期后能反查到上游 modelId
+        // claude-haiku-4-5-20251001 → claude-haiku-4-5 → claude-haiku.4.5
         assert_eq!(
-            map_model("claude-haiku-4-20250514").unwrap(),
-            KIRO_MODEL_HAIKU_4_5
+            map_model("claude-haiku-4-5-20251001", Some(&reg)).unwrap(),
+            "claude-haiku-4.5"
         );
         assert_eq!(
-            map_model("claude-haiku-4-5-20251001").unwrap(),
-            KIRO_MODEL_HAIKU_4_5
+            map_model("claude-opus-4-5-20251101", Some(&reg)).unwrap(),
+            "claude-opus-4.5"
         );
+    }
+
+    #[test]
+    fn test_map_model_dated_name_unsupported_when_version_absent() {
+        let reg = test_registry();
+        // 剥日期后的版本上游也没有（registry 无 sonnet-4.5、无 3.5-sonnet）→ None
+        assert!(map_model("claude-sonnet-4-5-20250929", Some(&reg)).is_none());
+        assert!(map_model("claude-3-5-sonnet-20241022", Some(&reg)).is_none());
     }
 
     #[test]
     fn test_map_model_unsupported() {
-        assert!(map_model("gpt-4").is_none());
+        let reg = test_registry();
+        assert!(map_model("gpt-4", Some(&reg)).is_none());
+        assert!(map_model("claude-opus-4-99", Some(&reg)).is_none());
     }
 
     #[test]
-    fn test_map_model_thinking_suffixes() {
+    fn test_map_model_no_registry_best_effort() {
+        // 无 registry：Claude 横杠版本号转点号，其余原样
         assert_eq!(
-            map_model("claude-sonnet-4-5-20250929-thinking"),
-            Some(KIRO_MODEL_SONNET_4_5.to_string())
+            map_model("claude-opus-4-8", None).unwrap(),
+            "claude-opus-4.8"
         );
-        assert_eq!(
-            map_model("claude-sonnet-4-6-thinking"),
-            Some(KIRO_MODEL_SONNET_4_6.to_string())
-        );
-        assert_eq!(
-            map_model("claude-opus-4-5-20251101-thinking"),
-            Some(KIRO_MODEL_OPUS_4_5.to_string())
-        );
-        assert_eq!(
-            map_model("claude-opus-4-6-thinking"),
-            Some(KIRO_MODEL_OPUS_4_6.to_string())
-        );
-        assert_eq!(
-            map_model("claude-opus-4-7-thinking"),
-            Some(KIRO_MODEL_OPUS_4_7.to_string())
-        );
-        assert_eq!(
-            map_model("claude-haiku-4-5-20251001-thinking"),
-            Some(KIRO_MODEL_HAIKU_4_5.to_string())
-        );
-    }
-
-    #[test]
-    fn test_map_model_agentic_suffixes() {
-        assert_eq!(
-            map_model("claude-sonnet-4-6-agentic"),
-            Some(KIRO_MODEL_SONNET_4_6.to_string())
-        );
-        assert_eq!(
-            map_model("claude-sonnet-4-5-20250929-agentic"),
-            Some(KIRO_MODEL_SONNET_4_5.to_string())
-        );
-        assert_eq!(
-            map_model("claude-opus-4-6-agentic"),
-            Some(KIRO_MODEL_OPUS_4_6.to_string())
-        );
-        assert_eq!(
-            map_model("claude-opus-4-7-agentic"),
-            Some(KIRO_MODEL_OPUS_4_7.to_string())
-        );
-        assert_eq!(
-            map_model("claude-opus-4-5-20251101-agentic"),
-            Some(KIRO_MODEL_OPUS_4_5.to_string())
-        );
-        assert_eq!(
-            map_model("claude-haiku-4-5-20251001-agentic"),
-            Some(KIRO_MODEL_HAIKU_4_5.to_string())
-        );
-    }
-
-    #[test]
-    fn test_map_model_versioned_entries_from_models_endpoint() {
-        let supported_models = [
-            ("claude-sonnet-4-6", KIRO_MODEL_SONNET_4_6),
-            ("claude-sonnet-4-6-thinking", KIRO_MODEL_SONNET_4_6),
-            ("claude-sonnet-4-6-agentic", KIRO_MODEL_SONNET_4_6),
-            ("claude-sonnet-4-5-20250929", KIRO_MODEL_SONNET_4_5),
-            ("claude-sonnet-4-5-20250929-thinking", KIRO_MODEL_SONNET_4_5),
-            ("claude-sonnet-4-5-20250929-agentic", KIRO_MODEL_SONNET_4_5),
-            ("claude-opus-4-5-20251101", KIRO_MODEL_OPUS_4_5),
-            ("claude-opus-4-5-20251101-thinking", KIRO_MODEL_OPUS_4_5),
-            ("claude-opus-4-5-20251101-agentic", KIRO_MODEL_OPUS_4_5),
-            ("claude-opus-4-6", KIRO_MODEL_OPUS_4_6),
-            ("claude-opus-4-6-thinking", KIRO_MODEL_OPUS_4_6),
-            ("claude-opus-4-6-agentic", KIRO_MODEL_OPUS_4_6),
-            ("claude-opus-4-7", KIRO_MODEL_OPUS_4_7),
-            ("claude-opus-4-7-thinking", KIRO_MODEL_OPUS_4_7),
-            ("claude-opus-4-7-agentic", KIRO_MODEL_OPUS_4_7),
-            ("claude-haiku-4-5-20251001", KIRO_MODEL_HAIKU_4_5),
-            ("claude-haiku-4-5-20251001-thinking", KIRO_MODEL_HAIKU_4_5),
-            ("claude-haiku-4-5-20251001-agentic", KIRO_MODEL_HAIKU_4_5),
-        ];
-
-        for (input, expected) in supported_models {
-            assert_eq!(map_model(input), Some(expected.to_string()), "{input}");
-        }
+        assert_eq!(map_model("deepseek-3.2", None).unwrap(), "deepseek-3.2");
+        assert_eq!(map_model("gpt-4", None).unwrap(), "gpt-4");
     }
 
     #[test]
@@ -1710,7 +1671,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req, &CompressionConfig::default()).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default(), None).unwrap();
 
         // 验证 tools 列表中包含了历史中使用的工具的占位符定义
         let tools = &result
@@ -1798,7 +1759,7 @@ mod tests {
             }),
         };
 
-        let result = convert_request(&req, &CompressionConfig::default()).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default(), None).unwrap();
         assert_eq!(
             result.conversation_state.conversation_id,
             "a0662283-7fd3-4399-a7eb-52b9a717ae88"
@@ -1826,7 +1787,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req, &CompressionConfig::default()).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default(), None).unwrap();
         // 验证生成的是有效的 UUID 格式
         assert_eq!(result.conversation_state.conversation_id.len(), 36);
         assert_eq!(
@@ -2278,7 +2239,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req, &CompressionConfig::default()).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default(), None).unwrap();
         let tools = &result
             .conversation_state
             .current_message
@@ -2337,7 +2298,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req, &CompressionConfig::default()).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default(), None).unwrap();
         let content = &result
             .conversation_state
             .current_message
@@ -2393,7 +2354,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req, &CompressionConfig::default()).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default(), None).unwrap();
 
         let mut found = false;
         for msg in &result.conversation_state.history {
@@ -2457,7 +2418,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req, &CompressionConfig::default()).unwrap();
+        let result = convert_request(&req, &CompressionConfig::default(), None).unwrap();
 
         // 孤立 tool_result 会被过滤
         assert!(
@@ -2631,7 +2592,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req_no_tools, &CompressionConfig::default()).unwrap();
+        let result = convert_request(&req_no_tools, &CompressionConfig::default(), None).unwrap();
         let first_user = &result.conversation_state.history[0];
         match first_user {
             Message::User(u) => {
@@ -2667,7 +2628,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req_with_write, &CompressionConfig::default()).unwrap();
+        let result = convert_request(&req_with_write, &CompressionConfig::default(), None).unwrap();
         let first_user = &result.conversation_state.history[0];
         match first_user {
             Message::User(u) => {
@@ -2704,7 +2665,7 @@ mod tests {
         };
 
         let result =
-            convert_request(&req_no_system_with_edit, &CompressionConfig::default()).unwrap();
+            convert_request(&req_no_system_with_edit, &CompressionConfig::default(), None).unwrap();
         let first_user = &result.conversation_state.history[0];
         match first_user {
             Message::User(u) => {
@@ -2840,7 +2801,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req, &CompressionConfig::default());
+        let result = convert_request(&req, &CompressionConfig::default(), None);
         assert!(result.is_ok(), "prefill 场景不应报错: {:?}", result.err());
         let state = result.unwrap().conversation_state;
         assert_eq!(
@@ -2870,7 +2831,7 @@ mod tests {
             metadata: None,
         };
 
-        let err = convert_request(&req, &CompressionConfig::default()).unwrap_err();
+        let err = convert_request(&req, &CompressionConfig::default(), None).unwrap_err();
         assert!(
             matches!(err, ConversionError::EmptyMessages),
             "只有 assistant 消息时应返回 EmptyMessages，实际: {:?}",
@@ -2899,7 +2860,7 @@ mod tests {
             metadata: None,
         };
 
-        let err = convert_request(&req, &CompressionConfig::default()).unwrap_err();
+        let err = convert_request(&req, &CompressionConfig::default(), None).unwrap_err();
         assert!(
             matches!(err, ConversionError::EmptyMessageContent),
             "空消息内容应返回 EmptyMessageContent，实际: {:?}",
@@ -2931,7 +2892,7 @@ mod tests {
             metadata: None,
         };
 
-        let err = convert_request(&req, &CompressionConfig::default()).unwrap_err();
+        let err = convert_request(&req, &CompressionConfig::default(), None).unwrap_err();
         assert!(
             matches!(err, ConversionError::EmptyMessageContent),
             "仅包含空白文本的消息应返回 EmptyMessageContent，实际: {:?}",
@@ -2966,7 +2927,7 @@ mod tests {
             metadata: None,
         };
 
-        let err = convert_request(&req, &CompressionConfig::default()).unwrap_err();
+        let err = convert_request(&req, &CompressionConfig::default(), None).unwrap_err();
         assert!(
             matches!(err, ConversionError::EmptyMessageContent),
             "prefill 回退后的空 user 消息应返回 EmptyMessageContent，实际: {:?}",
@@ -3068,7 +3029,7 @@ mod tests {
         };
 
         // 转换应成功，不应因 tool_use/tool_result 配对失败而报错
-        let result = convert_request(&req, &CompressionConfig::default());
+        let result = convert_request(&req, &CompressionConfig::default(), None);
         assert!(
             result.is_ok(),
             "连续 assistant 消息场景不应报错: {:?}",

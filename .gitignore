@@ -34,3 +34,7 @@ config/
 tmp/
 .planning/
 
+# Docker compose 本地覆盖（按 docker compose 约定不入库）
+docker-compose.override.yml
+docker-compose.override.yaml
+

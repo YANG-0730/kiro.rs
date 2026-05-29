@@ -44,6 +44,7 @@ pub fn create_router_with_provider(
     profile_arn: Option<String>,
     compression_config: Arc<RwLock<CompressionConfig>>,
     prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
+    model_registry: Option<Arc<crate::kiro::model_registry::ModelRegistry>>,
 ) -> Router {
     let mut state = AppState::new(api_key, prompt_cache_runtime);
     if let Some(provider) = kiro_provider {
@@ -53,6 +54,7 @@ pub fn create_router_with_provider(
         state = state.with_profile_arn(arn);
     }
     state = state.with_compression_config(compression_config);
+    state.model_registry = model_registry;
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()

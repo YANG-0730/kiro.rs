@@ -1130,6 +1130,14 @@ impl StreamContext {
             self.output_tokens
         );
 
+        // credit 是上游唯一真实的消耗指标（meteringEvent），默认打日志便于额度核算
+        tracing::info!(
+            credit_usage = self.metering.as_ref().map(|m| m.usage).unwrap_or(0.0),
+            output_tokens = self.output_tokens,
+            stream = true,
+            "请求完成 credit 消耗"
+        );
+
         // 生成最终事件
         events.extend(self.state_manager.generate_final_events(FinalUsage {
             input_tokens: billed_input_tokens,

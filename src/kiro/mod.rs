@@ -7,6 +7,7 @@ pub mod endpoint;
 pub mod fingerprint;
 pub mod machine_id;
 pub mod model;
+pub mod model_registry;
 pub mod parser;
 pub mod provider;
 pub mod rate_limiter;

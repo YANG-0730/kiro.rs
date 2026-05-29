@@ -174,6 +174,30 @@ async fn main() {
     );
     let kiro_provider = Arc::new(kiro_provider);
 
+    // 初始化模型注册表（动态拉取上游可用模型列表）
+    let model_registry = std::sync::Arc::new(crate::kiro::model_registry::ModelRegistry::new());
+    let model_init_count = token_manager.initialize_model_registry(&model_registry).await;
+    if model_init_count == 0 {
+        tracing::warn!("所有凭据模型列表拉取失败，/v1/models 将返回空列表，请求将无法通过模型校验");
+    }
+    // 将 registry 注入 token_manager，用于模型级凭据过滤（Phase 7）
+    token_manager.set_model_registry(model_registry.clone());
+
+    // 启动模型列表后台刷新（每小时）
+    {
+        let tm = token_manager.clone();
+        let reg = model_registry.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            interval.tick().await; // 跳过首次立即触发
+            loop {
+                interval.tick().await;
+                tracing::info!("后台刷新模型列表...");
+                tm.initialize_model_registry(&reg).await;
+            }
+        });
+    }
+
     // 初始化 count_tokens 配置
     {
         let cfg = config.read();
@@ -200,6 +224,7 @@ async fn main() {
         first_credentials.profile_arn.clone(),
         compression_config.clone(),
         prompt_cache_runtime.clone(),
+        Some(model_registry.clone()),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）

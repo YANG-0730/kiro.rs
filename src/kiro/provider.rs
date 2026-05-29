@@ -228,8 +228,10 @@ impl KiroProvider {
         &self,
         request_body: &str,
         user_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> anyhow::Result<ApiCallResult> {
-        self.call_api_with_retry(request_body, false, user_id).await
+        self.call_api_with_retry(request_body, false, user_id, model_id)
+            .await
     }
 
     /// 发送流式 API 请求
@@ -249,8 +251,10 @@ impl KiroProvider {
         &self,
         request_body: &str,
         user_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> anyhow::Result<ApiCallResult> {
-        self.call_api_with_retry(request_body, true, user_id).await
+        self.call_api_with_retry(request_body, true, user_id, model_id)
+            .await
     }
 
     /// 发送 MCP API 请求
@@ -532,6 +536,7 @@ impl KiroProvider {
         request_body: &str,
         is_stream: bool,
         user_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> anyhow::Result<ApiCallResult> {
         let total_credentials = self.token_manager.total_count();
         let available = self.token_manager.available_count();
@@ -544,8 +549,12 @@ impl KiroProvider {
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         for attempt in 0..max_retries {
-            // 获取调用上下文（绑定 index、credentials、token），支持用户亲和性
-            let ctx = match self.token_manager.acquire_context_for_user(user_id).await {
+            // 获取调用上下文（绑定 index、credentials、token），支持用户亲和性 + 模型过滤
+            let ctx = match self
+                .token_manager
+                .acquire_context_for_user(user_id, model_id)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);

@@ -77,6 +77,8 @@ pub struct AppState {
     pub compression_config: Arc<RwLock<CompressionConfig>>,
     /// Prompt Cache 运行时配置（共享引用，支持热更新）
     pub prompt_cache_runtime: Arc<RwLock<PromptCacheRuntime>>,
+    /// 模型注册表（动态拉取的上游可用模型列表）
+    pub model_registry: Option<Arc<crate::kiro::model_registry::ModelRegistry>>,
 }
 
 impl AppState {
@@ -91,6 +93,7 @@ impl AppState {
             profile_arn: None,
             compression_config: Arc::new(RwLock::new(CompressionConfig::default())),
             prompt_cache_runtime,
+            model_registry: None,
         }
     }
 

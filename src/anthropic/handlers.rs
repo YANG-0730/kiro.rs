@@ -37,7 +37,6 @@ use super::middleware::AppState;
 use super::stream::{CacheUsageBreakdown, SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
-    OutputConfig, Thinking,
 };
 use super::websearch;
 
@@ -54,6 +53,8 @@ struct StreamRequestContext<'a> {
     cache_profile: Option<&'a crate::anthropic::cache_tracker::CacheProfile>,
     request_body: &'a str,
     model: &'a str,
+    /// 映射后的上游 modelId（点号格式），用于模型级凭据过滤
+    kiro_model_id: &'a str,
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
@@ -63,6 +64,8 @@ struct StreamRequestContext<'a> {
 struct NonStreamRequestContext<'a> {
     request_body: &'a str,
     model: &'a str,
+    /// 映射后的上游 modelId（点号格式），用于模型级凭据过滤
+    kiro_model_id: &'a str,
     input_tokens: i32,
     tool_name_map: std::collections::HashMap<String, String>,
     user_id: Option<&'a str>,
@@ -628,235 +631,72 @@ fn strip_empty_text_content_blocks(messages: &mut [super::types::Message]) -> us
 /// GET /v1/models
 ///
 /// 返回可用的模型列表。
-pub async fn get_models(OriginalUri(uri): OriginalUri) -> impl IntoResponse {
+pub async fn get_models(
+    OriginalUri(uri): OriginalUri,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
     tracing::info!(
         path = %uri.path(),
         "Received request"
     );
 
-    let models = vec![
-        Model {
-            id: "claude-sonnet-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1770314400,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-            context_length: Some(1_000_000),
-            max_completion_tokens: Some(64_000),
-            thinking: Some(true),
-        },
-        Model {
-            id: "claude-sonnet-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1770314400,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-            context_length: Some(1_000_000),
-            max_completion_tokens: Some(64_000),
-            thinking: Some(true),
-        },
-        Model {
-            id: "claude-sonnet-4-6-agentic".to_string(),
-            object: "model".to_string(),
-            created: 1770314400,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6 (Agentic)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-            context_length: Some(1_000_000),
-            max_completion_tokens: Some(64_000),
-            thinking: Some(true),
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929".to_string(),
-            object: "model".to_string(),
-            created: 1727568000,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-            context_length: Some(200_000),
-            max_completion_tokens: Some(64_000),
-            thinking: Some(true),
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1727568000,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-            context_length: Some(200_000),
-            max_completion_tokens: Some(64_000),
-            thinking: Some(true),
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929-agentic".to_string(),
-            object: "model".to_string(),
-            created: 1727568000,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5 (Agentic)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-            context_length: Some(200_000),
-            max_completion_tokens: Some(64_000),
-            thinking: Some(true),
-        },
-        Model {
-            id: "claude-opus-4-5-20251101".to_string(),
-            object: "model".to_string(),
-            created: 1730419200,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-            context_length: Some(200_000),
-            max_completion_tokens: Some(64_000),
-            thinking: Some(true),
-        },
-        Model {
-            id: "claude-opus-4-5-20251101-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1730419200,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-            context_length: Some(200_000),
-            max_completion_tokens: Some(64_000),
-            thinking: Some(true),
-        },
-        Model {
-            id: "claude-opus-4-5-20251101-agentic".to_string(),
-            object: "model".to_string(),
-            created: 1730419200,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5 (Agentic)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-            context_length: Some(200_000),
-            max_completion_tokens: Some(64_000),
-            thinking: Some(true),
-        },
-        Model {
-            id: "claude-opus-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1770314400,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-            context_length: Some(1_000_000),
-            max_completion_tokens: Some(128_000),
-            thinking: Some(true),
-        },
-        Model {
-            id: "claude-opus-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1770314400,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-            context_length: Some(1_000_000),
-            max_completion_tokens: Some(128_000),
-            thinking: Some(true),
-        },
-        Model {
-            id: "claude-opus-4-6-agentic".to_string(),
-            object: "model".to_string(),
-            created: 1770314400,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6 (Agentic)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-            context_length: Some(1_000_000),
-            max_completion_tokens: Some(128_000),
-            thinking: Some(true),
-        },
-        Model {
-            id: "claude-opus-4-7".to_string(),
-            object: "model".to_string(),
-            created: 1772992800,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-            context_length: Some(1_000_000),
-            max_completion_tokens: Some(128_000),
-            thinking: Some(true),
-        },
-        Model {
-            id: "claude-opus-4-7-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1772992800,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-            context_length: Some(1_000_000),
-            max_completion_tokens: Some(128_000),
-            thinking: Some(true),
-        },
-        Model {
-            id: "claude-opus-4-7-agentic".to_string(),
-            object: "model".to_string(),
-            created: 1772992800,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7 (Agentic)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-            context_length: Some(1_000_000),
-            max_completion_tokens: Some(128_000),
-            thinking: Some(true),
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001".to_string(),
-            object: "model".to_string(),
-            created: 1727740800,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-            context_length: Some(200_000),
-            max_completion_tokens: Some(64_000),
-            thinking: Some(true),
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1727740800,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-            context_length: Some(200_000),
-            max_completion_tokens: Some(64_000),
-            thinking: Some(true),
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001-agentic".to_string(),
-            object: "model".to_string(),
-            created: 1727740800,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5 (Agentic)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-            context_length: Some(200_000),
-            max_completion_tokens: Some(64_000),
-            thinking: Some(true),
-        },
-    ];
+    // 模型列表完全由上游 ListAvailableModels 驱动。
+    // registry 拉取失败（None 或空）时返回空列表，不用静态兜底误导客户端。
+    let models = state
+        .model_registry
+        .as_ref()
+        .filter(|r| !r.is_empty())
+        .map(|r| build_models_from_registry(r))
+        .unwrap_or_default();
 
     Json(ModelsResponse {
         object: "list".to_string(),
         data: models,
     })
+}
+
+fn build_models_from_registry(
+    registry: &crate::kiro::model_registry::ModelRegistry,
+) -> Vec<Model> {
+    let upstream = registry.get_union_models();
+    let mut models = Vec::new();
+
+    for entry in &upstream {
+        let max_output = entry
+            .token_limits
+            .as_ref()
+            .and_then(|t| t.max_output_tokens);
+        let max_input = entry.token_limits.as_ref().and_then(|t| t.max_input_tokens);
+        let is_claude = entry.model_id.starts_with("claude-");
+
+        // Claude 模型：点号转横杠（Anthropic 客户端惯例）
+        // 非 Claude 模型：保留原始 modelId
+        let display_id = if is_claude {
+            entry.model_id.replace('.', "-")
+        } else {
+            entry.model_id.clone()
+        };
+
+        let has_thinking = entry.supports_thinking();
+
+        models.push(Model {
+            id: display_id.clone(),
+            object: "model".to_string(),
+            created: 1770314400,
+            owned_by: "anthropic".to_string(),
+            display_name: entry
+                .model_name
+                .clone()
+                .unwrap_or_else(|| entry.model_id.clone()),
+            model_type: "chat".to_string(),
+            max_tokens: max_output.unwrap_or(32000),
+            context_length: max_input,
+            max_completion_tokens: max_output,
+            thinking: if has_thinking { Some(true) } else { None },
+        });
+    }
+
+    models
 }
 
 /// POST /v1/messages
@@ -871,9 +711,6 @@ pub async fn post_messages(
     let compression_config = state.compression_config.read().clone();
     let prompt_cache = state.prompt_cache_snapshot();
 
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
-
     // 提取 user_id 用于凭据亲和性
     let user_id = payload.metadata.as_ref().and_then(|m| m.user_id.clone());
 
@@ -885,10 +722,32 @@ pub async fn post_messages(
         payload.tools.clone(),
     ) as i32;
 
+    // 提取 thinking / effort 用于日志（仅观测，不改变行为）
+    let thinking_type = payload
+        .thinking
+        .as_ref()
+        .map(|t| t.thinking_type.clone())
+        .unwrap_or_else(|| "off".to_string());
+    let effort = payload
+        .output_config
+        .as_ref()
+        .map(|c| c.effort.clone())
+        .unwrap_or_else(|| "-".to_string());
+    // 上游模型支持的输出上限（与客户端请求的 max_tokens 区分；客户端值不发上游）
+    let model_max_output = state
+        .model_registry
+        .as_ref()
+        .and_then(|r| r.max_output_tokens_for(&payload.model))
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string());
+
     tracing::info!(
         path = %uri.path(),
         model = %payload.model,
         max_tokens = %payload.max_tokens,
+        model_max_output = %model_max_output,
+        thinking = %thinking_type,
+        effort = %effort,
         stream = %payload.stream,
         message_count = %payload.messages.len(),
         user_id = %mask_user_id(user_id.as_deref()),
@@ -969,7 +828,8 @@ pub async fn post_messages(
     );
 
     // 转换请求
-    let conversion_result = match convert_request(&payload, &compression_config) {
+    let registry_ref = state.model_registry.as_deref();
+    let conversion_result = match convert_request(&payload, &compression_config, registry_ref) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -1009,6 +869,7 @@ pub async fn post_messages(
 
     // 构建 Kiro 请求
     let tool_name_map = conversion_result.tool_name_map;
+    let kiro_model_id = conversion_result.model_id;
     let mut kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: state.profile_arn.clone(),
@@ -1122,6 +983,7 @@ pub async fn post_messages(
             cache_profile: cache_profile.as_ref(),
             request_body: &request_body,
             model: &payload.model,
+            kiro_model_id: &kiro_model_id,
             input_tokens: estimated_input_tokens,
             thinking_enabled,
             tool_name_map: tool_name_map.clone(),
@@ -1133,6 +995,7 @@ pub async fn post_messages(
         let non_stream_request = NonStreamRequestContext {
             request_body: &request_body,
             model: &payload.model,
+            kiro_model_id: &kiro_model_id,
             input_tokens: estimated_input_tokens,
             tool_name_map,
             user_id: user_id.as_deref(),
@@ -1150,7 +1013,11 @@ async fn handle_stream_request(
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let api_result = match provider
-        .call_api_stream(context.request_body, context.user_id)
+        .call_api_stream(
+            context.request_body,
+            context.user_id,
+            Some(context.kiro_model_id),
+        )
         .await
     {
         Ok(resp) => resp,
@@ -1312,7 +1179,11 @@ async fn handle_non_stream_request(
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let api_result = match provider
-        .call_api(context.request_body, context.user_id)
+        .call_api(
+            context.request_body,
+            context.user_id,
+            Some(context.kiro_model_id),
+        )
         .await
     {
         Ok(resp) => resp,
@@ -1333,6 +1204,8 @@ async fn handle_non_stream_request(
         }
         _ => None,
     };
+
+    let credential_id = api_result.credential_id;
 
     // 读取响应体
     let body_bytes = match api_result.response.bytes().await {
@@ -1541,6 +1414,15 @@ async fn handle_non_stream_request(
         output_tokens
     );
 
+    // credit 是上游唯一真实的消耗指标（meteringEvent），默认打日志便于额度核算
+    tracing::info!(
+        credential_id = credential_id,
+        credit_usage = metering.as_ref().map(|m| m.usage).unwrap_or(0.0),
+        output_tokens,
+        stream = false,
+        "请求完成 credit 消耗"
+    );
+
     let response_body = {
         let mut usage = json!({
             "input_tokens": billed_input_tokens,
@@ -1566,70 +1448,6 @@ async fn handle_non_stream_request(
     };
 
     (StatusCode::OK, Json(response_body)).into_response()
-}
-
-/// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-///
-/// 支持的后缀格式：
-/// - `-thinking-minimal` → budget 512
-/// - `-thinking-low` → budget 1024
-/// - `-thinking-medium` → budget 8192
-/// - `-thinking-high` → budget 24576
-/// - `-thinking-xhigh` → budget 32768
-/// - `-thinking` → budget 20000（默认）
-///
-/// - Opus 4.6：覆写为 adaptive 类型
-/// - 其他模型：覆写为 enabled 类型
-fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
-    let model_lower = payload.model.to_lowercase();
-    if !model_lower.contains("thinking") {
-        return;
-    }
-
-    // 具体后缀必须在通用 "thinking" 之前匹配
-    let budget_tokens = if model_lower.ends_with("-thinking-minimal") {
-        512
-    } else if model_lower.ends_with("-thinking-low") {
-        1024
-    } else if model_lower.ends_with("-thinking-medium") {
-        8192
-    } else if model_lower.ends_with("-thinking-high") {
-        24576
-    } else if model_lower.ends_with("-thinking-xhigh") {
-        32768
-    } else if model_lower.ends_with("-thinking") {
-        20000
-    } else {
-        // "thinking" 出现在模型名中但不是后缀（如 "thinking-model-v2"），不覆写
-        return;
-    };
-
-    let is_opus_or_sonnet_4_6 = (model_lower.contains("opus") || model_lower.contains("sonnet"))
-        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
-
-    let thinking_type = if is_opus_or_sonnet_4_6 {
-        "adaptive"
-    } else {
-        "enabled"
-    };
-
-    tracing::info!(
-        model = %payload.model,
-        thinking_type = thinking_type,
-        budget_tokens = budget_tokens,
-        "模型名包含 thinking 后缀，覆写 thinking 配置"
-    );
-
-    payload.thinking = Some(Thinking {
-        thinking_type: thinking_type.to_string(),
-        budget_tokens,
-    });
-
-    if is_opus_or_sonnet_4_6 {
-        payload.output_config = Some(OutputConfig {
-            effort: "high".to_string(),
-        });
-    }
 }
 
 /// POST /v1/messages/count_tokens
