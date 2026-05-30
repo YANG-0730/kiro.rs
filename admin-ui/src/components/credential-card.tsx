@@ -477,6 +477,7 @@ export function CredentialCard({
             <Button
               size="sm"
               variant="outline"
+              className="min-w-[7rem]"
               onClick={handleReset}
               disabled={resetFailure.isPending || credential.failureCount === 0}
             >
@@ -486,9 +487,10 @@ export function CredentialCard({
             <Button
               size="sm"
               variant="outline"
+              className="min-w-[7rem]"
               onClick={() => resetRateLimit.mutate(credential.id)}
               disabled={resetRateLimit.isPending}
-              title="清空该凭据的限速 / 冷却状态（不动 enabled / failure_count）"
+              title="清空该凭据的速率限制与冷却状态（不影响启用状态与失败计数）"
             >
               <RefreshCw className="h-4 w-4 mr-1" />
               {resetRateLimit.isPending ? '重置中…' : '重置限速'}
@@ -496,6 +498,7 @@ export function CredentialCard({
             <Button
               size="sm"
               variant="outline"
+              className="min-w-[7rem]"
               onClick={() => {
                 const newPriority = Math.max(0, credential.priority - 1)
                 setPriority.mutate(
@@ -514,6 +517,7 @@ export function CredentialCard({
             <Button
               size="sm"
               variant="outline"
+              className="min-w-[7rem]"
               onClick={() => {
                 const newPriority = credential.priority + 1
                 setPriority.mutate(
@@ -532,6 +536,7 @@ export function CredentialCard({
             <Button
               size="sm"
               variant="outline"
+              className="min-w-[7rem]"
               onClick={handleForceRefresh}
               disabled={forceRefreshToken.isPending}
             >
@@ -541,6 +546,7 @@ export function CredentialCard({
             <Button
               size="sm"
               variant="default"
+              className="min-w-[7rem]"
               onClick={handleViewBalance}
             >
               <Wallet className="h-4 w-4 mr-1" />
@@ -549,6 +555,7 @@ export function CredentialCard({
             <Button
               size="sm"
               variant="destructive"
+              className="min-w-[7rem]"
               onClick={() => setShowDeleteDialog(true)}
               disabled={!credential.disabled}
               title={!credential.disabled ? '需要先禁用凭据才能删除' : undefined}

@@ -224,18 +224,19 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
                 <label htmlFor="gcRegion" className="text-sm font-medium">Region</label>
                 <Input id="gcRegion" placeholder="us-east-1" value={region} onChange={(e) => setRegion(e.target.value)} disabled={isPending} />
               </div>
-              {numInput('gcRpm', 'Credential RPM', credentialRpm, setCredentialRpm, '单凭据每分钟请求数（频率）。留空=默认策略，0=频率不限，>0=固定间隔')}
-              {numInput('gcDailyMax', 'Credential 每日上限', credentialDailyMax, setCredentialDailyMax, '单凭据每日请求总量。留空=默认 500，0=不限，>0=该值即上限')}
-              {numInput('gcDailyWindowSeconds', 'Credential 每日窗口（秒）', credentialDailyWindowSeconds, setCredentialDailyWindowSeconds, '撞每日上限后多少秒自动重置。留空=默认 86400（24h），0=不自动重置（需手动），>0=该秒数。常用：60=1分钟、3600=1小时、86400=24小时')}
+              {numInput('gcRpm', '每分钟请求数 (RPM)', credentialRpm, setCredentialRpm, '单凭据的请求频率上限。留空使用默认节流（约 1~2 秒/次），0 表示不限频率，>0 表示固定为该 RPM')}
+              {numInput('gcDailyMax', '每日请求总量上限', credentialDailyMax, setCredentialDailyMax, '单凭据每日累计请求次数上限。留空使用默认 500，0 表示不限制，>0 表示即为该值')}
+              {numInput('gcDailyWindowSeconds', '每日额度重置窗口（秒）', credentialDailyWindowSeconds, setCredentialDailyWindowSeconds, '达到每日上限后，等待多少秒自动恢复。留空使用默认 86400 秒（24 小时），0 表示不自动恢复（需手动重置），>0 表示该秒数。常用：60、3600、86400')}
               <div className="flex items-center justify-between gap-3 rounded-md border border-dashed border-muted-foreground/30 bg-muted/20 p-3">
                 <div className="space-y-0.5">
-                  <p className="text-sm font-medium">立即重置所有凭据的限速状态</p>
-                  <p className="text-xs text-muted-foreground">撞 daily 上限后一键恢复，不必等窗口或重启容器；不影响 enabled / failure_count</p>
+                  <p className="text-sm font-medium">立即恢复所有凭据的请求额度</p>
+                  <p className="text-xs text-muted-foreground">无需等待重置窗口或重启服务；仅清空速率限制与冷却状态，不影响启用状态与失败计数</p>
                 </div>
                 <Button
                   type="button"
                   variant="outline"
                   size="sm"
+                  className="min-w-[6rem]"
                   disabled={isPending || resetRLPending}
                   onClick={() => mutateResetRL()}
                 >
