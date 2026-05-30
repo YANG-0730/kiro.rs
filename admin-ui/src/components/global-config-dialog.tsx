@@ -34,7 +34,7 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
   const [region, setRegion] = useState('')
   const [credentialRpm, setCredentialRpm] = useState('')
   const [credentialDailyMax, setCredentialDailyMax] = useState('')
-  const [credentialDailyWindowHours, setCredentialDailyWindowHours] = useState('')
+  const [credentialDailyWindowSeconds, setCredentialDailyWindowSeconds] = useState('')
   const [promptCacheTtlSeconds, setPromptCacheTtlSeconds] = useState('300')
   const [promptCacheAccountingEnabled, setPromptCacheAccountingEnabled] = useState(true)
   const [defaultEndpoint, setDefaultEndpoint] = useState('ide')
@@ -65,7 +65,7 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
       setRegion(globalConfig.region || '')
       setCredentialRpm(globalConfig.credentialRpm?.toString() || '')
       setCredentialDailyMax(globalConfig.credentialDailyMax?.toString() || '')
-      setCredentialDailyWindowHours(globalConfig.credentialDailyWindowHours?.toString() || '')
+      setCredentialDailyWindowSeconds(globalConfig.credentialDailyWindowSeconds?.toString() || '')
       setPromptCacheTtlSeconds(globalConfig.promptCacheTtlSeconds.toString())
       setPromptCacheAccountingEnabled(globalConfig.promptCacheAccountingEnabled)
       setDefaultEndpoint(globalConfig.defaultEndpoint || 'ide')
@@ -112,9 +112,9 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
       hasGlobalChanges = true
     }
 
-    const newDailyWindowHours = credentialDailyWindowHours.trim() ? parseInt(credentialDailyWindowHours.trim(), 10) : null
-    if (newDailyWindowHours !== (globalConfig?.credentialDailyWindowHours ?? null)) {
-      globalPayload.credentialDailyWindowHours = newDailyWindowHours
+    const newDailyWindowSeconds = credentialDailyWindowSeconds.trim() ? parseInt(credentialDailyWindowSeconds.trim(), 10) : null
+    if (newDailyWindowSeconds !== (globalConfig?.credentialDailyWindowSeconds ?? null)) {
+      globalPayload.credentialDailyWindowSeconds = newDailyWindowSeconds
       hasGlobalChanges = true
     }
 
@@ -226,7 +226,7 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
               </div>
               {numInput('gcRpm', 'Credential RPM', credentialRpm, setCredentialRpm, '单凭据每分钟请求数（频率）。留空=默认策略，0=频率不限，>0=固定间隔')}
               {numInput('gcDailyMax', 'Credential 每日上限', credentialDailyMax, setCredentialDailyMax, '单凭据每日请求总量。留空=默认 500，0=不限，>0=该值即上限')}
-              {numInput('gcDailyWindowHours', 'Credential 每日窗口（小时）', credentialDailyWindowHours, setCredentialDailyWindowHours, '撞每日上限后多少小时自动重置。留空=默认 24，0=不自动重置（需手动重置），>0=该小时数')}
+              {numInput('gcDailyWindowSeconds', 'Credential 每日窗口（秒）', credentialDailyWindowSeconds, setCredentialDailyWindowSeconds, '撞每日上限后多少秒自动重置。留空=默认 86400（24h），0=不自动重置（需手动），>0=该秒数。常用：60=1分钟、3600=1小时、86400=24小时')}
               <div className="flex items-center justify-between gap-3 rounded-md border border-dashed border-muted-foreground/30 bg-muted/20 p-3">
                 <div className="space-y-0.5">
                   <p className="text-sm font-medium">立即重置所有凭据的限速状态</p>

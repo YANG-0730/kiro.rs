@@ -112,6 +112,22 @@ pub async fn reset_rate_limit_all(State(state): State<AdminState>) -> impl IntoR
     ))
 }
 
+/// POST /api/admin/credentials/:id/reset-rate-limit
+/// 重置指定单凭据的限速 / 冷却状态（不动 enabled / failure_count）
+pub async fn reset_rate_limit_one(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.reset_rate_limit_for(id) {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} 的限速与冷却状态已清空",
+            id
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials/:id/refresh
 /// 强制刷新指定凭据 Token
 pub async fn force_refresh_token(

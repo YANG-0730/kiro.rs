@@ -597,9 +597,9 @@ fn build_rate_limit_config(config: &Config) -> RateLimitConfig {
         Some(v) => cfg.daily_max_requests = v,  // 0 = 不限（由 rate_limiter 解释）
     }
 
-    // daily 滑动窗口（小时）：留空保持默认 24h；0 = 永不自动重置；>0 = 即为窗口大小
-    if let Some(hours) = config.credential_daily_window_hours {
-        cfg.daily_reset_seconds = (hours as u64).saturating_mul(3600);
+    // daily 滑动窗口（秒）：留空保持默认 86400；0 = 永不自动重置；>0 = 即为窗口大小
+    if let Some(secs) = config.credential_daily_window_seconds {
+        cfg.daily_reset_seconds = secs;
     }
 
     cfg
@@ -2770,6 +2770,21 @@ impl MultiTokenManager {
         }
     }
 
+    /// 重置指定凭据的限速 / 冷却状态（不动 enabled / failure_count）
+    ///
+    /// 与 `reset_and_enable` 不同：本方法是"轻量"重置，只清 rate_limiter
+    /// 与 cooldown，不会把禁用的凭据强行启用、也不重置失败计数。
+    pub fn reset_rate_limit_for(&self, id: u64) -> anyhow::Result<()> {
+        // 凭据存在性校验
+        let exists = self.entries.lock().iter().any(|e| e.id == id);
+        if !exists {
+            anyhow::bail!("凭据不存在: {}", id);
+        }
+        self.rate_limiter.reset(id);
+        self.cooldown_manager.clear_cooldown(id);
+        Ok(())
+    }
+
     /// 强制刷新指定凭据的 Token（Admin API）
     pub async fn force_refresh_token_for(&self, id: u64) -> anyhow::Result<()> {
         let config = self.config.read().clone();
@@ -3541,27 +3556,27 @@ mod tests {
     }
 
     #[test]
-    fn test_build_rate_limit_config_daily_window_hours() {
+    fn test_build_rate_limit_config_daily_window_seconds() {
         // 留空：保留默认 86400 秒
         let mut config = Config::default();
-        config.credential_daily_window_hours = None;
+        config.credential_daily_window_seconds = None;
         let cfg = build_rate_limit_config(&config);
         assert_eq!(cfg.daily_reset_seconds, 86_400);
 
         // 0：不自动重置（窗口为 0 秒，rate_limiter 内部用 .max(1) 兜底）
-        config.credential_daily_window_hours = Some(0);
+        config.credential_daily_window_seconds = Some(0);
         let cfg = build_rate_limit_config(&config);
         assert_eq!(cfg.daily_reset_seconds, 0);
 
-        // 1 小时
-        config.credential_daily_window_hours = Some(1);
+        // 60 秒
+        config.credential_daily_window_seconds = Some(60);
+        let cfg = build_rate_limit_config(&config);
+        assert_eq!(cfg.daily_reset_seconds, 60);
+
+        // 3600 秒（1 小时）
+        config.credential_daily_window_seconds = Some(3600);
         let cfg = build_rate_limit_config(&config);
         assert_eq!(cfg.daily_reset_seconds, 3600);
-
-        // 12 小时
-        config.credential_daily_window_hours = Some(12);
-        let cfg = build_rate_limit_config(&config);
-        assert_eq!(cfg.daily_reset_seconds, 43_200);
     }
 
     /// 回归测试：report_success 必须自增 rate_limiter 的 daily_count，

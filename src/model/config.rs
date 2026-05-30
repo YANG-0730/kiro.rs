@@ -98,15 +98,15 @@ pub struct Config {
     #[serde(default)]
     pub credential_daily_max: Option<u32>,
 
-    /// 每日计数滑动窗口大小（小时）
+    /// 每日计数滑动窗口大小（秒）
     ///
-    /// `credential_daily_max` 撞墙后等待该小时数才会自动重置。
+    /// `credential_daily_max` 撞墙后等待该秒数才会自动重置。
     ///
-    /// - `None`（留空）: 默认 24 小时
+    /// - `None`（留空）: 默认 86400 秒（24 小时）
     /// - `Some(0)`: 不自动重置（等同永久撞墙，需手动 reset）
-    /// - `Some(n)` (n>0): 该小时数为窗口
+    /// - `Some(n)` (n>0): 该秒数为窗口
     #[serde(default)]
-    pub credential_daily_window_hours: Option<u32>,
+    pub credential_daily_window_seconds: Option<u64>,
 
     /// 输入压缩配置
     #[serde(default)]
@@ -326,7 +326,7 @@ impl Default for Config {
             admin_api_key: None,
             credential_rpm: None,
             credential_daily_max: None,
-            credential_daily_window_hours: None,
+            credential_daily_window_seconds: None,
             compression: CompressionConfig::default(),
             prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
             prompt_cache_accounting_enabled: default_true(),

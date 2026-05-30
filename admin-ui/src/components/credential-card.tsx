@@ -22,6 +22,7 @@ import {
   useSetRegion,
   useSetEndpoint,
   useResetFailure,
+  useResetCredentialRateLimit,
   useForceRefreshToken,
   useDeleteCredential,
 } from '@/hooks/use-credentials'
@@ -75,6 +76,7 @@ export function CredentialCard({
   const setRegion = useSetRegion()
   const setEndpoint = useSetEndpoint()
   const resetFailure = useResetFailure()
+  const resetRateLimit = useResetCredentialRateLimit()
   const forceRefreshToken = useForceRefreshToken()
   const deleteCredential = useDeleteCredential()
 
@@ -480,6 +482,16 @@ export function CredentialCard({
             >
               <RefreshCw className="h-4 w-4 mr-1" />
               重置失败
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => resetRateLimit.mutate(credential.id)}
+              disabled={resetRateLimit.isPending}
+              title="清空该凭据的限速 / 冷却状态（不动 enabled / failure_count）"
+            >
+              <RefreshCw className="h-4 w-4 mr-1" />
+              {resetRateLimit.isPending ? '重置中…' : '重置限速'}
             </Button>
             <Button
               size="sm"

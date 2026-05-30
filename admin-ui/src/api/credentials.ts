@@ -82,6 +82,12 @@ export async function resetAllRateLimit(): Promise<SuccessResponse> {
   return data
 }
 
+// 重置单个凭据的限速 / 冷却（不动 enabled / failure_count）
+export async function resetCredentialRateLimit(id: number): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/reset-rate-limit`)
+  return data
+}
+
 // 设置凭据 Region
 export async function setCredentialRegion(
   id: number,
