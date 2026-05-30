@@ -5,6 +5,18 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Kiro Admin</title>
+    <script>
+      // 在 React 渲染前同步应用主题，避免亮色闪烁。
+      // 优先读 localStorage，其次跟随系统偏好；用户切换后写回 localStorage 持久化。
+      (function () {
+        try {
+          var saved = localStorage.getItem('kiro-admin-theme')
+          var prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches
+          var dark = saved ? saved === 'dark' : prefersDark
+          if (dark) document.documentElement.classList.add('dark')
+        } catch (e) { /* localStorage 不可用时忽略 */ }
+      })()
+    </script>
   </head>
   <body>
     <div id="root"></div>

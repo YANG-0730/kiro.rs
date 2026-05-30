@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, Pencil } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -23,6 +23,7 @@ import {
   useSetEndpoint,
   useResetFailure,
   useResetCredentialRateLimit,
+  useSetCredentialLabel,
   useForceRefreshToken,
   useDeleteCredential,
 } from '@/hooks/use-credentials'
@@ -69,6 +70,8 @@ export function CredentialCard({
   const [apiRegionValue, setApiRegionValue] = useState(credential.apiRegion ?? '')
   const [editingEndpoint, setEditingEndpoint] = useState(false)
   const [endpointValue, setEndpointValue] = useState(credential.endpoint ?? '')
+  const [editingLabel, setEditingLabel] = useState(false)
+  const [labelValue, setLabelValue] = useState(credential.label ?? '')
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
@@ -77,6 +80,7 @@ export function CredentialCard({
   const setEndpoint = useSetEndpoint()
   const resetFailure = useResetFailure()
   const resetRateLimit = useResetCredentialRateLimit()
+  const setLabel = useSetCredentialLabel()
   const forceRefreshToken = useForceRefreshToken()
   const deleteCredential = useDeleteCredential()
 
@@ -225,12 +229,89 @@ export function CredentialCard({
                 checked={selected}
                 onCheckedChange={onToggleSelect}
               />
-              <CardTitle className="text-lg flex items-center gap-2">
-                {credential.email || `凭据 #${credential.id}`}
+              <CardTitle className="text-lg flex items-center gap-2 min-w-0 flex-wrap">
+                {editingLabel ? (
+                  <span className="flex items-center gap-1">
+                    <Input
+                      value={labelValue}
+                      onChange={(e) => setLabelValue(e.target.value)}
+                      placeholder="备注名称"
+                      className="h-8 w-40"
+                      autoFocus
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          setLabel.mutate(
+                            { id: credential.id, label: labelValue.trim() || null },
+                            { onSuccess: () => setEditingLabel(false) }
+                          )
+                        } else if (e.key === 'Escape') {
+                          setLabelValue(credential.label ?? '')
+                          setEditingLabel(false)
+                        }
+                      }}
+                    />
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-8"
+                      disabled={setLabel.isPending}
+                      onClick={() => {
+                        setLabel.mutate(
+                          { id: credential.id, label: labelValue.trim() || null },
+                          { onSuccess: () => setEditingLabel(false) }
+                        )
+                      }}
+                    >
+                      保存
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-8"
+                      onClick={() => {
+                        setLabelValue(credential.label ?? '')
+                        setEditingLabel(false)
+                      }}
+                    >
+                      取消
+                    </Button>
+                  </span>
+                ) : (
+                  <>
+                    <span className="truncate">
+                      {credential.label || credential.email || `凭据 #${credential.id}`}
+                    </span>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-6 w-6"
+                      title="编辑备注"
+                      onClick={() => {
+                        setLabelValue(credential.label ?? '')
+                        setEditingLabel(true)
+                      }}
+                    >
+                      <Pencil className="h-3.5 w-3.5" />
+                    </Button>
+                  </>
+                )}
                 {credential.disabled && (
                   <Badge variant="destructive">已禁用</Badge>
                 )}
               </CardTitle>
+              {/* 副标题：当用了 label 时，把 email/id 作为副信息展示，方便识别 */}
+              {!editingLabel && credential.label && (
+                <p className="text-xs text-muted-foreground mt-0.5 truncate">
+                  {credential.email
+                    ? `${credential.email} · #${credential.id}`
+                    : `#${credential.id}`}
+                </p>
+              )}
+              {!editingLabel && !credential.label && credential.email && (
+                <p className="text-xs text-muted-foreground mt-0.5 truncate">
+                  #{credential.id}
+                </p>
+              )}
             </div>
             <div className="flex items-center gap-2">
               <span className="text-sm text-muted-foreground">启用</span>

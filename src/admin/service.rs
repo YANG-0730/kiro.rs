@@ -105,6 +105,7 @@ impl AdminService {
                     has_profile_arn: entry.has_profile_arn,
                     refresh_token_hash: entry.refresh_token_hash,
                     email: entry.email,
+                    label: entry.label,
                     subscription_title: entry.subscription_title,
                     success_count: entry.success_count,
                     last_used_at: entry.last_used_at.clone(),
@@ -178,6 +179,13 @@ impl AdminService {
 
         self.token_manager
             .set_endpoint(id, endpoint)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置凭据备注（None 或空字符串等同清除）
+    pub fn set_label(&self, id: u64, label: Option<String>) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_label(id, label)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -362,6 +370,7 @@ impl AdminService {
             machine_id: req.machine_id,
             endpoint,
             email: req.email,
+            label: None,
             subscription_title: None,
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
@@ -685,6 +694,7 @@ impl AdminService {
             machine_id: item.machine_id,
             endpoint: None,
             email: None,
+            label: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,

@@ -137,8 +137,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
   }, [data?.credentials])
 
   const toggleDarkMode = () => {
-    setDarkMode(!darkMode)
-    document.documentElement.classList.toggle('dark')
+    const next = !darkMode
+    setDarkMode(next)
+    document.documentElement.classList.toggle('dark', next)
+    try {
+      localStorage.setItem('kiro-admin-theme', next ? 'dark' : 'light')
+    } catch { /* ignore */ }
   }
 
   const handleViewBalance = (id: number, forceRefresh: boolean) => {

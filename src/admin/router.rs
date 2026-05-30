@@ -10,8 +10,8 @@ use super::{
         add_credential, delete_credential, force_refresh_token, get_all_credentials,
         get_cached_balances, get_credential_balance, get_global_config, get_proxy_config,
         import_token_json, reset_failure_count, reset_rate_limit_all, reset_rate_limit_one,
-        set_credential_disabled, set_credential_endpoint, set_credential_priority,
-        set_credential_region, update_global_config, update_proxy_config,
+        set_credential_disabled, set_credential_endpoint, set_credential_label,
+        set_credential_priority, set_credential_region, update_global_config, update_proxy_config,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -50,6 +50,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/priority", post(set_credential_priority))
         .route("/credentials/{id}/region", post(set_credential_region))
         .route("/credentials/{id}/endpoint", post(set_credential_endpoint))
+        .route("/credentials/{id}/label", post(set_credential_label))
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route(
             "/credentials/{id}/reset-rate-limit",

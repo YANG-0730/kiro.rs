@@ -10,6 +10,7 @@ import {
   resetCredentialFailure,
   resetAllRateLimit,
   resetCredentialRateLimit,
+  setCredentialLabel,
   forceRefreshToken,
   getCredentialBalance,
   getCachedBalances,
@@ -176,6 +177,22 @@ export function useResetCredentialRateLimit() {
     },
     onError: (error: Error) => {
       toast.error(`重置失败：${error.message}`)
+    },
+  })
+}
+
+// 设置凭据备注
+export function useSetCredentialLabel() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, label }: { id: number; label: string | null }) =>
+      setCredentialLabel(id, label),
+    onSuccess: (data) => {
+      toast.success(data.message || '备注已更新')
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+    onError: (error: Error) => {
+      toast.error(`备注更新失败：${error.message}`)
     },
   })
 }

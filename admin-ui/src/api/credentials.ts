@@ -88,6 +88,15 @@ export async function resetCredentialRateLimit(id: number): Promise<SuccessRespo
   return data
 }
 
+// 设置凭据备注（空字符串或 null 等同清除）
+export async function setCredentialLabel(
+  id: number,
+  label: string | null
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/label`, { label })
+  return data
+}
+
 // 设置凭据 Region
 export async function setCredentialRegion(
   id: number,

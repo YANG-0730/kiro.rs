@@ -708,6 +708,8 @@ pub struct CredentialEntrySnapshot {
     pub refresh_token_hash: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 用户备注（管理员自起的别名）
+    pub label: Option<String>,
     /// 已持久化的订阅等级（页面刷新后可直接展示）
     pub subscription_title: Option<String>,
     /// API 调用成功次数
@@ -2647,6 +2649,7 @@ impl MultiTokenManager {
                         expires_at: e.credentials.expires_at.clone(),
                         refresh_token_hash: hash,
                         email: e.credentials.email.clone(),
+                        label: e.credentials.label.clone(),
                         subscription_title: e.credentials.subscription_title.clone(),
                         success_count: e.success_count,
                         last_used_at: e.last_used_at.clone(),
@@ -2729,6 +2732,30 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             entry.credentials.endpoint = endpoint;
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置凭据备注（Admin API）
+    ///
+    /// 传 `Some(s)` 设置备注；空字符串或 `None` 清除。
+    pub fn set_label(&self, id: u64, label: Option<String>) -> anyhow::Result<()> {
+        let normalized = label.and_then(|s| {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.label = normalized;
         }
         self.persist_credentials()?;
         Ok(())

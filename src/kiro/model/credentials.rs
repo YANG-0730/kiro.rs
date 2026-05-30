@@ -80,6 +80,11 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
 
+    /// 用户备注（管理员自己起的别名，便于在多凭据时识别）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub label: Option<String>,
+
     /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
@@ -376,6 +381,7 @@ mod tests {
             machine_id: None,
             endpoint: None,
             email: None,
+            label: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -496,6 +502,7 @@ mod tests {
             machine_id: None,
             endpoint: None,
             email: None,
+            label: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -528,6 +535,7 @@ mod tests {
             machine_id: None,
             endpoint: None,
             email: None,
+            label: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,
@@ -646,6 +654,7 @@ mod tests {
             machine_id: Some("c".repeat(64)),
             endpoint: None,
             email: None,
+            label: None,
             subscription_title: None,
             proxy_url: None,
             proxy_username: None,

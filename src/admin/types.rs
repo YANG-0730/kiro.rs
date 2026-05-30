@@ -42,6 +42,8 @@ pub struct CredentialStatusItem {
     pub refresh_token_hash: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 用户备注（管理员自起的别名，便于多凭据时识别）
+    pub label: Option<String>,
     /// 已持久化的订阅等级（页面刷新后可直接展示）
     pub subscription_title: Option<String>,
     /// API 调用成功次数
@@ -59,6 +61,14 @@ pub struct CredentialStatusItem {
 }
 
 // ============ 操作请求 ============
+
+/// 设置凭据备注请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetLabelRequest {
+    /// 备注内容；空字符串或 null 表示清除
+    pub label: Option<String>,
+}
 
 /// 启用/禁用凭据请求
 #[derive(Debug, Deserialize)]

@@ -10,7 +10,8 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, ImportTokenJsonRequest, SetDisabledRequest, SetEndpointRequest,
-        SetPriorityRequest, SetRegionRequest, SuccessResponse, UpdateProxyConfigRequest,
+        SetLabelRequest, SetPriorityRequest, SetRegionRequest, SuccessResponse,
+        UpdateProxyConfigRequest,
     },
 };
 
@@ -83,6 +84,20 @@ pub async fn set_credential_endpoint(
             id
         )))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/label
+/// 设置凭据备注
+pub async fn set_credential_label(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetLabelRequest>,
+) -> impl IntoResponse {
+    match state.service.set_label(id, payload.label) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 备注已更新", id)))
+            .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

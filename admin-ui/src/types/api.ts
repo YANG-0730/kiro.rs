@@ -18,6 +18,7 @@ export interface CredentialStatusItem {
   hasProfileArn: boolean
   accountEmail: string | null
   email?: string
+  label?: string | null
   refreshTokenHash?: string
   subscriptionTitle?: string | null
 
