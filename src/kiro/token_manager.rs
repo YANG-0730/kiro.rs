@@ -566,6 +566,40 @@ pub(crate) async fn fetch_available_models(
     Ok(data)
 }
 
+/// 根据全局 `Config` 构建凭据级限速配置
+///
+/// `credential_rpm` 与 `credential_daily_max` 各自三态（留空/0/自定义），互相正交：
+/// - rpm 留空 → 保留默认间隔与抖动；rpm=0 → 频率不限（间隔归零）；rpm>0 → 固定 60000/rpm ms
+/// - daily 留空 → 保留默认日上限；daily=0 → 不限；daily>0 → 即为日上限
+///   （rate_limiter 中以 `daily_max_requests == 0` 表示不限）
+fn build_rate_limit_config(config: &Config) -> RateLimitConfig {
+    let mut cfg = RateLimitConfig::default();
+
+    match config.credential_rpm {
+        None => {}              // 留空：保留默认间隔/抖动
+        Some(0) => {
+            // 频率不限
+            cfg.min_interval_ms = 0;
+            cfg.max_interval_ms = 0;
+            cfg.jitter_percent = 0.0;
+        }
+        Some(rpm) => {
+            // RPM -> 固定间隔（ms），例如 20 RPM => 3000ms；固定间隔下抖动无意义
+            let interval_ms = (60_000u64 / rpm as u64).max(1);
+            cfg.min_interval_ms = interval_ms;
+            cfg.max_interval_ms = interval_ms;
+            cfg.jitter_percent = 0.0;
+        }
+    }
+
+    match config.credential_daily_max {
+        None => {}                              // 留空：保留默认日上限
+        Some(v) => cfg.daily_max_requests = v,  // 0 = 不限（由 rate_limiter 解释）
+    }
+
+    cfg
+}
+
 // ============================================================================
 // 多凭据 Token 管理器
 // ============================================================================
@@ -882,18 +916,7 @@ impl MultiTokenManager {
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
     ) -> anyhow::Result<Self> {
-        let rate_limit_config = {
-            let mut cfg = RateLimitConfig::default();
-            if let Some(rpm) = config.credential_rpm.filter(|&v| v > 0) {
-                // RPM -> 固定间隔（ms），例如 20 RPM => 3000ms
-                let interval_ms = (60_000u64 / rpm as u64).max(1);
-                cfg.min_interval_ms = interval_ms;
-                cfg.max_interval_ms = interval_ms;
-                // 固定间隔下抖动无意义，避免反复计算造成误差
-                cfg.jitter_percent = 0.0;
-            }
-            cfg
-        };
+        let rate_limit_config = build_rate_limit_config(&config);
 
         // 计算当前最大 ID，为没有 ID 的凭据分配新 ID
         let max_existing_id = credentials.iter().filter_map(|c| c.id).max().unwrap_or(0);
@@ -1045,19 +1068,11 @@ impl MultiTokenManager {
     }
 
     /// 热更新单凭据目标请求速率（RPM）
-    pub fn update_credential_rpm(&self, rpm: Option<u32>) {
-        // 更新 config 中的 credential_rpm
-        self.config.write().credential_rpm = rpm;
-
-        // 重新计算 RateLimitConfig 并应用到 rate_limiter
-        let mut cfg = RateLimitConfig::default();
-        if let Some(rpm) = rpm.filter(|&v| v > 0) {
-            let interval_ms = (60_000u64 / rpm as u64).max(1);
-            cfg.min_interval_ms = interval_ms;
-            cfg.max_interval_ms = interval_ms;
-            cfg.jitter_percent = 0.0;
-        }
-        self.rate_limiter.update_config(cfg);
+    /// 根据当前 `config` 中的 `credential_rpm` / `credential_daily_max`
+    /// 重建限速配置并应用到 rate_limiter（调用前应已更新好 config）。
+    pub fn refresh_rate_limit_from_config(&self) {
+        let config = self.config.read();
+        self.rate_limiter.update_config(build_rate_limit_config(&config));
     }
 
     /// 获取凭据总数
@@ -4182,5 +4197,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ctx.id, 1);
+    }
+
+    // ========================================================================
+    // 限速配置三态语义：credential_rpm / credential_daily_max
+    // ========================================================================
+
+    #[test]
+    fn test_build_rate_limit_config_rpm_three_states() {
+        // 留空：保留默认间隔与抖动
+        let mut config = Config::default();
+        config.credential_rpm = None;
+        let cfg = build_rate_limit_config(&config);
+        assert_eq!(cfg.min_interval_ms, RateLimitConfig::default().min_interval_ms);
+        assert_eq!(cfg.jitter_percent, RateLimitConfig::default().jitter_percent);
+
+        // 0：频率不限（间隔归零、无抖动）
+        config.credential_rpm = Some(0);
+        let cfg = build_rate_limit_config(&config);
+        assert_eq!(cfg.min_interval_ms, 0);
+        assert_eq!(cfg.max_interval_ms, 0);
+        assert_eq!(cfg.jitter_percent, 0.0);
+
+        // >0：固定间隔 60000/rpm，例如 20 RPM => 3000ms
+        config.credential_rpm = Some(20);
+        let cfg = build_rate_limit_config(&config);
+        assert_eq!(cfg.min_interval_ms, 3000);
+        assert_eq!(cfg.max_interval_ms, 3000);
+        assert_eq!(cfg.jitter_percent, 0.0);
+    }
+
+    #[test]
+    fn test_build_rate_limit_config_daily_max_three_states() {
+        // 留空：保留默认日上限
+        let mut config = Config::default();
+        config.credential_daily_max = None;
+        let cfg = build_rate_limit_config(&config);
+        assert_eq!(
+            cfg.daily_max_requests,
+            RateLimitConfig::default().daily_max_requests
+        );
+
+        // 0：不限（rate_limiter 以 0 表示不限）
+        config.credential_daily_max = Some(0);
+        let cfg = build_rate_limit_config(&config);
+        assert_eq!(cfg.daily_max_requests, 0);
+
+        // >0：该值即日上限
+        config.credential_daily_max = Some(1000);
+        let cfg = build_rate_limit_config(&config);
+        assert_eq!(cfg.daily_max_requests, 1000);
+    }
+
+    #[test]
+    fn test_build_rate_limit_config_rpm_and_daily_orthogonal() {
+        // rpm 与 daily 互不干扰：设 rpm=200 不影响 daily 默认值
+        let mut config = Config::default();
+        config.credential_rpm = Some(200);
+        config.credential_daily_max = None;
+        let cfg = build_rate_limit_config(&config);
+        assert_eq!(cfg.min_interval_ms, 300); // 60000/200
+        assert_eq!(
+            cfg.daily_max_requests,
+            RateLimitConfig::default().daily_max_requests,
+            "设置 RPM 不应改变每日上限"
+        );
     }
 }

@@ -79,12 +79,24 @@ pub struct Config {
     /// 单个凭据的目标请求速率（RPM，每分钟请求数）
     ///
     /// 用于凭据级节流/分流：当某个凭据短时间内请求过密时，优先将流量分配到其他可用凭据，
-    /// 从而减少上游 429 的概率。
+    /// 从而减少上游 429 的概率。仅影响请求频率（间隔），与每日总量 `credential_daily_max` 正交。
     ///
-    /// - `None` 或 `0`: 使用内置默认节流策略
-    /// - `>0`: 将最小/最大请求间隔固定为 `60_000 / rpm` 毫秒
+    /// - `None`（留空）: 使用内置默认节流策略（1~2 秒间隔 + 抖动）
+    /// - `Some(0)`: 频率不限（间隔归零、无抖动）
+    /// - `Some(n)` (n>0): 将最小/最大请求间隔固定为 `60_000 / n` 毫秒
     #[serde(default)]
     pub credential_rpm: Option<u32>,
+
+    /// 单个凭据的每日最大请求数
+    ///
+    /// 与 `credential_rpm`（频率）正交：本项控制单凭据每天的请求总量，超过后该凭据
+    /// 限流直至次日重置。
+    ///
+    /// - `None`（留空）: 使用内置默认日上限（500/天）
+    /// - `Some(0)`: 日总量不限
+    /// - `Some(n)` (n>0): 日上限即为 n
+    #[serde(default)]
+    pub credential_daily_max: Option<u32>,
 
     /// 输入压缩配置
     #[serde(default)]
@@ -303,6 +315,7 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             credential_rpm: None,
+            credential_daily_max: None,
             compression: CompressionConfig::default(),
             prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
             prompt_cache_accounting_enabled: default_true(),

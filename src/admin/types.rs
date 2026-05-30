@@ -391,8 +391,10 @@ impl AdminErrorResponse {
 pub struct GlobalConfigResponse {
     /// AWS Region
     pub region: String,
-    /// 单凭据目标请求速率（RPM），None 表示无限制
+    /// 单凭据目标请求速率（RPM）。None=默认策略，0=频率不限，>0=固定间隔
     pub credential_rpm: Option<u32>,
+    /// 单凭据每日最大请求数。None=默认 500，0=不限，>0=该值即上限
+    pub credential_daily_max: Option<u32>,
     /// Prompt Cache TTL（秒）
     pub prompt_cache_ttl_seconds: u64,
     /// 是否启用本地 Prompt Cache usage 记账
@@ -428,6 +430,8 @@ pub struct UpdateGlobalConfigRequest {
     pub region: Option<String>,
     /// 单凭据目标请求速率（RPM，可选）
     pub credential_rpm: Option<Option<u32>>,
+    /// 单凭据每日最大请求数（可选）
+    pub credential_daily_max: Option<Option<u32>>,
     /// Prompt Cache TTL（秒，可选，仅支持 300 或 3600）
     pub prompt_cache_ttl_seconds: Option<u64>,
     /// 是否启用本地 Prompt Cache usage 记账（可选）

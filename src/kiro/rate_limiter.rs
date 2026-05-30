@@ -152,8 +152,8 @@ impl RateLimiter {
             state.count_reset_at = now + Duration::from_secs(86400);
         }
 
-        // 检查每日限制
-        if state.daily_count >= config.daily_max_requests {
+        // 检查每日限制（0 表示不限）
+        if config.daily_max_requests > 0 && state.daily_count >= config.daily_max_requests {
             let wait_time = state.count_reset_at.saturating_duration_since(now);
             return Err(wait_time);
         }
@@ -201,8 +201,8 @@ impl RateLimiter {
             state.count_reset_at = now + Duration::from_secs(86400);
         }
 
-        // 检查每日限制
-        if state.daily_count >= config.daily_max_requests {
+        // 检查每日限制（0 表示不限）
+        if config.daily_max_requests > 0 && state.daily_count >= config.daily_max_requests {
             let wait_time = state.count_reset_at.saturating_duration_since(now);
             return Err(wait_time);
         }
@@ -404,6 +404,23 @@ mod tests {
 
         // 第三次应该被限制
         assert!(limiter.check_rate_limit(1).is_err());
+    }
+
+    #[test]
+    fn test_rate_limiter_daily_limit_zero_means_unlimited() {
+        let config = RateLimitConfig {
+            daily_max_requests: 0, // 0 = 不限
+            min_interval_ms: 0,
+            max_interval_ms: 0,
+            ..Default::default()
+        };
+        let limiter = RateLimiter::new(config);
+
+        // 远超默认 500 的请求量仍应全部放行
+        for _ in 0..1000 {
+            assert!(limiter.check_rate_limit(1).is_ok());
+            limiter.record_success(1);
+        }
     }
 
     #[test]
