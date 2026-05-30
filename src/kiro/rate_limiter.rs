@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 /// 默认每日最大请求数
 const DEFAULT_DAILY_MAX_REQUESTS: u32 = 500;
 
+/// 默认每日计数滑动窗口（秒，24 小时）
+const DEFAULT_DAILY_RESET_SECONDS: u64 = 86_400;
+
 /// 默认最小请求间隔（毫秒）
 const DEFAULT_MIN_INTERVAL_MS: u64 = 1000;
 
@@ -46,6 +49,9 @@ pub struct RateLimitConfig {
     /// 每日最大请求数
     pub daily_max_requests: u32,
 
+    /// 每日计数滑动窗口秒数（达到 daily_max_requests 后等待该秒数才重置）
+    pub daily_reset_seconds: u64,
+
     /// 最小请求间隔（毫秒）
     pub min_interval_ms: u64,
 
@@ -69,6 +75,7 @@ impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
             daily_max_requests: DEFAULT_DAILY_MAX_REQUESTS,
+            daily_reset_seconds: DEFAULT_DAILY_RESET_SECONDS,
             min_interval_ms: DEFAULT_MIN_INTERVAL_MS,
             max_interval_ms: DEFAULT_MAX_INTERVAL_MS,
             jitter_percent: DEFAULT_JITTER_PERCENT,
@@ -149,7 +156,7 @@ impl RateLimiter {
         // 检查是否需要重置每日计数
         if now >= state.count_reset_at {
             state.daily_count = 0;
-            state.count_reset_at = now + Duration::from_secs(86400);
+            state.count_reset_at = now + Duration::from_secs(config.daily_reset_seconds.max(1));
         }
 
         // 检查每日限制（0 表示不限）
@@ -198,7 +205,7 @@ impl RateLimiter {
         // 检查是否需要重置每日计数
         if now >= state.count_reset_at {
             state.daily_count = 0;
-            state.count_reset_at = now + Duration::from_secs(86400);
+            state.count_reset_at = now + Duration::from_secs(config.daily_reset_seconds.max(1));
         }
 
         // 检查每日限制（0 表示不限）

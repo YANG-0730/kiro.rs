@@ -395,6 +395,8 @@ pub struct GlobalConfigResponse {
     pub credential_rpm: Option<u32>,
     /// 单凭据每日最大请求数。None=默认 500，0=不限，>0=该值即上限
     pub credential_daily_max: Option<u32>,
+    /// 每日计数滑动窗口（小时）。None=24，0=不自动重置，>0=该小时数
+    pub credential_daily_window_hours: Option<u32>,
     /// Prompt Cache TTL（秒）
     pub prompt_cache_ttl_seconds: u64,
     /// 是否启用本地 Prompt Cache usage 记账
@@ -432,6 +434,8 @@ pub struct UpdateGlobalConfigRequest {
     pub credential_rpm: Option<Option<u32>>,
     /// 单凭据每日最大请求数（可选）
     pub credential_daily_max: Option<Option<u32>>,
+    /// 每日计数滑动窗口（小时，可选）
+    pub credential_daily_window_hours: Option<Option<u32>>,
     /// Prompt Cache TTL（秒，可选，仅支持 300 或 3600）
     pub prompt_cache_ttl_seconds: Option<u64>,
     /// 是否启用本地 Prompt Cache usage 记账（可选）

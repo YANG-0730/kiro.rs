@@ -188,6 +188,11 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id))
     }
 
+    /// 重置所有凭据的限速 / 冷却状态（不动 enabled / failure_count）
+    pub fn reset_rate_limit_all(&self) {
+        self.token_manager.reset_rate_limit_all();
+    }
+
     /// 强制刷新指定凭据 Token
     pub async fn force_refresh_token(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
@@ -816,6 +821,7 @@ impl AdminService {
             region: config.region.clone(),
             credential_rpm: config.credential_rpm,
             credential_daily_max: config.credential_daily_max,
+            credential_daily_window_hours: config.credential_daily_window_hours,
             prompt_cache_ttl_seconds: config.prompt_cache_ttl_seconds,
             prompt_cache_accounting_enabled: config.prompt_cache_accounting_enabled,
             default_endpoint: config.default_endpoint.clone(),
@@ -860,6 +866,10 @@ impl AdminService {
 
             if let Some(daily_max) = req.credential_daily_max {
                 config.credential_daily_max = daily_max;
+            }
+
+            if let Some(daily_window_hours) = req.credential_daily_window_hours {
+                config.credential_daily_window_hours = daily_window_hours;
             }
 
             if let Some(ttl_seconds) = req.prompt_cache_ttl_seconds {
@@ -913,8 +923,11 @@ impl AdminService {
             self.token_manager.update_region(config.region.clone());
         }
 
-        // 热更新 credential_rpm / credential_daily_max（任一变更即按当前 config 重建限速）
-        if req.credential_rpm.is_some() || req.credential_daily_max.is_some() {
+        // 热更新 credential_rpm / credential_daily_max / credential_daily_window_hours（任一变更即按当前 config 重建限速）
+        if req.credential_rpm.is_some()
+            || req.credential_daily_max.is_some()
+            || req.credential_daily_window_hours.is_some()
+        {
             self.token_manager.refresh_rate_limit_from_config();
         }
 
@@ -1055,6 +1068,7 @@ mod tests {
             region: None,
             credential_rpm: None,
             credential_daily_max: None,
+            credential_daily_window_hours: None,
             prompt_cache_ttl_seconds: None,
             prompt_cache_accounting_enabled: None,
             default_endpoint: Some("cli".to_string()),
@@ -1080,6 +1094,7 @@ mod tests {
             region: None,
             credential_rpm: None,
             credential_daily_max: None,
+            credential_daily_window_hours: None,
             prompt_cache_ttl_seconds: None,
             prompt_cache_accounting_enabled: None,
             default_endpoint: Some("".to_string()),
@@ -1104,6 +1119,7 @@ mod tests {
             region: None,
             credential_rpm: None,
             credential_daily_max: None,
+            credential_daily_window_hours: None,
             prompt_cache_ttl_seconds: None,
             prompt_cache_accounting_enabled: None,
             default_endpoint: Some("   ".to_string()),
@@ -1128,6 +1144,7 @@ mod tests {
             region: None,
             credential_rpm: None,
             credential_daily_max: None,
+            credential_daily_window_hours: None,
             prompt_cache_ttl_seconds: None,
             prompt_cache_accounting_enabled: None,
             default_endpoint: Some("unknown".to_string()),
@@ -1149,6 +1166,7 @@ mod tests {
             region: None,
             credential_rpm: None,
             credential_daily_max: None,
+            credential_daily_window_hours: None,
             prompt_cache_ttl_seconds: None,
             prompt_cache_accounting_enabled: None,
             default_endpoint: Some("  cli  ".to_string()),

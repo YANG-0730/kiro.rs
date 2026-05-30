@@ -8,6 +8,7 @@ import {
   setCredentialRegion,
   setCredentialEndpoint,
   resetCredentialFailure,
+  resetAllRateLimit,
   forceRefreshToken,
   getCredentialBalance,
   getCachedBalances,
@@ -144,6 +145,21 @@ export function useResetFailure() {
     mutationFn: (id: number) => resetCredentialFailure(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 一键清空所有凭据的限速 / 冷却（撞 daily_max 后立即恢复）
+export function useResetAllRateLimit() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: () => resetAllRateLimit(),
+    onSuccess: (data) => {
+      toast.success(data.message || '已清空所有凭据的限速状态')
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+    onError: (error: Error) => {
+      toast.error(`重置失败：${error.message}`)
     },
   })
 }

@@ -103,6 +103,15 @@ pub async fn reset_failure_count(
     }
 }
 
+/// POST /api/admin/credentials/reset-rate-limit
+/// 重置所有凭据的限速 / 冷却状态（用于撞 daily_max 后一键全局恢复）
+pub async fn reset_rate_limit_all(State(state): State<AdminState>) -> impl IntoResponse {
+    state.service.reset_rate_limit_all();
+    Json(SuccessResponse::new(
+        "所有凭据的限速与冷却状态已清空".to_string(),
+    ))
+}
+
 /// POST /api/admin/credentials/:id/refresh
 /// 强制刷新指定凭据 Token
 pub async fn force_refresh_token(

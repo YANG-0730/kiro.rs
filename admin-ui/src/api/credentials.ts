@@ -75,6 +75,13 @@ export async function resetCredentialFailure(
   return data
 }
 
+// 一键清空所有凭据的限速 / 冷却状态（不动 enabled / failure_count）
+// 用于撞 daily_max 后立即恢复，不必等窗口或重启容器
+export async function resetAllRateLimit(): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/credentials/reset-rate-limit')
+  return data
+}
+
 // 设置凭据 Region
 export async function setCredentialRegion(
   id: number,

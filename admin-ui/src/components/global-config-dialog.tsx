@@ -14,6 +14,7 @@ import {
   useUpdateProxyConfig,
   useGlobalConfig,
   useUpdateGlobalConfig,
+  useResetAllRateLimit,
 } from '@/hooks/use-credentials'
 import type { UpdateGlobalConfigRequest, UpdateCompressionConfigRequest } from '@/types/api'
 
@@ -27,11 +28,13 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
   const { data: globalConfig, isLoading: globalLoading } = useGlobalConfig()
   const { mutate: mutateProxy, isPending: proxyPending } = useUpdateProxyConfig()
   const { mutate: mutateGlobal, isPending: globalPending } = useUpdateGlobalConfig()
+  const { mutate: mutateResetRL, isPending: resetRLPending } = useResetAllRateLimit()
 
   // 基本设置
   const [region, setRegion] = useState('')
   const [credentialRpm, setCredentialRpm] = useState('')
   const [credentialDailyMax, setCredentialDailyMax] = useState('')
+  const [credentialDailyWindowHours, setCredentialDailyWindowHours] = useState('')
   const [promptCacheTtlSeconds, setPromptCacheTtlSeconds] = useState('300')
   const [promptCacheAccountingEnabled, setPromptCacheAccountingEnabled] = useState(true)
   const [defaultEndpoint, setDefaultEndpoint] = useState('ide')
@@ -62,6 +65,7 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
       setRegion(globalConfig.region || '')
       setCredentialRpm(globalConfig.credentialRpm?.toString() || '')
       setCredentialDailyMax(globalConfig.credentialDailyMax?.toString() || '')
+      setCredentialDailyWindowHours(globalConfig.credentialDailyWindowHours?.toString() || '')
       setPromptCacheTtlSeconds(globalConfig.promptCacheTtlSeconds.toString())
       setPromptCacheAccountingEnabled(globalConfig.promptCacheAccountingEnabled)
       setDefaultEndpoint(globalConfig.defaultEndpoint || 'ide')
@@ -105,6 +109,12 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
     const newDailyMax = credentialDailyMax.trim() ? parseInt(credentialDailyMax.trim(), 10) : null
     if (newDailyMax !== (globalConfig?.credentialDailyMax ?? null)) {
       globalPayload.credentialDailyMax = newDailyMax
+      hasGlobalChanges = true
+    }
+
+    const newDailyWindowHours = credentialDailyWindowHours.trim() ? parseInt(credentialDailyWindowHours.trim(), 10) : null
+    if (newDailyWindowHours !== (globalConfig?.credentialDailyWindowHours ?? null)) {
+      globalPayload.credentialDailyWindowHours = newDailyWindowHours
       hasGlobalChanges = true
     }
 
@@ -216,6 +226,22 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
               </div>
               {numInput('gcRpm', 'Credential RPM', credentialRpm, setCredentialRpm, '单凭据每分钟请求数（频率）。留空=默认策略，0=频率不限，>0=固定间隔')}
               {numInput('gcDailyMax', 'Credential 每日上限', credentialDailyMax, setCredentialDailyMax, '单凭据每日请求总量。留空=默认 500，0=不限，>0=该值即上限')}
+              {numInput('gcDailyWindowHours', 'Credential 每日窗口（小时）', credentialDailyWindowHours, setCredentialDailyWindowHours, '撞每日上限后多少小时自动重置。留空=默认 24，0=不自动重置（需手动重置），>0=该小时数')}
+              <div className="flex items-center justify-between gap-3 rounded-md border border-dashed border-muted-foreground/30 bg-muted/20 p-3">
+                <div className="space-y-0.5">
+                  <p className="text-sm font-medium">立即重置所有凭据的限速状态</p>
+                  <p className="text-xs text-muted-foreground">撞 daily 上限后一键恢复，不必等窗口或重启容器；不影响 enabled / failure_count</p>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={isPending || resetRLPending}
+                  onClick={() => mutateResetRL()}
+                >
+                  {resetRLPending ? '重置中…' : '一键重置'}
+                </Button>
+              </div>
               <div className="space-y-1">
                 <label htmlFor="gcPromptCacheTtl" className="text-sm font-medium">Prompt Cache TTL</label>
                 <select
