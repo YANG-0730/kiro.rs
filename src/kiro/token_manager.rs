@@ -2182,6 +2182,11 @@ impl MultiTokenManager {
         // 记录使用次数（用于动态 TTL）
         self.record_usage(id);
 
+        // 自增 rate_limiter 的每日计数：让 credential_daily_max 限速真正生效
+        // （历史遗留：record_success 只在测试里被调用，生产路径漏掉，导致 daily_count
+        //  永远停在 0、daily_max_requests 形同虚设。补上这一行。）
+        self.rate_limiter.record_success(id);
+
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -3511,6 +3516,31 @@ mod tests {
         // 再失败一次不会禁用（因为计数已重置）
         manager.report_failure(1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    /// 回归测试：report_success 必须自增 rate_limiter 的 daily_count，
+    /// 否则 credential_daily_max 限速永远不会触发（历史 bug）
+    #[test]
+    fn test_report_success_increments_rate_limiter_daily_count() {
+        let mut config = Config::default();
+        config.credential_daily_max = Some(2);
+        // 同时设 rpm=0（频率不限），避免 1s 默认间隔干扰对 daily 的断言
+        config.credential_rpm = Some(0);
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        let limiter = manager.rate_limiter();
+        // 第一次：可获取
+        assert!(limiter.try_acquire(1).is_ok());
+        manager.report_success(1);
+        // 第二次：仍可获取（已用 1）
+        assert!(limiter.try_acquire(1).is_ok());
+        manager.report_success(1);
+        // 第三次：已用 2，daily_max=2，应被拦
+        assert!(
+            limiter.try_acquire(1).is_err(),
+            "report_success 没自增 daily_count，limiter 限不到 daily_max"
+        );
     }
 
     #[tokio::test]
