@@ -128,10 +128,16 @@ impl AdminService {
     }
 
     /// 设置凭据禁用状态
-    pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminServiceError> {
+    pub async fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_disabled(id, disabled)
-            .map_err(|e| self.classify_error(e, id))
+            .map_err(|e| self.classify_error(e, id))?;
+        // 启用时若注册表里没有该凭据缓存（例如启动时它就是禁用状态被跳过了），
+        // 立即拉一次模型列表写入注册表，避免被模型→凭据白名单过滤掉
+        if !disabled {
+            self.token_manager.sync_credential_models(id).await;
+        }
+        Ok(())
     }
 
     /// 设置凭据优先级
@@ -190,10 +196,13 @@ impl AdminService {
     }
 
     /// 重置失败计数并重新启用
-    pub fn reset_and_enable(&self, id: u64) -> Result<(), AdminServiceError> {
+    pub async fn reset_and_enable(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
             .reset_and_enable(id)
-            .map_err(|e| self.classify_error(e, id))
+            .map_err(|e| self.classify_error(e, id))?;
+        // 重启用后同步模型注册表（与 set_disabled(false) 同理）
+        self.token_manager.sync_credential_models(id).await;
+        Ok(())
     }
 
     /// 重置所有凭据的限速 / 冷却状态（不动 enabled / failure_count）

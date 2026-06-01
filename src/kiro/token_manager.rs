@@ -2611,6 +2611,34 @@ impl MultiTokenManager {
         fetch_available_models(&credentials, &config, &token, proxy.as_ref()).await
     }
 
+    /// 同步 ModelRegistry：拉取指定凭据的可用模型列表并写入缓存
+    ///
+    /// 用于凭据生命周期变化时（add/启用）即时同步白名单，避免依赖每小时的
+    /// 后台刷新。失败仅打 warn，不阻塞调用方——白名单查不到时会退化为全量候选。
+    pub async fn sync_credential_models(&self, id: u64) {
+        let registry = match self.model_registry.read().clone() {
+            Some(r) => r,
+            None => return,
+        };
+        match self.fetch_models_for(id).await {
+            Ok(resp) => {
+                let count = resp.models.len();
+                registry.update_credential(id, resp.models);
+                tracing::info!("凭据 #{} 模型列表已同步至注册表: {} 个模型", id, count);
+            }
+            Err(e) => {
+                tracing::warn!("凭据 #{} 模型列表同步失败（不阻塞）: {}", id, e);
+            }
+        }
+    }
+
+    /// 从 ModelRegistry 中移除指定凭据
+    fn drop_credential_from_registry(&self, id: u64) {
+        if let Some(registry) = self.model_registry.read().as_ref() {
+            registry.remove_credential(id);
+        }
+    }
+
     // ========================================================================
     // Admin API 方法
     // ========================================================================
@@ -3075,6 +3103,9 @@ impl MultiTokenManager {
         // 6. 持久化
         self.persist_credentials()?;
 
+        // 7. 同步模型注册表（让新凭据立即进入模型→凭据白名单，避免要等到下次定时刷新）
+        self.sync_credential_models(new_id).await;
+
         tracing::info!("成功添加凭据 #{}", new_id);
         Ok(new_id)
     }
@@ -3117,6 +3148,9 @@ impl MultiTokenManager {
 
         // 立即回写统计数据，清除已删除凭据的残留条目
         self.save_stats();
+
+        // 从模型注册表中移除该凭据，避免白名单仍把它当作某些模型的支持者
+        self.drop_credential_from_registry(id);
 
         tracing::info!("已删除凭据 #{}", id);
         Ok(())

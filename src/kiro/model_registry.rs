@@ -60,6 +60,14 @@ impl ModelRegistry {
             .insert(credential_id, CredentialModelCache::new(models));
     }
 
+    /// 从注册表中移除指定凭据的模型缓存
+    ///
+    /// 调用场景：凭据被删除时，避免 `credentials_supporting` 仍把已不存在的
+    /// 凭据 ID 当作某个模型的支持者，从而污染模型→凭据白名单。
+    pub fn remove_credential(&self, credential_id: u64) {
+        self.caches.write().remove(&credential_id);
+    }
+
     pub fn get_union_models(&self) -> Vec<AvailableModelEntry> {
         let caches = self.caches.read();
         let mut seen = HashSet::new();
@@ -267,5 +275,44 @@ mod tests {
         // 精确匹配集合保留原始大小写
         assert!(cache.model_ids.contains("claude-opus-4.8"));
         assert!(cache.model_ids.contains("Claude-Haiku-4.5"));
+    }
+
+    /// remove_credential 应该把该凭据从 credentials_supporting 的命中集合里彻底移除
+    /// （回归测试：修复「删除/新增凭据后白名单未同步」的脏数据问题，详见
+    /// `MultiTokenManager::sync_credential_models` / `drop_credential_from_registry`）
+    #[test]
+    fn test_remove_credential_clears_supporting() {
+        fn entry(id: &str) -> AvailableModelEntry {
+            AvailableModelEntry {
+                model_id: id.to_string(),
+                model_name: None,
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                token_limits: None,
+                supported_input_types: None,
+                prompt_caching: None,
+                model_provider: None,
+                status: None,
+                available_origins: None,
+                additional_model_request_fields_schema: None,
+            }
+        }
+
+        let reg = ModelRegistry::new();
+        reg.update_credential(1, vec![entry("claude-opus-4.8")]);
+        reg.update_credential(2, vec![entry("claude-opus-4.8")]);
+
+        let mut supporting = reg.credentials_supporting("claude-opus-4.8");
+        supporting.sort();
+        assert_eq!(supporting, vec![1, 2]);
+
+        reg.remove_credential(1);
+        let supporting = reg.credentials_supporting("claude-opus-4.8");
+        assert_eq!(supporting, vec![2]);
+
+        reg.remove_credential(2);
+        assert!(reg.credentials_supporting("claude-opus-4.8").is_empty());
+        assert!(reg.is_empty());
     }
 }
