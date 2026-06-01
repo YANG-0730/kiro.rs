@@ -108,6 +108,20 @@ pub struct Config {
     #[serde(default)]
     pub credential_daily_window_seconds: Option<u64>,
 
+    /// 上游 429 触发的冷却时长（秒）
+    ///
+    /// 控制收到上游 429（速率限制）时本地对该凭据施加的冷却时间。仅影响 429
+    /// 这一种瞬态错误的处理；其它原因（QuotaExhausted/AuthFailed 等）走默认策略。
+    ///
+    /// - `None`（留空）: 默认策略——基础 60s，递增至最多 5 分钟，并尊重上游
+    ///   `Retry-After` 头（夹在 60s ~ 300s 之间）
+    /// - `Some(0)`: 不进入冷却。当前请求直接切到下一个可用凭据，但**不**挂起
+    ///   触发 429 的凭据；下次轮询仍可能命中同一凭据，由 `credentialRpm` /
+    ///   `credentialDailyMax` 控制实际间隔。适合凭据池小、想最大化吞吐的场景
+    /// - `Some(n)` (n>0): 固定冷却 n 秒，忽略上游 Retry-After 与递增策略
+    #[serde(default)]
+    pub rate_limit_cooldown_secs: Option<u32>,
+
     /// 输入压缩配置
     #[serde(default)]
     pub compression: CompressionConfig,
@@ -327,6 +341,7 @@ impl Default for Config {
             credential_rpm: None,
             credential_daily_max: None,
             credential_daily_window_seconds: None,
+            rate_limit_cooldown_secs: None,
             compression: CompressionConfig::default(),
             prompt_cache_ttl_seconds: default_prompt_cache_ttl_seconds(),
             prompt_cache_accounting_enabled: default_true(),

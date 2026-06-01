@@ -361,6 +361,7 @@ export interface GlobalConfigResponse {
   credentialRpm: number | null
   credentialDailyMax: number | null
   credentialDailyWindowSeconds: number | null
+  rateLimitCooldownSecs: number | null
   promptCacheTtlSeconds: number
   promptCacheAccountingEnabled: boolean
   defaultEndpoint: string
@@ -386,6 +387,7 @@ export interface UpdateGlobalConfigRequest {
   credentialRpm?: number | null
   credentialDailyMax?: number | null
   credentialDailyWindowSeconds?: number | null
+  rateLimitCooldownSecs?: number | null
   promptCacheTtlSeconds?: number
   promptCacheAccountingEnabled?: boolean
   defaultEndpoint?: string

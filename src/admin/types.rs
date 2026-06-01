@@ -407,6 +407,8 @@ pub struct GlobalConfigResponse {
     pub credential_daily_max: Option<u32>,
     /// 每日计数滑动窗口（秒）。None=86400，0=不自动重置，>0=该秒数
     pub credential_daily_window_seconds: Option<u64>,
+    /// 上游 429 冷却时长（秒）。None=默认策略，0=不冷却，>0=固定该秒数
+    pub rate_limit_cooldown_secs: Option<u32>,
     /// Prompt Cache TTL（秒）
     pub prompt_cache_ttl_seconds: u64,
     /// 是否启用本地 Prompt Cache usage 记账
@@ -446,6 +448,8 @@ pub struct UpdateGlobalConfigRequest {
     pub credential_daily_max: Option<Option<u32>>,
     /// 每日计数滑动窗口（秒，可选）
     pub credential_daily_window_seconds: Option<Option<u64>>,
+    /// 上游 429 冷却时长（秒，可选）
+    pub rate_limit_cooldown_secs: Option<Option<u32>>,
     /// Prompt Cache TTL（秒，可选，仅支持 300 或 3600）
     pub prompt_cache_ttl_seconds: Option<u64>,
     /// 是否启用本地 Prompt Cache usage 记账（可选）

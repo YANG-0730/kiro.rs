@@ -896,15 +896,36 @@ impl KiroProvider {
         body: &str,
         retry_after: Option<Duration>,
     ) -> Duration {
+        // 读取用户对 429 冷却的全局覆盖配置（rate_limit_cooldown_secs）
+        // - None：走默认策略（基础 60s + 递增，尊重 retry-after 夹在 60~300s）
+        // - Some(0)：完全不进入本地冷却，本次请求切到下一个凭据，但不挂起当前凭据
+        // - Some(n)：固定 n 秒，忽略 retry-after 和递增
+        let cooldown_override = self.token_manager.config().rate_limit_cooldown_secs;
+
+        if matches!(cooldown_override, Some(0)) {
+            tracing::warn!(
+                credential_id = %credential_id,
+                rate_limit_response = %Self::is_rate_limit_response(body),
+                "凭据触发 429 限流，按配置不进入冷却（rateLimitCooldownSecs=0），切换下个凭据继续"
+            );
+            return Duration::ZERO;
+        }
+
+        let custom = match cooldown_override {
+            Some(n) if n > 0 => Some(Duration::from_secs(n as u64)),
+            _ => retry_after,
+        };
+
         let cooldown = self.token_manager.set_credential_cooldown_with_duration(
             credential_id,
             crate::kiro::cooldown::CooldownReason::RateLimitExceeded,
-            retry_after,
+            custom,
         );
 
         tracing::warn!(
             credential_id = %credential_id,
             retry_after_secs = ?retry_after.map(|d| d.as_secs()),
+            cooldown_override_secs = ?cooldown_override,
             cooldown_secs = %cooldown.as_secs(),
             rate_limit_response = %Self::is_rate_limit_response(body),
             "凭据触发 429 限流，已设置冷却"
@@ -1506,6 +1527,60 @@ mod tests {
         assert_eq!(reason, CooldownReason::RateLimitExceeded);
         assert!(remaining <= Duration::from_secs(60));
         assert!(remaining > Duration::from_secs(50));
+    }
+
+    /// rate_limit_cooldown_secs = Some(0)：429 不进入冷却，直接返回零时长，
+    /// CooldownManager 中也不应有该凭据的冷却条目（保留给下次调用立即可用）
+    #[test]
+    fn test_handle_rate_limited_response_zero_cooldown_skips_cooldown() {
+        let mut config = Config::default();
+        config.rate_limit_cooldown_secs = Some(0);
+        let credentials = KiroCredentials::default();
+        let provider = create_test_provider(config, credentials);
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("120"));
+
+        let cooldown = provider.handle_rate_limited_response(
+            1,
+            "Too many requests",
+            KiroProvider::parse_retry_after(&headers),
+        );
+        assert_eq!(cooldown, Duration::ZERO);
+        assert!(
+            provider
+                .token_manager()
+                .cooldown_manager()
+                .check_cooldown(1)
+                .is_none(),
+            "rate_limit_cooldown_secs=0 时不应写入冷却状态"
+        );
+    }
+
+    /// rate_limit_cooldown_secs = Some(n>0)：固定 n 秒，忽略上游 Retry-After 与递增策略
+    #[test]
+    fn test_handle_rate_limited_response_fixed_custom_cooldown() {
+        let mut config = Config::default();
+        config.rate_limit_cooldown_secs = Some(15);
+        let credentials = KiroCredentials::default();
+        let provider = create_test_provider(config, credentials);
+        let mut headers = HeaderMap::new();
+        // 即使上游给了 retry-after=600（被 clamp 到 300），也应被自定义 15s 覆盖
+        headers.insert("retry-after", HeaderValue::from_static("600"));
+
+        let cooldown = provider.handle_rate_limited_response(
+            1,
+            "Too many requests",
+            KiroProvider::parse_retry_after(&headers),
+        );
+        assert_eq!(cooldown, Duration::from_secs(15));
+
+        let (reason, remaining) = provider
+            .token_manager()
+            .cooldown_manager()
+            .check_cooldown(1)
+            .unwrap();
+        assert_eq!(reason, CooldownReason::RateLimitExceeded);
+        assert!(remaining <= Duration::from_secs(15));
     }
 
     #[test]

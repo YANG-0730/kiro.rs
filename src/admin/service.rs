@@ -848,6 +848,7 @@ impl AdminService {
             credential_rpm: config.credential_rpm,
             credential_daily_max: config.credential_daily_max,
             credential_daily_window_seconds: config.credential_daily_window_seconds,
+            rate_limit_cooldown_secs: config.rate_limit_cooldown_secs,
             prompt_cache_ttl_seconds: config.prompt_cache_ttl_seconds,
             prompt_cache_accounting_enabled: config.prompt_cache_accounting_enabled,
             default_endpoint: config.default_endpoint.clone(),
@@ -896,6 +897,10 @@ impl AdminService {
 
             if let Some(daily_window_seconds) = req.credential_daily_window_seconds {
                 config.credential_daily_window_seconds = daily_window_seconds;
+            }
+
+            if let Some(cooldown_secs) = req.rate_limit_cooldown_secs {
+                config.rate_limit_cooldown_secs = cooldown_secs;
             }
 
             if let Some(ttl_seconds) = req.prompt_cache_ttl_seconds {
@@ -1095,6 +1100,7 @@ mod tests {
             credential_rpm: None,
             credential_daily_max: None,
             credential_daily_window_seconds: None,
+            rate_limit_cooldown_secs: None,
             prompt_cache_ttl_seconds: None,
             prompt_cache_accounting_enabled: None,
             default_endpoint: Some("cli".to_string()),
@@ -1121,6 +1127,7 @@ mod tests {
             credential_rpm: None,
             credential_daily_max: None,
             credential_daily_window_seconds: None,
+            rate_limit_cooldown_secs: None,
             prompt_cache_ttl_seconds: None,
             prompt_cache_accounting_enabled: None,
             default_endpoint: Some("".to_string()),
@@ -1146,6 +1153,7 @@ mod tests {
             credential_rpm: None,
             credential_daily_max: None,
             credential_daily_window_seconds: None,
+            rate_limit_cooldown_secs: None,
             prompt_cache_ttl_seconds: None,
             prompt_cache_accounting_enabled: None,
             default_endpoint: Some("   ".to_string()),
@@ -1171,6 +1179,7 @@ mod tests {
             credential_rpm: None,
             credential_daily_max: None,
             credential_daily_window_seconds: None,
+            rate_limit_cooldown_secs: None,
             prompt_cache_ttl_seconds: None,
             prompt_cache_accounting_enabled: None,
             default_endpoint: Some("unknown".to_string()),
@@ -1193,6 +1202,7 @@ mod tests {
             credential_rpm: None,
             credential_daily_max: None,
             credential_daily_window_seconds: None,
+            rate_limit_cooldown_secs: None,
             prompt_cache_ttl_seconds: None,
             prompt_cache_accounting_enabled: None,
             default_endpoint: Some("  cli  ".to_string()),

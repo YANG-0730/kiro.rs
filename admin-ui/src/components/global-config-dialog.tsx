@@ -35,6 +35,7 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
   const [credentialRpm, setCredentialRpm] = useState('')
   const [credentialDailyMax, setCredentialDailyMax] = useState('')
   const [credentialDailyWindowSeconds, setCredentialDailyWindowSeconds] = useState('')
+  const [rateLimitCooldownSecs, setRateLimitCooldownSecs] = useState('')
   const [promptCacheTtlSeconds, setPromptCacheTtlSeconds] = useState('300')
   const [promptCacheAccountingEnabled, setPromptCacheAccountingEnabled] = useState(true)
   const [defaultEndpoint, setDefaultEndpoint] = useState('ide')
@@ -66,6 +67,7 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
       setCredentialRpm(globalConfig.credentialRpm?.toString() || '')
       setCredentialDailyMax(globalConfig.credentialDailyMax?.toString() || '')
       setCredentialDailyWindowSeconds(globalConfig.credentialDailyWindowSeconds?.toString() || '')
+      setRateLimitCooldownSecs(globalConfig.rateLimitCooldownSecs?.toString() || '')
       setPromptCacheTtlSeconds(globalConfig.promptCacheTtlSeconds.toString())
       setPromptCacheAccountingEnabled(globalConfig.promptCacheAccountingEnabled)
       setDefaultEndpoint(globalConfig.defaultEndpoint || 'ide')
@@ -115,6 +117,12 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
     const newDailyWindowSeconds = credentialDailyWindowSeconds.trim() ? parseInt(credentialDailyWindowSeconds.trim(), 10) : null
     if (newDailyWindowSeconds !== (globalConfig?.credentialDailyWindowSeconds ?? null)) {
       globalPayload.credentialDailyWindowSeconds = newDailyWindowSeconds
+      hasGlobalChanges = true
+    }
+
+    const newRateLimitCooldownSecs = rateLimitCooldownSecs.trim() ? parseInt(rateLimitCooldownSecs.trim(), 10) : null
+    if (newRateLimitCooldownSecs !== (globalConfig?.rateLimitCooldownSecs ?? null)) {
+      globalPayload.rateLimitCooldownSecs = newRateLimitCooldownSecs
       hasGlobalChanges = true
     }
 
@@ -227,6 +235,7 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
               {numInput('gcRpm', '每分钟请求数 (RPM)', credentialRpm, setCredentialRpm, '单凭据的请求频率上限。留空使用默认节流（约 1~2 秒/次），0 表示不限频率，>0 表示固定为该 RPM')}
               {numInput('gcDailyMax', '每日请求总量上限', credentialDailyMax, setCredentialDailyMax, '单凭据每日累计请求次数上限。留空使用默认 500，0 表示不限制，>0 表示即为该值')}
               {numInput('gcDailyWindowSeconds', '每日额度重置窗口（秒）', credentialDailyWindowSeconds, setCredentialDailyWindowSeconds, '达到每日上限后，等待多少秒自动恢复。留空使用默认 86400 秒（24 小时），0 表示不自动恢复（需手动重置），>0 表示该秒数。常用：60、3600、86400')}
+              {numInput('gcRateLimitCooldown', '上游 429 冷却时长（秒）', rateLimitCooldownSecs, setRateLimitCooldownSecs, '收到上游 429 限流时，本地对该凭据的冷却秒数。留空使用默认策略（60s 起步、最长 5 分钟、尊重 Retry-After），0 表示不冷却（仅切换凭据但不挂起当前凭据），>0 表示固定为该秒数')}
               <div className="flex items-center justify-between gap-3 rounded-md border border-dashed border-muted-foreground/30 bg-muted/20 p-3">
                 <div className="space-y-0.5">
                   <p className="text-sm font-medium">立即恢复所有凭据的请求额度</p>
