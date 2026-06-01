@@ -68,6 +68,16 @@ impl ModelRegistry {
         self.caches.write().remove(&credential_id);
     }
 
+    /// 注册表中已有缓存条目的凭据 ID 集合
+    ///
+    /// 用于「未知凭据兜底」：若某个 entries 里的凭据 ID 不在该集合内（即从未
+    /// 成功拉取过模型列表，例如刚启用尚未刷新 token / 同步失败），就不能依据
+    /// `credentials_supporting` 判定它「不支持某模型」——应将其纳入候选，让
+    /// 请求实际打到上游，由上游错误（400/403）决定是否可用。
+    pub fn known_credentials(&self) -> HashSet<u64> {
+        self.caches.read().keys().copied().collect()
+    }
+
     pub fn get_union_models(&self) -> Vec<AvailableModelEntry> {
         let caches = self.caches.read();
         let mut seen = HashSet::new();

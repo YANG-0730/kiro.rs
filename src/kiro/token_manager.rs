@@ -1074,11 +1074,6 @@ impl MultiTokenManager {
         self.config.write().default_endpoint = default_endpoint;
     }
 
-    /// 热更新上游 429 冷却时长配置
-    pub fn update_rate_limit_cooldown_secs(&self, secs: Option<u32>) {
-        self.config.write().rate_limit_cooldown_secs = secs;
-    }
-
     /// 用一份新的 Config 整体覆盖内部运行时配置
     ///
     /// 用于 admin 端持久化全局配置后，把全部字段一次性同步到 token_manager
@@ -2536,12 +2531,24 @@ impl MultiTokenManager {
         let model_id = model_id?;
         let guard = self.model_registry.read();
         let registry = guard.as_ref()?;
-        let supporting = registry.credentials_supporting(model_id);
+        let supporting: std::collections::HashSet<u64> =
+            registry.credentials_supporting(model_id).into_iter().collect();
         if supporting.is_empty() {
-            None
-        } else {
-            Some(supporting.into_iter().collect())
+            return None;
         }
+
+        // 兜底：把「entries 中存在但 registry 还没缓存过」的凭据也纳入白名单。
+        // 这类凭据可能是刚启用尚未拉到模型列表、或上游 ListAvailableModels 暂时
+        // 失败——本地不应替上游回答「这个号支持不支持这个模型」，让它进候选，
+        // 由真实请求的 400/403 决定是否可用，避免出现「明明启用了却被本地挡死」。
+        let known = registry.known_credentials();
+        let mut whitelist = supporting;
+        for entry in self.entries.lock().iter() {
+            if !entry.disabled && !known.contains(&entry.id) {
+                whitelist.insert(entry.id);
+            }
+        }
+        Some(whitelist)
     }
 
     /// 初始化模型注册表：为每个启用的凭据拉取可用模型列表
@@ -2632,11 +2639,33 @@ impl MultiTokenManager {
     ///
     /// 用于凭据生命周期变化时（add/启用）即时同步白名单，避免依赖每小时的
     /// 后台刷新。失败仅打 warn，不阻塞调用方——白名单查不到时会退化为全量候选。
+    ///
+    /// 对 OAuth 凭据先做一次强制刷新，避免长期禁用后重新启用、access_token 已过期，
+    /// 直接拿旧 token 去拉模型列表被 403 拒绝。
     pub async fn sync_credential_models(&self, id: u64) {
         let registry = match self.model_registry.read().clone() {
             Some(r) => r,
             None => return,
         };
+
+        let is_api_key = self
+            .entries
+            .lock()
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.credentials.is_api_key_credential())
+            .unwrap_or(false);
+
+        if !is_api_key {
+            if let Err(e) = self.force_refresh_token_for(id).await {
+                tracing::warn!(
+                    "凭据 #{} 同步前刷新 Token 失败（继续尝试用旧 token 拉模型列表）: {}",
+                    id,
+                    e
+                );
+            }
+        }
+
         match self.fetch_models_for(id).await {
             Ok(resp) => {
                 let count = resp.models.len();
@@ -4366,6 +4395,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ctx.id, 1);
+    }
+
+    /// 凭据存在但 registry 中无缓存（如刚启用尚未 sync），不应被本地白名单挡死，
+    /// 应作为「未知凭据」纳入候选，由真实请求的上游错误决定可用性。
+    /// 回归：「禁用→启用」后白名单仍把新启用的号过滤掉的 bug。
+    #[tokio::test]
+    async fn test_acquire_context_for_model_includes_unknown_credentials() {
+        let config = Config::default();
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        // 仅 #1 在 registry 中，并且只支持 model-a
+        let registry = Arc::new(crate::kiro::model_registry::ModelRegistry::new());
+        registry.update_credential(1, vec![model_entry("model-a")]);
+        manager.set_model_registry(registry);
+
+        // 请求 model-a：#2 是 registry 未知凭据，应该和 #1 一起进候选
+        let mut hit_two = false;
+        for _ in 0..20 {
+            let ctx = manager
+                .acquire_context_for_model(Some("model-a"))
+                .await
+                .unwrap();
+            if ctx.id == 2 {
+                hit_two = true;
+                break;
+            }
+        }
+        assert!(
+            hit_two,
+            "registry 未知的凭据应该被纳入候选，避免本地把刚启用的号挡死"
+        );
     }
 
     // ========================================================================
