@@ -1074,6 +1074,23 @@ impl MultiTokenManager {
         self.config.write().default_endpoint = default_endpoint;
     }
 
+    /// 热更新上游 429 冷却时长配置
+    pub fn update_rate_limit_cooldown_secs(&self, secs: Option<u32>) {
+        self.config.write().rate_limit_cooldown_secs = secs;
+    }
+
+    /// 用一份新的 Config 整体覆盖内部运行时配置
+    ///
+    /// 用于 admin 端持久化全局配置后，把全部字段一次性同步到 token_manager
+    /// 的内部 RwLock<Config>，避免逐字段写漏（历史上 update_region /
+    /// update_default_endpoint / update_rate_limit_cooldown_secs 这些专项
+    /// setter 容易遗漏新增字段，导致「保存后不生效，必须重启」）。
+    ///
+    /// 不会触发 rate_limiter 重建——调用方需要按需配合 `refresh_rate_limit_from_config`。
+    pub fn replace_config(&self, new_config: Config) {
+        *self.config.write() = new_config;
+    }
+
     /// 热更新单凭据目标请求速率（RPM）
     /// 根据当前 `config` 中的 `credential_rpm` / `credential_daily_max`
     /// 重建限速配置并应用到 rate_limiter（调用前应已更新好 config）。

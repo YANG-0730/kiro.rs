@@ -949,6 +949,11 @@ impl AdminService {
         // 2. 持久化成功后再应用运行时变更
         let config = self.config.read();
 
+        // 先把全部字段一次性同步到 token_manager 的内部 Config 副本，避免
+        // 后续逐字段 update_xxx 漏掉新字段（典型 bug：增加了字段但忘了在
+        // update_global_config 里加对应同步，导致保存后必须重启才生效）
+        self.token_manager.replace_config(config.clone());
+
         // 热更新 region
         if req.region.is_some() {
             self.token_manager.update_region(config.region.clone());
