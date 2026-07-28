@@ -515,6 +515,11 @@ pub struct StreamContext {
     pub thinking_extracted: bool,
     /// thinking 块索引
     pub thinking_block_index: Option<i32>,
+    /// 结构化推理块索引（新模型 reasoningContentEvent 专用，与内联 thinking 互斥）
+    pub reasoning_block_index: Option<i32>,
+    /// 上游模型上下文窗口大小（来自 ListAvailableModels 的 maxInputTokens）；
+    /// None 表示 registry 未命中，回退到 `get_context_window_size` 静态判断
+    pub context_window: Option<i32>,
     /// 文本块索引（按需动态分配）
     pub text_block_index: Option<i32>,
     /// 上游 meteringEvent 透传的 credit usage，仅用于最终 usage 统计，不生成独立 SSE 事件
@@ -548,10 +553,18 @@ impl StreamContext {
             in_thinking_block: false,
             thinking_extracted: false,
             thinking_block_index: None,
+            reasoning_block_index: None,
+            context_window: None,
             text_block_index: None,
             metering: None,
             strip_thinking_leading_newline: false,
         }
+    }
+
+    /// 设置上游模型上下文窗口大小（来自 registry 的 maxInputTokens）
+    pub fn with_context_window(mut self, context_window: Option<i32>) -> Self {
+        self.context_window = context_window;
+        self
     }
 
     /// 生成 message_start 事件
@@ -610,10 +623,15 @@ impl StreamContext {
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
         match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
+            Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(context_usage) => {
-                // 从上下文使用百分比计算实际的 input_tokens
-                let context_window = super::types::get_context_window_size(&self.model) as f64;
+                // 从上下文使用百分比计算实际的 input_tokens。
+                // 优先用 registry 提供的真实 maxInputTokens，未命中时回退静态判断。
+                let context_window = self
+                    .context_window
+                    .unwrap_or_else(|| super::types::get_context_window_size(&self.model))
+                    as f64;
                 let actual_input_tokens =
                     (context_usage.context_usage_percentage * context_window / 100.0) as i32;
                 self.context_input_tokens = Some(actual_input_tokens);
@@ -668,17 +686,116 @@ impl StreamContext {
             return Vec::new();
         }
 
+        // 结构化推理块（新模型）在正文开始前必须关闭
+        let mut events = self.close_reasoning_block_if_open();
+
         // 估算 tokens
         self.output_tokens += estimate_tokens(content);
 
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
-            return self.process_content_with_thinking(content);
+            events.extend(self.process_content_with_thinking(content));
+            return events;
         }
 
         // 非 thinking 模式同样复用统一的 text_delta 发送逻辑，
         // 以便在 tool_use 自动关闭文本块后能够自愈重建新的文本块，避免“吞字”。
-        self.create_text_delta_events(content)
+        events.extend(self.create_text_delta_events(content));
+        events
+    }
+
+    /// 处理结构化推理内容事件（新模型的 reasoningContentEvent）
+    ///
+    /// 新模型（opus-5 / sonnet-5 / opus-4.8 等）通过独立事件流返回思考内容，
+    /// 与老模型在正文中内联 `<thinking>` 标签的机制互斥。这里将其映射为
+    /// Anthropic 的 `thinking` 内容块：
+    /// - 首个 `text` 帧触发 `content_block_start(type=thinking)`
+    /// - 后续 `text` 帧转为 `thinking_delta`
+    /// - `signature` 帧转为 `signature_delta`
+    ///
+    /// 推理块在首个正文（assistantResponseEvent）或 tool_use 到达前关闭
+    /// （见 `close_reasoning_block_if_open`）。
+    fn process_reasoning_content(
+        &mut self,
+        reasoning: &crate::kiro::model::events::ReasoningContentEvent,
+    ) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+
+        // 按需创建 thinking 块
+        let index = if let Some(idx) = self.reasoning_block_index {
+            idx
+        } else {
+            let idx = self.state_manager.next_block_index();
+            self.reasoning_block_index = Some(idx);
+            let start_events = self.state_manager.handle_content_block_start(
+                idx,
+                "thinking",
+                json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {
+                        "type": "thinking",
+                        "thinking": ""
+                    }
+                }),
+            );
+            events.extend(start_events);
+            idx
+        };
+
+        // text 增量 → thinking_delta
+        if let Some(text) = &reasoning.text
+            && !text.is_empty()
+        {
+            self.output_tokens += estimate_tokens(text);
+            if let Some(delta) = self.state_manager.handle_content_block_delta(
+                index,
+                json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "thinking_delta",
+                        "thinking": text
+                    }
+                }),
+            ) {
+                events.push(delta);
+            }
+        }
+
+        // signature 帧 → signature_delta
+        if let Some(signature) = &reasoning.signature
+            && !signature.is_empty()
+            && let Some(delta) = self.state_manager.handle_content_block_delta(
+                index,
+                json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "signature_delta",
+                        "signature": signature
+                    }
+                }),
+            )
+        {
+            events.push(delta);
+        }
+
+        events
+    }
+
+    /// 若结构化推理块处于打开状态，先关闭它
+    ///
+    /// 在正文文本或 tool_use 开始前调用，确保 thinking 块先于其他内容块结束，
+    /// 符合 Anthropic 的内容块顺序约定。
+    fn close_reasoning_block_if_open(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        if let Some(idx) = self.reasoning_block_index.take()
+            && let Some(stop_event) = self.state_manager.handle_content_block_stop(idx)
+        {
+            events.push(stop_event);
+        }
+        events
     }
 
     /// 处理包含thinking块的内容
@@ -907,7 +1024,8 @@ impl StreamContext {
         &mut self,
         tool_use: &crate::kiro::model::events::ToolUseEvent,
     ) -> Vec<SseEvent> {
-        let mut events = Vec::new();
+        // 结构化推理块（新模型）在 tool_use 开始前必须关闭
+        let mut events = self.close_reasoning_block_if_open();
 
         self.state_manager.set_has_tool_use(true);
 
@@ -2236,5 +2354,132 @@ mod tests {
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
         );
+    }
+
+    fn reasoning_event(
+        text: Option<&str>,
+        signature: Option<&str>,
+    ) -> crate::kiro::model::events::ReasoningContentEvent {
+        serde_json::from_value(serde_json::json!({
+            "text": text,
+            "signature": signature,
+        }))
+        .unwrap()
+    }
+
+    /// 结构化推理事件（新模型）→ Anthropic thinking 块，且在正文前正确关闭
+    #[test]
+    fn test_reasoning_content_events_map_to_thinking_block() {
+        // thinking_enabled=false：结构化推理独立于内联 thinking 机制
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5",
+            1,
+            zero_cache_usage(),
+            false,
+            HashMap::new(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut events = Vec::new();
+        events.extend(
+            ctx.process_kiro_event(&Event::ReasoningContent(reasoning_event(
+                Some("thinking part 1 "),
+                None,
+            ))),
+        );
+        events.extend(
+            ctx.process_kiro_event(&Event::ReasoningContent(reasoning_event(
+                Some("part 2"),
+                None,
+            ))),
+        );
+        events.extend(
+            ctx.process_kiro_event(&Event::ReasoningContent(reasoning_event(
+                None,
+                Some("SIG123"),
+            ))),
+        );
+        // 正文到达，应先关闭 thinking 块
+        let assistant: crate::kiro::model::events::AssistantResponseEvent =
+            serde_json::from_value(serde_json::json!({"content": "the answer"})).unwrap();
+        events.extend(ctx.process_kiro_event(&Event::AssistantResponse(assistant)));
+        events.extend(ctx.generate_final_events());
+
+        // content_block_start 类型顺序：thinking 先于 text
+        let block_types: Vec<(&str, i64)> = events
+            .iter()
+            .filter(|e| e.event == "content_block_start")
+            .map(|e| {
+                (
+                    e.data["content_block"]["type"].as_str().unwrap(),
+                    e.data["index"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(block_types.len(), 2, "应有 thinking 与 text 两个块");
+        assert_eq!(block_types[0].0, "thinking");
+        assert_eq!(block_types[1].0, "text");
+        let thinking_index = block_types[0].1;
+        let text_index = block_types[1].1;
+
+        // thinking_delta 内容拼接正确
+        let thinking_text: String = events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "thinking_delta"
+            })
+            .map(|e| {
+                e.data["delta"]["thinking"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(thinking_text, "thinking part 1 part 2");
+
+        // signature_delta 存在
+        assert!(events.iter().any(|e| {
+            e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "signature_delta"
+                && e.data["delta"]["signature"] == "SIG123"
+        }));
+
+        // thinking 块在 text 块开始前关闭
+        let thinking_stop_pos = events.iter().position(|e| {
+            e.event == "content_block_stop" && e.data["index"].as_i64() == Some(thinking_index)
+        });
+        let text_start_pos = events.iter().position(|e| {
+            e.event == "content_block_start" && e.data["index"].as_i64() == Some(text_index)
+        });
+        assert!(thinking_stop_pos.is_some() && text_start_pos.is_some());
+        assert!(
+            thinking_stop_pos.unwrap() < text_start_pos.unwrap(),
+            "thinking 块必须在 text 块之前关闭"
+        );
+    }
+
+    /// 仅有推理内容、无正文时，final_events 应关闭 thinking 块
+    #[test]
+    fn test_reasoning_only_closes_block_at_end() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5",
+            1,
+            zero_cache_usage(),
+            false,
+            HashMap::new(),
+        );
+        let _ = ctx.generate_initial_events();
+        let mut events = Vec::new();
+        events.extend(
+            ctx.process_kiro_event(&Event::ReasoningContent(reasoning_event(
+                Some("only thinking"),
+                Some("SIG"),
+            ))),
+        );
+        events.extend(ctx.generate_final_events());
+
+        // thinking 块应被 content_block_stop 关闭
+        assert!(events.iter().any(|e| e.event == "content_block_stop"));
+        assert!(events.iter().any(|e| e.event == "message_stop"));
     }
 }

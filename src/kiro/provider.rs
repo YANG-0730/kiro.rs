@@ -47,6 +47,9 @@ const DEFAULT_RATE_LIMIT_COOLDOWN_SECS: u64 = 60;
 /// 429 冷却最大时长上限（避免异常 Retry-After 把单号挂死太久）
 const MAX_RATE_LIMIT_COOLDOWN_SECS: u64 = 300;
 
+/// 余额不足判定阈值（基础剩余额度低于此值且无可用超额时禁用凭据）
+const BALANCE_INSUFFICIENT_THRESHOLD: f64 = 1.0;
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -196,12 +199,21 @@ impl KiroProvider {
         tokio::spawn(async move {
             match tm.get_usage_limits_for(id).await {
                 Ok(resp) => {
-                    let remaining = resp.usage_limit() - resp.current_usage();
+                    let remaining = (resp.usage_limit() - resp.current_usage()).max(0.0);
                     tm.update_balance_cache(id, remaining);
                     tracing::debug!("凭据 #{} 余额缓存已刷新: {:.2}", id, remaining);
-                    if remaining < 1.0 {
+                    // 余额耗尽才禁用；开启超额且未达上限的账号即使基础余额为 0 也保持启用
+                    if resp.is_exhausted(BALANCE_INSUFFICIENT_THRESHOLD) {
                         tm.mark_insufficient_balance(id);
                         tracing::warn!("凭据 #{} 余额不足 ({:.2})，已主动禁用", id, remaining);
+                    } else if remaining < BALANCE_INSUFFICIENT_THRESHOLD
+                        && resp.has_available_overage()
+                    {
+                        tracing::debug!(
+                            "凭据 #{} 基础余额为 {:.2}，但已开启超额计费，保持启用",
+                            id,
+                            remaining
+                        );
                     }
                 }
                 Err(e) => {

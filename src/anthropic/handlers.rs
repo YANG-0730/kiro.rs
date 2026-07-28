@@ -59,6 +59,8 @@ struct StreamRequestContext<'a> {
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     user_id: Option<&'a str>,
+    /// 上游模型上下文窗口（maxInputTokens），None 表示回退静态判断
+    context_window: Option<i32>,
 }
 
 struct NonStreamRequestContext<'a> {
@@ -69,6 +71,8 @@ struct NonStreamRequestContext<'a> {
     input_tokens: i32,
     tool_name_map: std::collections::HashMap<String, String>,
     user_id: Option<&'a str>,
+    /// 上游模型上下文窗口（maxInputTokens），None 表示回退静态判断
+    context_window: Option<i32>,
     cache_tracker: Option<&'a std::sync::Arc<crate::anthropic::cache_tracker::CacheTracker>>,
     cache_profile: Option<&'a crate::anthropic::cache_tracker::CacheProfile>,
 }
@@ -655,9 +659,7 @@ pub async fn get_models(
     })
 }
 
-fn build_models_from_registry(
-    registry: &crate::kiro::model_registry::ModelRegistry,
-) -> Vec<Model> {
+fn build_models_from_registry(registry: &crate::kiro::model_registry::ModelRegistry) -> Vec<Model> {
     let upstream = registry.get_union_models();
     let mut models = Vec::new();
 
@@ -740,6 +742,12 @@ pub async fn post_messages(
         .and_then(|r| r.max_output_tokens_for(&payload.model))
         .map(|v| v.to_string())
         .unwrap_or_else(|| "-".to_string());
+    // 上游模型的上下文窗口（maxInputTokens），用于将 contextUsageEvent 百分比
+    // 换算回实际 input tokens；None 时下游回退到静态判断
+    let model_context_window = state
+        .model_registry
+        .as_ref()
+        .and_then(|r| r.max_input_tokens_for(&payload.model));
 
     tracing::info!(
         path = %uri.path(),
@@ -988,6 +996,7 @@ pub async fn post_messages(
             thinking_enabled,
             tool_name_map: tool_name_map.clone(),
             user_id: user_id.as_deref(),
+            context_window: model_context_window,
         };
         handle_stream_request(provider, stream_request).await
     } else {
@@ -1003,6 +1012,7 @@ pub async fn post_messages(
                 .accounting_enabled
                 .then_some(&prompt_cache.tracker),
             cache_profile: cache_profile.as_ref(),
+            context_window: model_context_window,
         };
         handle_non_stream_request(provider, non_stream_request).await
     }
@@ -1052,7 +1062,8 @@ async fn handle_stream_request(
         final_cache_usage,
         context.thinking_enabled,
         context.tool_name_map,
-    );
+    )
+    .with_context_window(context.context_window);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1230,6 +1241,9 @@ async fn handle_non_stream_request(
     }
 
     let mut text_content = String::new();
+    // 结构化推理内容（新模型 reasoningContentEvent）：thinking 文本与结束签名
+    let mut reasoning_content = String::new();
+    let mut reasoning_signature: Option<String> = None;
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
@@ -1249,6 +1263,14 @@ async fn handle_non_stream_request(
                     match event {
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
+                        }
+                        Event::ReasoningContent(reasoning) => {
+                            if let Some(text) = reasoning.text {
+                                reasoning_content.push_str(&text);
+                            }
+                            if let Some(sig) = reasoning.signature {
+                                reasoning_signature = Some(sig);
+                            }
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
@@ -1323,9 +1345,11 @@ async fn handle_non_stream_request(
                             }
                         }
                         Event::ContextUsage(context_usage) => {
-                            // 从上下文使用百分比计算实际的 input_tokens
-                            let context_window =
-                                super::types::get_context_window_size(context.model) as f64;
+                            // 从上下文使用百分比计算实际的 input_tokens。
+                            // 优先用 registry 提供的真实 maxInputTokens，未命中时回退静态判断。
+                            let context_window = context.context_window.unwrap_or_else(|| {
+                                super::types::get_context_window_size(context.model)
+                            }) as f64;
                             let actual_input_tokens =
                                 (context_usage.context_usage_percentage * context_window / 100.0)
                                     as i32;
@@ -1375,6 +1399,15 @@ async fn handle_non_stream_request(
 
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
+
+    // 结构化推理块（新模型）置于最前，符合 Anthropic 内容块顺序约定
+    if !reasoning_content.is_empty() {
+        content.push(json!({
+            "type": "thinking",
+            "thinking": reasoning_content,
+            "signature": reasoning_signature.unwrap_or_default()
+        }));
+    }
 
     if !text_content.is_empty() {
         content.push(json!({

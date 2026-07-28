@@ -151,7 +151,46 @@ impl ModelRegistry {
         for cache in caches.values() {
             for entry in &cache.models {
                 if entry.model_id == model_id {
-                    return entry.token_limits.as_ref().and_then(|t| t.max_output_tokens);
+                    return entry
+                        .token_limits
+                        .as_ref()
+                        .and_then(|t| t.max_output_tokens);
+                }
+            }
+        }
+        None
+    }
+
+    /// 按客户端模型名查上游模型的 maxInputTokens（上下文窗口大小）
+    ///
+    /// 用于把 `contextUsageEvent` 的百分比换算回实际 input tokens。
+    /// 上游 `ListAvailableModels` 是权威来源（新模型 1M、老模型 200k 等各不相同），
+    /// 避免在代码中硬编码模型→窗口映射。
+    pub fn max_input_tokens_for(&self, client_model: &str) -> Option<i32> {
+        let model_id = self.resolve_client_model(client_model)?;
+        let caches = self.caches.read();
+        for cache in caches.values() {
+            for entry in &cache.models {
+                if entry.model_id == model_id {
+                    return entry.token_limits.as_ref().and_then(|t| t.max_input_tokens);
+                }
+            }
+        }
+        None
+    }
+
+    /// 按客户端模型名查上游模型的 additionalModelRequestFieldsSchema
+    ///
+    /// 用于决定向上游透传 thinking / effort / reasoning 配置的字段形状：
+    /// Claude 系模型 schema 含 `thinking` + `output_config`，GPT 系含 `reasoning`，
+    /// null-schema 模型返回 None（不支持扩展参数）。
+    pub fn additional_fields_schema_for(&self, client_model: &str) -> Option<serde_json::Value> {
+        let model_id = self.resolve_client_model(client_model)?;
+        let caches = self.caches.read();
+        for cache in caches.values() {
+            for entry in &cache.models {
+                if entry.model_id == model_id {
+                    return entry.additional_model_request_fields_schema.clone();
                 }
             }
         }

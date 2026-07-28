@@ -530,6 +530,14 @@ pub fn convert_request(
         user_input = user_input.with_images(images);
     }
 
+    // 12.1. 透传模型扩展字段（thinking / effort / reasoning）
+    // 依据上游模型 schema 决定字段形状；null-schema 模型返回 None（不透传）
+    let model_schema = model_registry.and_then(|r| r.additional_fields_schema_for(&req.model));
+    if let Some(fields) = build_additional_model_request_fields(req, model_schema.as_ref()) {
+        tracing::debug!(model = %req.model, ?fields, "透传 additionalModelRequestFields");
+        user_input = user_input.with_additional_model_request_fields(fields);
+    }
+
     let current_message = CurrentMessage::new(user_input);
 
     // 12.5. 图片统计日志
@@ -1044,6 +1052,114 @@ fn has_thinking_tags(content: &str) -> bool {
     content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
 }
 
+/// 归一化 effort 值（白名单，非法回退 high）
+fn normalize_effort(raw: &str) -> &'static str {
+    match raw {
+        "low" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        "xhigh" => "xhigh",
+        "max" => "max",
+        other => {
+            tracing::warn!("未知的 effort 值 '{}', 回退为 'high'", other);
+            "high"
+        }
+    }
+}
+
+/// 判断模型 schema 的某个顶层 property 是否存在
+fn schema_has_property(schema: &serde_json::Value, key: &str) -> bool {
+    schema.get("properties").and_then(|p| p.get(key)).is_some()
+}
+
+/// 根据模型的 additionalModelRequestFieldsSchema 和客户端请求，
+/// 构建发往上游的 `additionalModelRequestFields`
+///
+/// 权威来源是上游 schema（新模型才有）：
+/// - Claude 系（schema 含 `thinking`）：映射 `thinking.type`(adaptive/disabled) +
+///   `output_config.effort`，并透传 `display`（默认 summarized）。
+///   客户端 `thinking.type=enabled|adaptive` → adaptive；`disabled`/未设 → disabled。
+/// - GPT 系（schema 含 `reasoning`）：映射 `reasoning.effort`；
+///   客户端未开启 thinking 时不设置（用上游默认）。
+///
+/// 返回 None 表示无需透传（null-schema 模型，或无可映射配置）。
+fn build_additional_model_request_fields(
+    req: &MessagesRequest,
+    model_schema: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let schema = model_schema?;
+
+    let client_effort = req.output_config.as_ref().map(|c| c.effort.as_str());
+    let thinking_type = req.thinking.as_ref().map(|t| t.thinking_type.as_str());
+
+    // Claude 系：thinking + output_config.effort
+    if schema_has_property(schema, "thinking") {
+        let mut fields = serde_json::Map::new();
+
+        // thinking.type：enabled/adaptive → adaptive；其余（disabled / 未设）→ disabled
+        let want_thinking = matches!(thinking_type, Some("enabled") | Some("adaptive"));
+        let mut thinking_obj = serde_json::Map::new();
+        thinking_obj.insert(
+            "type".to_string(),
+            serde_json::Value::String(
+                if want_thinking {
+                    "adaptive"
+                } else {
+                    "disabled"
+                }
+                .to_string(),
+            ),
+        );
+        // schema 支持 display 时透传（默认 summarized）
+        if schema
+            .get("properties")
+            .and_then(|p| p.get("thinking"))
+            .and_then(|t| t.get("properties"))
+            .and_then(|p| p.get("display"))
+            .is_some()
+        {
+            thinking_obj.insert(
+                "display".to_string(),
+                serde_json::Value::String("summarized".to_string()),
+            );
+        }
+        fields.insert(
+            "thinking".to_string(),
+            serde_json::Value::Object(thinking_obj),
+        );
+
+        // output_config.effort：仅当 schema 支持且客户端提供了 effort 时透传
+        if want_thinking
+            && schema_has_property(schema, "output_config")
+            && let Some(effort) = client_effort
+        {
+            let effort = normalize_effort(effort);
+            fields.insert(
+                "output_config".to_string(),
+                serde_json::json!({ "effort": effort }),
+            );
+        }
+
+        return Some(serde_json::Value::Object(fields));
+    }
+
+    // GPT 系：reasoning.effort
+    if schema_has_property(schema, "reasoning") {
+        // 仅当客户端显式提供了 effort 时才透传，否则用上游默认
+        let effort = client_effort?;
+        let effort = match effort {
+            "none" | "low" | "medium" | "high" | "xhigh" | "max" => effort,
+            other => {
+                tracing::warn!("未知的 reasoning effort 值 '{}', 回退为 'high'", other);
+                "high"
+            }
+        };
+        return Some(serde_json::json!({ "reasoning": { "effort": effort } }));
+    }
+
+    None
+}
+
 /// 检查请求的工具列表中是否包含 Write 或 Edit 工具
 fn has_write_or_edit_tool(req: &MessagesRequest) -> bool {
     req.tools
@@ -1527,12 +1643,157 @@ mod tests {
     fn test_map_model_non_claude_passthrough() {
         let reg = test_registry();
         // 非 Claude 模型原样匹配上游 ID
-        assert_eq!(map_model("deepseek-3.2", Some(&reg)).unwrap(), "deepseek-3.2");
-        assert_eq!(map_model("minimax-m2.1", Some(&reg)).unwrap(), "minimax-m2.1");
+        assert_eq!(
+            map_model("deepseek-3.2", Some(&reg)).unwrap(),
+            "deepseek-3.2"
+        );
+        assert_eq!(
+            map_model("minimax-m2.1", Some(&reg)).unwrap(),
+            "minimax-m2.1"
+        );
         assert_eq!(map_model("glm-5", Some(&reg)).unwrap(), "glm-5");
         assert_eq!(map_model("auto", Some(&reg)).unwrap(), "auto");
         // 非 Claude 的横杠形式也能反查（deepseek-3-2 → deepseek-3.2）
-        assert_eq!(map_model("deepseek-3-2", Some(&reg)).unwrap(), "deepseek-3.2");
+        assert_eq!(
+            map_model("deepseek-3-2", Some(&reg)).unwrap(),
+            "deepseek-3.2"
+        );
+    }
+
+    // === additionalModelRequestFields 映射 ===
+
+    fn claude_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "thinking": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string", "enum": ["adaptive", "disabled"]},
+                        "display": {"type": "string", "enum": ["summarized", "omitted"]}
+                    },
+                    "required": ["type"]
+                },
+                "output_config": {
+                    "type": "object",
+                    "properties": {
+                        "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]}
+                    }
+                },
+                "max_tokens": {"type": "integer"}
+            }
+        })
+    }
+
+    fn gpt_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "reasoning": {
+                    "type": "object",
+                    "properties": {
+                        "mode": {"type": "string", "enum": ["standard", "pro"]},
+                        "effort": {"type": "string", "enum": ["none", "low", "medium", "high", "xhigh", "max"]}
+                    }
+                }
+            }
+        })
+    }
+
+    fn req_with_thinking(thinking_type: Option<&str>, effort: Option<&str>) -> MessagesRequest {
+        MessagesRequest {
+            model: "test".to_string(),
+            max_tokens: 1024,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: thinking_type.map(|t| super::super::types::Thinking {
+                thinking_type: t.to_string(),
+                budget_tokens: 8000,
+            }),
+            output_config: effort.map(|e| super::super::types::OutputConfig {
+                effort: e.to_string(),
+            }),
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_amrf_null_schema_returns_none() {
+        // null-schema 模型：不透传任何字段
+        let req = req_with_thinking(Some("enabled"), Some("high"));
+        assert!(build_additional_model_request_fields(&req, None).is_none());
+    }
+
+    #[test]
+    fn test_amrf_claude_thinking_enabled_with_effort() {
+        let schema = claude_schema();
+        let req = req_with_thinking(Some("enabled"), Some("max"));
+        let fields = build_additional_model_request_fields(&req, Some(&schema)).unwrap();
+        assert_eq!(fields["thinking"]["type"], "adaptive");
+        assert_eq!(fields["thinking"]["display"], "summarized");
+        assert_eq!(fields["output_config"]["effort"], "max");
+    }
+
+    #[test]
+    fn test_amrf_claude_adaptive_maps_to_adaptive() {
+        let schema = claude_schema();
+        let req = req_with_thinking(Some("adaptive"), Some("low"));
+        let fields = build_additional_model_request_fields(&req, Some(&schema)).unwrap();
+        assert_eq!(fields["thinking"]["type"], "adaptive");
+        assert_eq!(fields["output_config"]["effort"], "low");
+    }
+
+    #[test]
+    fn test_amrf_claude_disabled_and_unset() {
+        let schema = claude_schema();
+        // 显式 disabled
+        let req = req_with_thinking(Some("disabled"), Some("high"));
+        let fields = build_additional_model_request_fields(&req, Some(&schema)).unwrap();
+        assert_eq!(fields["thinking"]["type"], "disabled");
+        // disabled 时不应带 output_config（effort 只在开启思考时有意义）
+        assert!(fields.get("output_config").is_none());
+        // 完全未设 thinking → disabled
+        let req2 = req_with_thinking(None, None);
+        let fields2 = build_additional_model_request_fields(&req2, Some(&schema)).unwrap();
+        assert_eq!(fields2["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn test_amrf_claude_invalid_effort_falls_back_high() {
+        let schema = claude_schema();
+        let req = req_with_thinking(Some("enabled"), Some("超高"));
+        let fields = build_additional_model_request_fields(&req, Some(&schema)).unwrap();
+        assert_eq!(fields["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn test_amrf_claude_enabled_without_effort_omits_output_config() {
+        let schema = claude_schema();
+        let req = req_with_thinking(Some("enabled"), None);
+        let fields = build_additional_model_request_fields(&req, Some(&schema)).unwrap();
+        assert_eq!(fields["thinking"]["type"], "adaptive");
+        assert!(fields.get("output_config").is_none());
+    }
+
+    #[test]
+    fn test_amrf_gpt_reasoning_effort() {
+        let schema = gpt_schema();
+        let req = req_with_thinking(None, Some("none"));
+        let fields = build_additional_model_request_fields(&req, Some(&schema)).unwrap();
+        assert_eq!(fields["reasoning"]["effort"], "none");
+        // schema 无 thinking，不应带 thinking 字段
+        assert!(fields.get("thinking").is_none());
+    }
+
+    #[test]
+    fn test_amrf_gpt_no_effort_returns_none() {
+        let schema = gpt_schema();
+        // 客户端未提供 effort → 用上游默认，不透传
+        let req = req_with_thinking(Some("enabled"), None);
+        assert!(build_additional_model_request_fields(&req, Some(&schema)).is_none());
     }
 
     #[test]
@@ -2664,8 +2925,12 @@ mod tests {
             metadata: None,
         };
 
-        let result =
-            convert_request(&req_no_system_with_edit, &CompressionConfig::default(), None).unwrap();
+        let result = convert_request(
+            &req_no_system_with_edit,
+            &CompressionConfig::default(),
+            None,
+        )
+        .unwrap();
         let first_user = &result.conversation_state.history[0];
         match first_user {
             Message::User(u) => {

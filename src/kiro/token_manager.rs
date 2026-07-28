@@ -576,7 +576,7 @@ fn build_rate_limit_config(config: &Config) -> RateLimitConfig {
     let mut cfg = RateLimitConfig::default();
 
     match config.credential_rpm {
-        None => {}              // 留空：保留默认间隔/抖动
+        None => {} // 留空：保留默认间隔/抖动
         Some(0) => {
             // 频率不限
             cfg.min_interval_ms = 0;
@@ -593,8 +593,8 @@ fn build_rate_limit_config(config: &Config) -> RateLimitConfig {
     }
 
     match config.credential_daily_max {
-        None => {}                              // 留空：保留默认日上限
-        Some(v) => cfg.daily_max_requests = v,  // 0 = 不限（由 rate_limiter 解释）
+        None => {}                             // 留空：保留默认日上限
+        Some(v) => cfg.daily_max_requests = v, // 0 = 不限（由 rate_limiter 解释）
     }
 
     // daily 滑动窗口（秒）：留空保持默认 86400；0 = 永不自动重置；>0 = 即为窗口大小
@@ -1091,7 +1091,8 @@ impl MultiTokenManager {
     /// 重建限速配置并应用到 rate_limiter（调用前应已更新好 config）。
     pub fn refresh_rate_limit_from_config(&self) {
         let config = self.config.read();
-        self.rate_limiter.update_config(build_rate_limit_config(&config));
+        self.rate_limiter
+            .update_config(build_rate_limit_config(&config));
     }
 
     /// 获取凭据总数
@@ -2477,14 +2478,20 @@ impl MultiTokenManager {
 
                     self.update_balance_cache(id, remaining);
 
-                    // 余额小于 1 时自动禁用凭据
-                    if remaining < 1.0 {
+                    // 余额耗尽时自动禁用凭据（但开启超额且未达上限的账号不禁用）
+                    if limits.is_exhausted(LOW_BALANCE_THRESHOLD) {
                         let mut entries = self.entries.lock();
                         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                             entry.disabled = true;
                             entry.disable_reason = Some(DisableReason::InsufficientBalance);
                             tracing::warn!("凭据 #{} 余额不足 ({:.2})，已自动禁用", id, remaining);
                         }
+                    } else if remaining < LOW_BALANCE_THRESHOLD && limits.has_available_overage() {
+                        tracing::info!(
+                            "凭据 #{} 基础余额为 {:.2}，但已开启超额计费，保持启用",
+                            id,
+                            remaining
+                        );
                     } else {
                         tracing::info!("凭据 #{} 余额初始化成功: {:.2}", id, remaining);
                     }
@@ -2511,10 +2518,7 @@ impl MultiTokenManager {
     }
 
     /// 设置模型注册表引用（用于按模型过滤候选凭据）
-    pub fn set_model_registry(
-        &self,
-        registry: Arc<crate::kiro::model_registry::ModelRegistry>,
-    ) {
+    pub fn set_model_registry(&self, registry: Arc<crate::kiro::model_registry::ModelRegistry>) {
         *self.model_registry.write() = Some(registry);
     }
 
@@ -2531,8 +2535,10 @@ impl MultiTokenManager {
         let model_id = model_id?;
         let guard = self.model_registry.read();
         let registry = guard.as_ref()?;
-        let supporting: std::collections::HashSet<u64> =
-            registry.credentials_supporting(model_id).into_iter().collect();
+        let supporting: std::collections::HashSet<u64> = registry
+            .credentials_supporting(model_id)
+            .into_iter()
+            .collect();
         if supporting.is_empty() {
             return None;
         }
@@ -2569,10 +2575,7 @@ impl MultiTokenManager {
             return 0;
         }
 
-        tracing::info!(
-            "正在拉取 {} 个凭据的可用模型列表...",
-            credential_ids.len()
-        );
+        tracing::info!("正在拉取 {} 个凭据的可用模型列表...", credential_ids.len());
 
         let mut success_count = 0;
 
@@ -4446,8 +4449,14 @@ mod tests {
         let mut config = Config::default();
         config.credential_rpm = None;
         let cfg = build_rate_limit_config(&config);
-        assert_eq!(cfg.min_interval_ms, RateLimitConfig::default().min_interval_ms);
-        assert_eq!(cfg.jitter_percent, RateLimitConfig::default().jitter_percent);
+        assert_eq!(
+            cfg.min_interval_ms,
+            RateLimitConfig::default().min_interval_ms
+        );
+        assert_eq!(
+            cfg.jitter_percent,
+            RateLimitConfig::default().jitter_percent
+        );
 
         // 0：频率不限（间隔归零、无抖动）
         config.credential_rpm = Some(0);

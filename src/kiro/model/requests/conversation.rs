@@ -117,6 +117,12 @@ pub struct UserInputMessage {
     /// 消息来源（通常为 "AI_EDITOR"）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// 额外模型请求字段（thinking / output_config.effort / reasoning 等）
+    ///
+    /// 仅当模型支持且客户端有对应配置时才写入。经验证，只有放在
+    /// `userInputMessage` 层级才对上游生效；null-schema 模型会静默忽略，安全。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_model_request_fields: Option<serde_json::Value>,
 }
 
 impl UserInputMessage {
@@ -128,7 +134,14 @@ impl UserInputMessage {
             model_id: model_id.into(),
             images: Vec::new(),
             origin: Some("AI_EDITOR".to_string()),
+            additional_model_request_fields: None,
         }
+    }
+
+    /// 设置额外模型请求字段
+    pub fn with_additional_model_request_fields(mut self, fields: serde_json::Value) -> Self {
+        self.additional_model_request_fields = Some(fields);
+        self
     }
 
     /// 设置消息上下文

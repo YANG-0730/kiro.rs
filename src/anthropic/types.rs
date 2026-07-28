@@ -321,13 +321,24 @@ pub struct CountTokensResponse {
 
 /// 根据模型名称获取上下文窗口大小
 ///
-/// - Opus 4.6 和 Sonnet 4.6 系列: 1,000,000 tokens
+/// 注意：这是**兜底**逻辑，权威来源是上游 `ListAvailableModels` 的
+/// `maxInputTokens`（见 `ModelRegistry::max_input_tokens_for`）。仅当 registry
+/// 未命中（拉取失败 / 测试）时才依据模型名粗略判断。
+///
+/// - 1M 上下文: Claude Opus/Sonnet 4.6 及以上（含 opus-5 / sonnet-5 / opus-4.7 / opus-4.8）
 /// - 其他模型: 200,000 tokens
 pub fn get_context_window_size(model: &str) -> i32 {
     let model_lower = model.to_lowercase();
-    if (model_lower.contains("opus") || model_lower.contains("sonnet"))
-        && (model_lower.contains("4-6") || model_lower.contains("4.6"))
-    {
+    let is_claude_opus_or_sonnet = model_lower.contains("opus") || model_lower.contains("sonnet");
+    // 1M 上下文的 Claude 版本：4.6 / 4.7 / 4.8 / 5（含横杠与点号两种写法）
+    let is_1m_version = ["4-6", "4.6", "4-7", "4.7", "4-8", "4.8"]
+        .iter()
+        .any(|v| model_lower.contains(v))
+        || model_lower.contains("opus-5")
+        || model_lower.contains("sonnet-5")
+        || model_lower.contains("opus5")
+        || model_lower.contains("sonnet5");
+    if is_claude_opus_or_sonnet && is_1m_version {
         1_000_000
     } else {
         200_000
