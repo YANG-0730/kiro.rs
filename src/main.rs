@@ -176,7 +176,9 @@ async fn main() {
 
     // 初始化模型注册表（动态拉取上游可用模型列表）
     let model_registry = std::sync::Arc::new(crate::kiro::model_registry::ModelRegistry::new());
-    let model_init_count = token_manager.initialize_model_registry(&model_registry).await;
+    let model_init_count = token_manager
+        .initialize_model_registry(&model_registry)
+        .await;
     if model_init_count == 0 {
         tracing::warn!("所有凭据模型列表拉取失败，/v1/models 将返回空列表，请求将无法通过模型校验");
     }
@@ -197,6 +199,14 @@ async fn main() {
             }
         });
     }
+
+    // 启动 Token 主动刷新后台任务（每 60s 检查，过期前 15 分钟预刷新）
+    // 避免空闲期 IdC Token 过期后，下一批请求撞到过期窗口报"没有可用的凭据"。
+    // 返回的 Arc<BackgroundRefresher> 一旦 drop 会 stop() 后台任务，
+    // 因此必须持有到 main 结束（server 常驻运行期间）。
+    let _token_refresher = token_manager.start_background_refresh(
+        crate::kiro::background_refresh::BackgroundRefreshConfig::default(),
+    );
 
     // 初始化 count_tokens 配置
     {
