@@ -1264,8 +1264,8 @@ async fn handle_non_stream_request(
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
-    #[cfg(feature = "sensitive-logs")]
-    let mut context_input_tokens_for_log: Option<i32> = None;
+    // 从 contextUsageEvent 换算的上游实际输入 tokens（优先作为最终 usage 口径）
+    let mut context_input_tokens: Option<i32> = None;
     // 从 meteringEvent 透传的 credit usage，仅用于最终 usage 字段
     let mut metering: Option<MeteringEvent> = None;
 
@@ -1370,10 +1370,7 @@ async fn handle_non_stream_request(
                             let actual_input_tokens =
                                 (context_usage.context_usage_percentage * context_window / 100.0)
                                     as i32;
-                            #[cfg(feature = "sensitive-logs")]
-                            {
-                                context_input_tokens_for_log = Some(actual_input_tokens);
-                            }
+                            context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
                                 stop_reason = "model_context_window_exceeded".to_string();
@@ -1438,8 +1435,24 @@ async fn handle_non_stream_request(
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // non-stream 与 stream 保持一致：始终使用本地估算的 input_tokens 作为最终口径。
-    let final_input_tokens = context.input_tokens;
+    // 与 stream 一致：总输入优先用上游 contextUsageEvent 换算值，缺失时回退本地估算；
+    // cache 读写按同口径缩放
+    let (final_input_tokens, final_cache_breakdown) = super::stream::reconcile_input_usage(
+        context.input_tokens,
+        context_input_tokens,
+        final_cache_context.map(|ctx| CacheUsageBreakdown {
+            cache_creation_input_tokens: ctx.cache_creation_input_tokens,
+            cache_read_input_tokens: ctx.cache_read_input_tokens,
+            cache_creation_5m_input_tokens: ctx.cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens: ctx.cache_creation_1h_input_tokens,
+        }),
+    );
+    let final_cache_context = final_cache_breakdown.map(|b| CacheUsageContext {
+        cache_creation_input_tokens: b.cache_creation_input_tokens,
+        cache_read_input_tokens: b.cache_read_input_tokens,
+        cache_creation_5m_input_tokens: b.cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens: b.cache_creation_1h_input_tokens,
+    });
     let billed_input_tokens = final_cache_context
         .map(|ctx| {
             billed_input_tokens(
@@ -1450,24 +1463,15 @@ async fn handle_non_stream_request(
         })
         .unwrap_or(final_input_tokens);
 
-    #[cfg(feature = "sensitive-logs")]
-    tracing::info!(
-        estimated_input_tokens = context.input_tokens,
-        context_input_tokens = ?context_input_tokens_for_log,
-        final_input_tokens,
-        billed_input_tokens,
-        output_tokens,
-        "Non-stream usage: final_input_tokens={} (估算值), context_input_tokens={} (上游值), billed_input_tokens={}, output_tokens={}",
-        final_input_tokens,
-        context_input_tokens_for_log.map_or("N/A".to_string(), |v| v.to_string()),
-        billed_input_tokens,
-        output_tokens
-    );
-
-    // credit 是上游唯一真实的消耗指标（meteringEvent），默认打日志便于额度核算
+    // credit 是上游唯一真实的消耗指标（meteringEvent），默认打日志便于额度核算；
+    // 同时记录本地估算与上游换算的输入 tokens，便于持续对比两者偏差
     tracing::info!(
         credential_id = credential_id,
         credit_usage = metering.as_ref().map(|m| m.usage).unwrap_or(0.0),
+        estimated_input_tokens = context.input_tokens,
+        upstream_input_tokens = ?context_input_tokens,
+        final_input_tokens,
+        billed_input_tokens,
         output_tokens,
         stream = false,
         "请求完成 credit 消耗"
@@ -1733,23 +1737,34 @@ mod tests {
     }
 
     #[test]
-    fn test_non_stream_usage_uses_estimated_input_tokens_as_base() {
+    fn test_non_stream_usage_prefers_upstream_input_tokens_and_scales_cache() {
+        use super::super::stream::{CacheUsageBreakdown, reconcile_input_usage};
         let estimated_input_tokens = 1493;
         let upstream_context_input_tokens = 3106;
-        let cache_creation_input_tokens = 9;
-        let cache_read_input_tokens = 1480;
+        let cache = CacheUsageBreakdown {
+            cache_creation_input_tokens: 9,
+            cache_read_input_tokens: 1480,
+            cache_creation_5m_input_tokens: 9,
+            cache_creation_1h_input_tokens: 0,
+        };
 
-        let final_input_tokens = estimated_input_tokens;
+        let (final_input_tokens, scaled) = reconcile_input_usage(
+            estimated_input_tokens,
+            Some(upstream_context_input_tokens),
+            Some(cache),
+        );
+        let scaled = scaled.unwrap();
+        assert_eq!(final_input_tokens, 3106);
+        // 1480 * 3106 / 1493 ≈ 3079；9 * 3106 / 1493 ≈ 19
+        assert_eq!(scaled.cache_read_input_tokens, 3079);
+        assert_eq!(scaled.cache_creation_input_tokens, 19);
+        assert_eq!(scaled.cache_creation_5m_input_tokens, 19);
         let billed = billed_input_tokens(
             final_input_tokens,
-            cache_creation_input_tokens,
-            cache_read_input_tokens,
+            scaled.cache_creation_input_tokens,
+            scaled.cache_read_input_tokens,
         );
-
-        assert_eq!(final_input_tokens, 1493);
-        assert_eq!(upstream_context_input_tokens, 3106);
-        assert_eq!(billed, 4);
-        assert_ne!(final_input_tokens, upstream_context_input_tokens);
+        assert_eq!(billed, 8);
     }
 
     #[test]

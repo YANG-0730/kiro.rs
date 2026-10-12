@@ -1220,12 +1220,14 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(" "));
         }
 
-        // 始终基于本地估算输入与 cache 统计来生成 usage，
-        // 避免因服务端压缩导致上游 token 统计偏低，使客户端误判上下文大小。
-        // credit usage 则仅透传上游 meteringEvent，不影响本地 input/cache usage 语义。
-        let final_input_tokens = self.input_tokens;
-        let billed_input_tokens = self
-            .cache_usage
+        // 总输入优先用上游 contextUsageEvent 换算值（模型实际上下文大小），缺失时回退本地估算；
+        // cache 读写按同口径缩放。credit usage 仅透传上游 meteringEvent。
+        let (final_input_tokens, final_cache_usage) = reconcile_input_usage(
+            self.input_tokens,
+            self.context_input_tokens,
+            self.cache_usage,
+        );
+        let billed_input_tokens = final_cache_usage
             .map(|cache_usage| {
                 billed_input_tokens(
                     final_input_tokens,
@@ -1235,22 +1237,14 @@ impl StreamContext {
             })
             .unwrap_or(final_input_tokens);
 
-        #[cfg(feature = "sensitive-logs")]
-        tracing::info!(
-            estimated_input_tokens = self.input_tokens,
-            context_input_tokens = ?self.context_input_tokens,
-            final_input_tokens,
-            output_tokens = self.output_tokens,
-            "StreamContext usage: final_input_tokens={} (估算值), billed_input_tokens={}, context_input_tokens={} (上游值), output_tokens={}",
-            final_input_tokens,
-            billed_input_tokens,
-            self.context_input_tokens.map_or("N/A".to_string(), |v| v.to_string()),
-            self.output_tokens
-        );
-
-        // credit 是上游唯一真实的消耗指标（meteringEvent），默认打日志便于额度核算
+        // credit 是上游唯一真实的消耗指标（meteringEvent），默认打日志便于额度核算；
+        // 同时记录本地估算与上游换算的输入 tokens，便于持续对比两者偏差
         tracing::info!(
             credit_usage = self.metering.as_ref().map(|m| m.usage).unwrap_or(0.0),
+            estimated_input_tokens = self.input_tokens,
+            upstream_input_tokens = ?self.context_input_tokens,
+            final_input_tokens,
+            billed_input_tokens,
             output_tokens = self.output_tokens,
             stream = true,
             "请求完成 credit 消耗"
@@ -1260,11 +1254,49 @@ impl StreamContext {
         events.extend(self.state_manager.generate_final_events(FinalUsage {
             input_tokens: billed_input_tokens,
             output_tokens: self.output_tokens,
-            cache_usage: self.cache_usage,
+            cache_usage: final_cache_usage,
             metering: self.metering.as_ref(),
         }));
         events
     }
+}
+
+/// 确定最终 usage 的总输入 tokens，并让 cache 读写拆分与之对齐
+///
+/// - 上游 `contextUsageEvent` 换算出的值（`upstream`）是模型实际看到的上下文大小，
+///   有则优先使用；缺失或为 0 时回退本地估算（`estimated`）。
+/// - cache 读写是基于本地估算口径算出的，改用上游总量时按 `upstream / estimated`
+///   等比缩放，保证 `cache_creation + cache_read <= total`、拆分比例不变。
+pub(crate) fn reconcile_input_usage(
+    estimated: i32,
+    upstream: Option<i32>,
+    cache_usage: Option<CacheUsageBreakdown>,
+) -> (i32, Option<CacheUsageBreakdown>) {
+    let Some(total) = upstream.filter(|v| *v > 0) else {
+        return (estimated, cache_usage);
+    };
+    let Some(cache) = cache_usage else {
+        return (total, None);
+    };
+    if estimated <= 0 {
+        return (total, Some(cache));
+    }
+
+    let ratio = total as f64 / estimated as f64;
+    let scale = |v: i32| ((v as f64) * ratio).round() as i32;
+    let read = scale(cache.cache_read_input_tokens).clamp(0, total);
+    let creation = scale(cache.cache_creation_input_tokens).clamp(0, total - read);
+    // 5m/1h 是 creation 的细分：1h 按比例缩放并收敛到 creation 内，余量归 5m
+    let creation_1h = scale(cache.cache_creation_1h_input_tokens).clamp(0, creation);
+    (
+        total,
+        Some(CacheUsageBreakdown {
+            cache_creation_input_tokens: creation,
+            cache_read_input_tokens: read,
+            cache_creation_5m_input_tokens: creation - creation_1h,
+            cache_creation_1h_input_tokens: creation_1h,
+        }),
+    )
 }
 
 /// 将总输入 token 转为 Anthropic usage 的 input_tokens 口径（剔除 cache 读写）
@@ -1461,6 +1493,64 @@ mod tests {
         assert_eq!(message_delta_usage["cache_creation_input_tokens"], json!(7));
         assert_eq!(message_delta_usage["cache_read_input_tokens"], json!(8));
     }
+    #[test]
+    fn test_stream_final_usage_prefers_upstream_context_tokens() {
+        // 本地估算 1000，上游 contextUsage 换算 2000（窗口 1M × 0.2%）；cache 拆分等比放大
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1000,
+            cache_usage(100, 800, 100, 0),
+            false,
+            HashMap::new(),
+        )
+        .with_context_window(Some(1_000_000));
+        ctx.generate_initial_events();
+        ctx.process_kiro_event(&Event::ContextUsage(
+            crate::kiro::model::events::ContextUsageEvent {
+                context_usage_percentage: 0.2,
+            },
+        ));
+        assert_eq!(ctx.context_input_tokens, Some(2000));
+
+        let usage = ctx
+            .generate_final_events()
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .map(|e| e.data["usage"].clone())
+            .expect("message_delta should exist");
+        assert_eq!(usage["cache_read_input_tokens"], json!(1600));
+        assert_eq!(usage["cache_creation_input_tokens"], json!(200));
+        assert_eq!(
+            usage["cache_creation"]["ephemeral_5m_input_tokens"],
+            json!(200)
+        );
+        assert_eq!(usage["input_tokens"], json!(200));
+    }
+
+    #[test]
+    fn test_reconcile_input_usage_falls_back_and_clamps() {
+        let cache = cache_usage(300, 900, 0, 300);
+        // 无上游值：原样返回
+        let (total, c) = reconcile_input_usage(1000, None, cache);
+        assert_eq!(total, 1000);
+        assert_eq!(c.unwrap().cache_read_input_tokens, 900);
+        // 上游为 0 视为缺失
+        assert_eq!(reconcile_input_usage(1000, Some(0), cache).0, 1000);
+        // 本地估算的 cache 合计超过总量（1200 > 1000）：缩放后收敛到不超过上游总量
+        let (total, c) = reconcile_input_usage(1000, Some(500), cache);
+        let c = c.unwrap();
+        assert_eq!(total, 500);
+        assert!(c.cache_read_input_tokens + c.cache_creation_input_tokens <= 500);
+        assert_eq!(
+            c.cache_creation_5m_input_tokens + c.cache_creation_1h_input_tokens,
+            c.cache_creation_input_tokens
+        );
+        // 无 cache 统计：只替换总量
+        let (total, c) = reconcile_input_usage(1000, Some(1500), None);
+        assert_eq!(total, 1500);
+        assert!(c.is_none());
+    }
+
     #[test]
     fn test_stream_context_omits_cache_usage_fields_when_disabled() {
         let mut ctx =
