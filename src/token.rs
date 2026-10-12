@@ -250,7 +250,30 @@ fn estimate_content_block_tokens(obj: &serde_json::Map<String, serde_json::Value
         return count_message_content_tokens(content);
     }
 
-    0
+    match obj.get("type").and_then(|v| v.as_str()) {
+        // redacted_thinking：加密内容按序列化长度估算
+        Some("redacted_thinking") => obj
+            .get("data")
+            .and_then(|v| v.as_str())
+            .map(count_tokens)
+            .unwrap_or(0),
+        // document（PDF 等）：base64 来源无法本地解析页数，按解码字节粗估（约 1 token / 3 字节）；
+        // 文本来源按文本计数
+        Some("document") => match obj.get("source") {
+            Some(src) if src.get("type").and_then(|v| v.as_str()) == Some("base64") => src
+                .get("data")
+                .and_then(|v| v.as_str())
+                .map(|d| (d.len() as u64 * 3 / 4) / 3)
+                .unwrap_or(0),
+            Some(src) => src
+                .get("data")
+                .and_then(|v| v.as_str())
+                .map(count_tokens)
+                .unwrap_or(0),
+            None => 0,
+        },
+        _ => 0,
+    }
 }
 
 /// 本地计算请求的输入 tokens
@@ -387,6 +410,20 @@ mod tests {
             estimate_messages_tokens(&[msg]),
             count_tokens(&text) + TOKENS_PER_MESSAGE
         );
+    }
+
+    #[test]
+    fn document_and_redacted_thinking_blocks_are_counted() {
+        let pdf_b64 = "A".repeat(40_000); // 30_000 字节 → ~10_000 tokens
+        let doc = serde_json::json!({"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64}});
+        assert_eq!(count_message_content_tokens(&doc), 10_000);
+        let text_doc = serde_json::json!({"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "hello world"}});
+        assert_eq!(
+            count_message_content_tokens(&text_doc),
+            count_tokens("hello world")
+        );
+        let redacted = serde_json::json!({"type": "redacted_thinking", "data": "abcdefghij"});
+        assert!(count_message_content_tokens(&redacted) > 0);
     }
 
     #[test]

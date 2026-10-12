@@ -249,17 +249,31 @@ pub fn process_image_to_format(
 ///
 /// 返回 (tokens, width, height)，解析失败返回 None
 pub fn estimate_image_tokens(base64_data: &str) -> Option<(u64, u32, u32)> {
+    // 只需图片头即可读出尺寸：先解码前 64KB 的 base64（PNG/GIF/WebP 头在最前；
+    // JPEG 的 SOF 段通常也在前几 KB）。每个请求会对每张图估算多次（token 计数、
+    // 缓存分块），全量解码 100 张大图代价明显。头部不足时回退到全量解码。
+    const HEAD_B64_CHARS: usize = 64 * 1024; // 4 的倍数，保证 base64 分组对齐
+    if base64_data.len() > HEAD_B64_CHARS
+        && let Ok(head) = BASE64.decode(&base64_data.as_bytes()[..HEAD_B64_CHARS])
+        && let Some(dims) = ImageReader::new(Cursor::new(&head))
+            .with_guessed_format()
+            .ok()
+            .and_then(|r| r.into_dimensions().ok())
+    {
+        return Some(tokens_for_dimensions(dims));
+    }
+
     let bytes = BASE64.decode(base64_data).ok()?;
     let reader = ImageReader::new(Cursor::new(&bytes))
         .with_guessed_format()
         .ok()?;
-    let (width, height) = reader.into_dimensions().ok()?;
+    Some(tokens_for_dimensions(reader.into_dimensions().ok()?))
+}
 
-    // 应用 Anthropic 缩放规则计算 token
+/// 按 Anthropic 缩放规则从原始尺寸计算 token，返回 (tokens, width, height)
+fn tokens_for_dimensions((width, height): (u32, u32)) -> (u64, u32, u32) {
     let (scaled_w, scaled_h) = apply_scaling_rules(width, height, 1568, 1_150_000);
-    let tokens = calculate_tokens(scaled_w, scaled_h);
-
-    Some((tokens, width, height))
+    (calculate_tokens(scaled_w, scaled_h), width, height)
 }
 
 /// 处理图片：根据配置缩放并返回处理结果
@@ -449,6 +463,33 @@ mod tests {
 
         // 测试无需缩放
         assert_eq!(apply_scaling_rules(800, 600, 1568, 1_150_000), (800, 600));
+    }
+
+    #[test]
+    fn test_estimate_image_tokens_header_fast_path_matches_full_decode() {
+        // 噪声图不可压缩，确保 base64 远大于 64KB，走"只解码头部"的快速路径
+        let mut seed = 0x9e3779b9u32;
+        let noise = image::RgbImage::from_fn(1200, 900, |_, _| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            image::Rgb([seed as u8, (seed >> 8) as u8, (seed >> 16) as u8])
+        });
+        for fmt in [ImageFormat::Png, ImageFormat::Jpeg] {
+            let mut buf = Cursor::new(Vec::new());
+            DynamicImage::ImageRgb8(noise.clone())
+                .write_to(&mut buf, fmt)
+                .unwrap();
+            let b64 = BASE64.encode(buf.into_inner());
+            assert!(b64.len() > 64 * 1024, "{fmt:?} 测试图应超过 64KB");
+            let (tokens, w, h) = estimate_image_tokens(&b64).unwrap();
+            assert_eq!((w, h), (1200, 900), "{fmt:?}");
+            assert_eq!(
+                (tokens, w, h),
+                tokens_for_dimensions((1200, 900)),
+                "{fmt:?}"
+            );
+        }
     }
 
     #[test]

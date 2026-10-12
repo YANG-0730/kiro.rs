@@ -24,8 +24,8 @@ use crate::model::config::CompressionConfig;
 ///
 /// 对齐 Kiro 上游实际限制：2026-10-12 实测 100 张通过、150 张返回
 /// `400 too many inline media segments: 150 exceeds limit 100 (IMAGE_COUNT_EXCEEDED)`。
-/// 超出时优先保留当前消息图片、跳过最旧的历史图片（否则长对话一旦累积超过上限，
-/// 之后每个请求都会 400）。旧值 20 是早期上游限制。
+/// 超出时优先保留当前消息图片，其次保留最新的历史图片、跳过最旧的（见 `build_history`；
+/// 否则长对话一旦累积超过上限，之后每个请求都会 400）。旧值 20 是早期上游限制。
 const MAX_TOTAL_IMAGES: usize = 100;
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
@@ -1290,6 +1290,16 @@ fn build_history(
     // 最后一条消息作为 currentMessage，不加入历史
     let history_end_index = messages.len().saturating_sub(1);
 
+    // 图片配额按"新优先"分配：history 是从旧到新构建的，若直接共享剩余配额，
+    // 超额时被丢弃的会是最新的历史图片（最近的截图）。这里先从最新消息往回数，
+    // 只保留最近 `remaining_image_budget` 张，最旧的超额部分在构建时跳过。
+    let history_image_total: usize = messages
+        .iter()
+        .take(history_end_index)
+        .map(|m| count_images_in_content(&m.content))
+        .sum();
+    let mut skip_oldest = history_image_total.saturating_sub(*remaining_image_budget);
+
     // 收集并配对消息
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
     let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
@@ -1312,6 +1322,7 @@ fn build_history(
                     compression_config,
                     total_image_count,
                     remaining_image_budget,
+                    &mut skip_oldest,
                 )?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
@@ -1335,6 +1346,7 @@ fn build_history(
             compression_config,
             total_image_count,
             remaining_image_budget,
+            &mut skip_oldest,
         )?;
         history.push(Message::User(merged_user));
 
@@ -1382,20 +1394,65 @@ fn build_history(
     Ok(history)
 }
 
+/// 从消息内容中按出现顺序跳过前 `*skip` 张图片（含 tool_result 内嵌图片），
+/// 同时递减 `*skip`。无需跳过时返回 `None`，避免复制内容。
+fn skip_leading_images(content: &serde_json::Value, skip: &mut usize) -> Option<serde_json::Value> {
+    if *skip == 0 {
+        return None;
+    }
+    let serde_json::Value::Array(arr) = content else {
+        return None;
+    };
+    let is_image = |v: &serde_json::Value| v.get("type").and_then(|t| t.as_str()) == Some("image");
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        if *skip > 0 && is_image(item) {
+            *skip -= 1;
+            continue;
+        }
+        if *skip > 0
+            && item.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+            && let Some(serde_json::Value::Array(inner)) = item.get("content")
+        {
+            let mut item = item.clone();
+            let kept: Vec<serde_json::Value> = inner
+                .iter()
+                .filter(|v| {
+                    if *skip > 0 && is_image(v) {
+                        *skip -= 1;
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .cloned()
+                .collect();
+            item["content"] = serde_json::Value::Array(kept);
+            out.push(item);
+            continue;
+        }
+        out.push(item.clone());
+    }
+    Some(serde_json::Value::Array(out))
+}
+
 fn merge_user_messages(
     messages: &[&super::types::Message],
     model_id: &str,
     compression_config: &CompressionConfig,
     total_image_count: usize,
     remaining_image_budget: &mut usize,
+    skip_oldest_images: &mut usize,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut all_images = Vec::new();
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
+        // 超出总配额时，最旧的历史图片直接跳过（为更新的图片腾出配额）
+        let content = skip_leading_images(&msg.content, skip_oldest_images);
         let (text, images, tool_results) = process_message_content(
-            &msg.content,
+            content.as_ref().unwrap_or(&msg.content),
             compression_config,
             total_image_count,
             remaining_image_budget,
@@ -2634,6 +2691,102 @@ mod tests {
             {"type": "tool_result", "tool_use_id": "t2", "content": "plain"}
         ]);
         assert_eq!(count_images_in_content(&content), 3);
+    }
+
+    #[test]
+    fn test_image_budget_keeps_newest_history_images() {
+        use super::super::types::Message as AnthropicMessage;
+        use base64::Engine;
+
+        // 每张图用不同宽度编码，以便识别保留下来的是哪几张
+        let png = |w: u32| {
+            let mut buf = Vec::new();
+            image::DynamicImage::new_rgb8(w, 2)
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .unwrap();
+            base64::engine::general_purpose::STANDARD.encode(&buf)
+        };
+        let img = |w: u32| serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":png(w)}});
+
+        // 历史 3 轮 user，各 40 张（共 120 张），宽度 = 轮次*100 + 序号；当前消息 5 张
+        let mut messages = Vec::new();
+        for turn in 1..=3u32 {
+            let content: Vec<_> = (0..40).map(|i| img(turn * 100 + i)).collect();
+            messages.push(AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::Value::Array(content),
+            });
+            messages.push(AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!("ok"),
+            });
+        }
+        let current: Vec<_> = (0..5)
+            .map(|i| img(900 + i))
+            .chain([serde_json::json!({"type":"text","text":"count"})])
+            .collect();
+        messages.push(AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::Value::Array(current),
+        });
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 10,
+            messages,
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let result = convert_request(&req, &CompressionConfig::default(), None).unwrap();
+        let state = &result.conversation_state;
+
+        let width = |img: &KiroImage| {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&img.source.bytes)
+                .unwrap();
+            image::load_from_memory(&bytes).unwrap().width()
+        };
+        let history_widths: Vec<u32> = state
+            .history
+            .iter()
+            .filter_map(|m| match m {
+                Message::User(u) => Some(
+                    u.user_input_message
+                        .images
+                        .iter()
+                        .map(width)
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+
+        assert_eq!(
+            state.current_message.user_input_message.images.len(),
+            5,
+            "当前消息图片全部保留"
+        );
+        // 剩余配额 95：120 张历史图中丢弃最旧的 25 张（第 1 轮的前 25 张）
+        assert_eq!(history_widths.len(), 95);
+        assert_eq!(
+            history_widths.first(),
+            Some(&125),
+            "最旧保留的应是第 1 轮第 26 张"
+        );
+        assert!(
+            history_widths.contains(&339),
+            "第 3 轮（最新）最后一张必须保留"
+        );
+        assert!(
+            !history_widths.contains(&100),
+            "第 1 轮第 1 张（最旧）应被丢弃"
+        );
     }
 
     #[test]

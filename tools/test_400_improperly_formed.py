@@ -101,7 +101,8 @@ def safe_body(resp: requests.Response, max_len: int = 300) -> str:
 
 def is_local_request_too_large(resp: requests.Response) -> bool:
     """检查是否为本地请求体超限拒绝"""
-    if resp.status_code != 400:
+    # 本地超限现返回 413 request_too_large（与官方一致）；兼容旧版本的 400
+    if resp.status_code not in (400, 413):
         return False
     try:
         data = resp.json()

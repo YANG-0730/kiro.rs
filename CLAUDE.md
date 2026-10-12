@@ -65,7 +65,7 @@ POST /v1/messages (Anthropic 格式)
 2. **Multi-Token Manager** - `kiro/token_manager.rs`: 多凭据管理，按优先级故障转移，后台异步刷新 Token（支持 Social 和 IdC 两种认证方式）。余额缓存动态 TTL：高频用户 10 分钟、低频用户 30 分钟、低余额（超额计费中）用户 10 分钟，过期时异步刷新不阻塞请求。因额度耗尽（InsufficientBalance / QuotaExceeded）被禁用的凭据记录重置时间（上游 `nextDateReset`，缺省为下月 1 日 00:00 UTC），到点后复查余额并自动重新启用（Kiro 额度按 UTC 自然月重置）
 3. **Protocol Converter** - `anthropic/converter.rs`: Anthropic ↔ Kiro 双向协议转换，包括模型映射（sonnet/opus/haiku → Kiro 模型 ID）、JSON Schema 规范化（修复 MCP 工具的 `required: null` / `properties: null`）、工具占位符生成、图片格式转换。工具定义总大小超过 `compression.toolDefinitionsMaxBytes`（默认 256KB，0=不压缩；不受 `compression.enabled` 控制）时才简化 schema 并截断描述——旧的 20KB 硬编码会截掉 Claude Code 约四成工具说明，2026-10 实测上游可正常接受 ~246KB 完整工具定义
 4. **Event Stream Parser** - `kiro/parser/`: AWS Event Stream 二进制协议解析（header + payload + CRC32C 校验）
-5. **Streaming Response** - `anthropic/stream.rs`: 使用 `StreamContext` 实时将 Kiro 事件转换为 Anthropic SSE，最终 usage 采用本地估算口径并透传上游 `meteringEvent` 诊断信息
+5. **Streaming Response** - `anthropic/stream.rs`: 使用 `StreamContext` 实时将 Kiro 事件转换为 Anthropic SSE，最终 usage（`message_delta`）的总输入优先采用上游 `contextUsageEvent` 换算值（缺失时回退本地估算），cache 读写按同比例缩放，并透传上游 `meteringEvent` 的 credit；`message_start` 只能用本地估算
 6. **Input Compressor** - `anthropic/compressor.rs`: 多层压缩管道（空白压缩 → thinking 截断 → tool_result 截断 → tool_use input 截断 → 历史截断），自动修复 tool_use/tool_result 配对以避免上游 400 错误
 7. **Image Processor** - `image.rs`: 图片处理（缩放、GIF 抽帧、token 计算）。GIF 抽帧策略：最多 20 帧、最多 5fps、按时长自适应采样间隔，输出为 JPEG 静态帧序列
 
