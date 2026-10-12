@@ -208,8 +208,8 @@ fn default_6000() -> usize {
     6000
 }
 
-fn default_4000() -> usize {
-    4000
+fn default_tool_description_max_chars() -> usize {
+    32 * 1024
 }
 
 fn default_80_turns() -> usize {
@@ -241,9 +241,10 @@ fn default_tool_definitions_max_bytes() -> usize {
 }
 
 fn default_max_request_body_bytes() -> usize {
-    // 上游对请求体大小存在硬性限制（实测约 5MiB 左右会触发 400），
-    // 这里默认设置为 4.5MiB 留出安全余量。
-    4_718_592
+    // 对齐上游实际请求体上限：2026-10-12 实测发往 Kiro 的请求体 29.2MiB 通过、
+    // 30.2MiB 起被拒（官方 Anthropic Messages API 为 32MB）。旧值 4.5MiB 来自早期实测，已过时。
+    // 超过时本地直接返回 413 request_too_large（与官方一致），避免整包上传后才被上游拒绝。
+    29 * 1024 * 1024
 }
 
 /// 输入压缩配置
@@ -274,8 +275,10 @@ pub struct CompressionConfig {
     /// tool_use input 截断阈值（字符数），默认 6000
     #[serde(default = "default_6000")]
     pub tool_use_input_max_chars: usize,
-    /// 工具描述截断阈值（字符数），覆盖原 10000 硬编码，默认 4000
-    #[serde(default = "default_4000")]
+    /// 单个工具描述截断阈值（字符数，0=不截断），默认 32768。
+    /// 旧默认 4000 会截断 Claude Code 的 Bash/Agent/TodoWrite 等长工具说明；
+    /// 总量过大时由 `tool_definitions_max_bytes` 统一处理。
+    #[serde(default = "default_tool_description_max_chars")]
     pub tool_description_max_chars: usize,
     /// 工具定义总大小阈值（字节），超过后简化 schema 并按比例截断描述；默认 256KB（0=不压缩）。
     /// 2026-10 实测上游可正常接受 ~246KB 的完整工具定义；原 20KB 硬编码会截掉 Claude Code
@@ -315,7 +318,7 @@ impl Default for CompressionConfig {
             tool_result_head_lines: default_80(),
             tool_result_tail_lines: default_40(),
             tool_use_input_max_chars: default_6000(),
-            tool_description_max_chars: default_4000(),
+            tool_description_max_chars: default_tool_description_max_chars(),
             tool_definitions_max_bytes: default_tool_definitions_max_bytes(),
             max_history_turns: default_80_turns(),
             max_history_chars: default_400k(),

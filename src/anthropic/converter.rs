@@ -21,7 +21,12 @@ use crate::anthropic::compressor::CompressionStats;
 use crate::model::config::CompressionConfig;
 
 /// 单请求图片总数上限（所有消息合计，含 GIF 抽帧后的帧数）
-const MAX_TOTAL_IMAGES: usize = 20;
+///
+/// 对齐 Kiro 上游实际限制：2026-10-12 实测 100 张通过、150 张返回
+/// `400 too many inline media segments: 150 exceeds limit 100 (IMAGE_COUNT_EXCEEDED)`。
+/// 超出时优先保留当前消息图片、跳过最旧的历史图片（否则长对话一旦累积超过上限，
+/// 之后每个请求都会 400）。旧值 20 是早期上游限制。
+const MAX_TOTAL_IMAGES: usize = 100;
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 ///

@@ -204,6 +204,19 @@ fn is_model_overloaded_error(err: &Error) -> bool {
     err.to_string().contains("MODEL_TEMPORARILY_UNAVAILABLE")
 }
 
+/// 若错误来自上游 400 Bad Request，返回其中的上游说明（`400 Bad Request` 之后的部分）
+fn upstream_bad_request_message(err: &Error) -> Option<String> {
+    const MARKER: &str = "400 Bad Request";
+    let s = err.to_string();
+    let idx = s.find(MARKER)?;
+    let detail = s[idx + MARKER.len()..].trim();
+    Some(if detail.is_empty() {
+        "Bad request rejected by upstream.".to_string()
+    } else {
+        detail.to_string()
+    })
+}
+
 fn is_improperly_formed_request_error(err: &Error) -> bool {
     let s = err.to_string();
     s.contains("Improperly formed request")
@@ -223,7 +236,7 @@ struct AdaptiveCompressionOutcome {
 /// 计算 KiroRequest 中所有图片 base64 数据的总字节数。
 ///
 /// 该统计用于归因请求体大小（图片 base64 往往占用大量 bytes）。
-/// 注意：上游存在请求体大小硬限制（约 5MiB），因此图片也必须控制体积；
+/// 注意：上游存在请求体大小硬限制（实测约 29~30MiB），因此图片也必须控制体积；
 /// `max_request_body_bytes` 的校验以实际序列化后的总字节数为准。
 fn total_image_bytes(kiro_request: &KiroRequest) -> usize {
     let state = &kiro_request.conversation_state;
@@ -484,6 +497,20 @@ fn map_kiro_provider_error_to_response(request_body: &str, err: Error) -> Respon
             Json(ErrorResponse::new(
                 "invalid_request_error",
                 "Improperly formed request. This is often caused by oversized payloads, malformed message/tool sequences, or empty content blocks.",
+            )),
+        )
+            .into_response();
+    }
+
+    // 其余上游 400（如 IMAGE_COUNT_EXCEEDED）：属确定性请求错误，按 400 invalid_request_error
+    // 透传上游说明。此前会落到兜底 502，客户端会把它当瞬态错误反复重试同一个必然失败的请求。
+    if let Some(upstream_message) = upstream_bad_request_message(&err) {
+        tracing::warn!(error = %err, "上游拒绝请求（400），透传给客户端");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                upstream_message,
             )),
         )
             .into_response();
@@ -877,7 +904,7 @@ pub async fn post_messages(
         }
     };
 
-    // 输出压缩统计（以字节为单位；用于排查上游请求体大小限制，实测约 5MiB 左右会触发 400）
+    // 输出压缩统计（以字节为单位；用于排查上游请求体大小限制，实测约 29~30MiB 会触发 400）
     if let Some(ref stats) = conversion_result.compression_stats {
         tracing::info!(
             estimated_input_tokens,
@@ -971,10 +998,11 @@ pub async fn post_messages(
             "自适应压缩仍超限，完整请求体（用于诊断）: {}",
             truncate_base64_in_request_body(&request_body)
         );
+        // 与官方 Messages API 一致：超出请求体上限返回 413 request_too_large
         return (
-            StatusCode::BAD_REQUEST,
+            StatusCode::PAYLOAD_TOO_LARGE,
             Json(ErrorResponse::new(
-                "invalid_request_error",
+                "request_too_large",
                 format!(
                     "Request too large ({} bytes total; images {} bytes; non-image {} bytes; limit {}). Reduce conversation history/tool output or number/size of images.",
                     request_body.len(),
@@ -1908,6 +1936,31 @@ mod tests {
             anyhow::anyhow!("400 Improperly formed request"),
         );
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_other_upstream_400_maps_to_400_not_502() {
+        let response = map_kiro_provider_error_to_response(
+            "{}",
+            anyhow::anyhow!(
+                "非流式 API 请求失败: 400 Bad Request too many inline media segments: 150 exceeds limit 100 (reason=IMAGE_COUNT_EXCEEDED)"
+            ),
+        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_upstream_bad_request_message_extracts_detail() {
+        let err = anyhow::anyhow!(
+            "流式 API 请求失败: 400 Bad Request too many inline media segments (reason=IMAGE_COUNT_EXCEEDED)"
+        );
+        assert_eq!(
+            upstream_bad_request_message(&err).as_deref(),
+            Some("too many inline media segments (reason=IMAGE_COUNT_EXCEEDED)")
+        );
+        assert!(
+            upstream_bad_request_message(&anyhow::anyhow!("500 Internal Server Error")).is_none()
+        );
     }
 
     #[test]
