@@ -69,6 +69,8 @@ struct NonStreamRequestContext<'a> {
     /// 映射后的上游 modelId（点号格式），用于模型级凭据过滤
     kiro_model_id: &'a str,
     input_tokens: i32,
+    /// 客户端是否开启 thinking：开启时把老模型内联的 `<thinking>` 拆成 thinking 块
+    thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     user_id: Option<&'a str>,
     /// 上游模型上下文窗口（maxInputTokens），None 表示回退静态判断
@@ -699,6 +701,9 @@ pub async fn get_models(
 
     Json(ModelsResponse {
         object: "list".to_string(),
+        first_id: models.first().map(|m| m.id.clone()),
+        last_id: models.last().map(|m| m.id.clone()),
+        has_more: false,
         data: models,
     })
 }
@@ -729,13 +734,15 @@ fn build_models_from_registry(registry: &crate::kiro::model_registry::ModelRegis
             id: display_id.clone(),
             object: "model".to_string(),
             created: 1770314400,
+            created_at: "2026-02-05T18:00:00Z".to_string(),
             owned_by: "anthropic".to_string(),
             display_name: entry
                 .model_name
                 .clone()
                 .unwrap_or_else(|| entry.model_id.clone()),
-            model_type: "chat".to_string(),
+            model_type: "model".to_string(),
             max_tokens: max_output.unwrap_or(32000),
+            max_input_tokens: max_input,
             context_length: max_input,
             max_completion_tokens: max_output,
             thinking: if has_thinking { Some(true) } else { None },
@@ -777,7 +784,7 @@ pub async fn post_messages(
     let effort = payload
         .output_config
         .as_ref()
-        .map(|c| c.effort.clone())
+        .and_then(|c| c.effort.clone())
         .unwrap_or_else(|| "-".to_string());
     // 上游模型支持的输出上限（与客户端请求的 max_tokens 区分；客户端值不发上游）
     let model_max_output = state
@@ -1051,6 +1058,7 @@ pub async fn post_messages(
             model: &payload.model,
             kiro_model_id: &kiro_model_id,
             input_tokens: estimated_input_tokens,
+            thinking_enabled,
             tool_name_map,
             user_id: user_id.as_deref(),
             cache_tracker: prompt_cache
@@ -1441,6 +1449,16 @@ async fn handle_non_stream_request(
 
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
+
+    // 老模型（无 reasoningContentEvent）把思考以内联 `<thinking>` 写进正文：与流式路径一致，
+    // 客户端开启 thinking 时拆成独立的 thinking 块
+    if reasoning_content.is_empty()
+        && context.thinking_enabled
+        && let Some((thinking, rest)) = super::stream::split_inline_thinking(&text_content)
+    {
+        reasoning_content = thinking;
+        text_content = rest;
+    }
 
     // 结构化推理块（新模型）置于最前，符合 Anthropic 内容块顺序约定
     if !reasoning_content.is_empty() {
@@ -1961,6 +1979,41 @@ mod tests {
         assert!(
             upstream_bad_request_message(&anyhow::anyhow!("500 Internal Server Error")).is_none()
         );
+    }
+
+    #[test]
+    fn test_models_include_official_fields() {
+        use crate::kiro::model::available_models::{AvailableModelEntry, TokenLimits};
+        let reg = crate::kiro::model_registry::ModelRegistry::new();
+        reg.update_credential(
+            1,
+            vec![AvailableModelEntry {
+                model_id: "claude-opus-5.5".to_string(),
+                model_name: Some("Claude Opus 5.5".to_string()),
+                description: None,
+                rate_multiplier: None,
+                rate_unit: None,
+                token_limits: Some(TokenLimits {
+                    max_output_tokens: Some(128_000),
+                    max_input_tokens: Some(1_000_000),
+                }),
+                supported_input_types: None,
+                prompt_caching: None,
+                model_provider: None,
+                status: None,
+                available_origins: None,
+                additional_model_request_fields_schema: None,
+            }],
+        );
+        let models = build_models_from_registry(&reg);
+        let m = serde_json::to_value(&models[0]).unwrap();
+        assert_eq!(m["id"], "claude-opus-5-5");
+        assert_eq!(m["type"], "model", "官方 type 为 model");
+        assert_eq!(m["max_input_tokens"], 1_000_000);
+        assert_eq!(m["max_tokens"], 128_000);
+        assert!(m["created_at"].as_str().unwrap().ends_with('Z'));
+        // 兼容旧调用方的字段保留
+        assert_eq!(m["context_length"], 1_000_000);
     }
 
     #[test]

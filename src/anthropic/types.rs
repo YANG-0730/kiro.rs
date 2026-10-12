@@ -55,11 +55,17 @@ pub struct Model {
     pub id: String,
     pub object: String,
     pub created: i64,
+    /// 官方 Models API 字段（RFC 3339）
+    pub created_at: String,
     pub owned_by: String,
     pub display_name: String,
+    /// 官方值为 "model"（旧值 "chat" 非官方）
     #[serde(rename = "type")]
     pub model_type: String,
     pub max_tokens: i32,
+    /// 官方 Models API 字段：最大输入 tokens（上下文窗口）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -73,6 +79,10 @@ pub struct Model {
 pub struct ModelsResponse {
     pub object: String,
     pub data: Vec<Model>,
+    /// 官方分页字段（本代理一次返回全部，has_more 恒为 false）
+    pub has_more: bool,
+    pub first_id: Option<String>,
+    pub last_id: Option<String>,
 }
 
 // === Messages 端点类型 ===
@@ -90,6 +100,9 @@ pub struct Thinking {
         deserialize_with = "deserialize_budget_tokens"
     )]
     pub budget_tokens: i32,
+    /// 思考内容展示方式（"summarized" / "omitted"），未设置时由上游默认
+    #[serde(default)]
+    pub display: Option<String>,
 }
 
 impl Thinking {
@@ -113,12 +126,10 @@ where
 /// OutputConfig 配置
 #[derive(Debug, Deserialize, Clone)]
 pub struct OutputConfig {
-    #[serde(default = "default_effort")]
-    pub effort: String,
-}
-
-fn default_effort() -> String {
-    "high".to_string()
+    /// 推理强度；未设置时为 None，交由上游模型默认（官方 Opus 5.5 默认 medium）。
+    /// 旧实现缺省填 "high"，会让只带 `output_config.format` 等字段的请求被抬高一档。
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 /// Claude Code 请求中的 metadata

@@ -1308,7 +1308,7 @@ fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
             let raw_effort = req
                 .output_config
                 .as_ref()
-                .map(|c| c.effort.as_str())
+                .and_then(|c| c.effort.as_deref())
                 .unwrap_or("high");
             // 白名单归一化：仅接受 low/medium/high，非法值回退 high
             let effort = match raw_effort {
@@ -1363,50 +1363,72 @@ fn schema_has_property(schema: &serde_json::Value, key: &str) -> bool {
 ///   客户端未开启 thinking 时不设置（用上游默认）。
 ///
 /// 返回 None 表示无需透传（null-schema 模型，或无可映射配置）。
+/// schema 中 `<object>.properties.<field>.enum` 是否包含 `value`（无 enum 约束时视为允许）
+fn schema_enum_allows(object_schema: Option<&serde_json::Value>, field: &str, value: &str) -> bool {
+    match object_schema
+        .and_then(|t| t.get("properties"))
+        .and_then(|p| p.get(field))
+        .and_then(|f| f.get("enum"))
+        .and_then(|e| e.as_array())
+    {
+        Some(values) => values.iter().any(|v| v.as_str() == Some(value)),
+        None => true,
+    }
+}
+
 fn build_additional_model_request_fields(
     req: &MessagesRequest,
     model_schema: Option<&serde_json::Value>,
 ) -> Option<serde_json::Value> {
     let schema = model_schema?;
 
-    let client_effort = req.output_config.as_ref().map(|c| c.effort.as_str());
+    let client_effort = req.output_config.as_ref().and_then(|c| c.effort.as_deref());
     let thinking_type = req.thinking.as_ref().map(|t| t.thinking_type.as_str());
 
     // Claude 系：thinking + output_config.effort
     if schema_has_property(schema, "thinking") {
         let mut fields = serde_json::Map::new();
+        let thinking_schema = schema.get("properties").and_then(|p| p.get("thinking"));
 
-        // thinking.type：enabled/adaptive → adaptive；其余（disabled / 未设）→ disabled
+        // thinking.type：enabled/adaptive → adaptive；显式 disabled → disabled（仅当 schema 允许）；
+        // 客户端未设置 → 不写 thinking，交由上游默认（与官方一致：5.x 模型默认开启思考）
         let want_thinking = matches!(thinking_type, Some("enabled") | Some("adaptive"));
-        let mut thinking_obj = serde_json::Map::new();
-        thinking_obj.insert(
-            "type".to_string(),
-            serde_json::Value::String(
-                if want_thinking {
-                    "adaptive"
-                } else {
-                    "disabled"
-                }
-                .to_string(),
-            ),
-        );
-        // schema 支持 display 时透传（默认 summarized）
-        if schema
-            .get("properties")
-            .and_then(|p| p.get("thinking"))
-            .and_then(|t| t.get("properties"))
-            .and_then(|p| p.get("display"))
-            .is_some()
-        {
+        let thinking_type_value = match thinking_type {
+            Some("enabled") | Some("adaptive") => Some("adaptive"),
+            Some("disabled") if schema_enum_allows(thinking_schema, "type", "disabled") => {
+                Some("disabled")
+            }
+            _ => None,
+        };
+        if let Some(type_value) = thinking_type_value {
+            let mut thinking_obj = serde_json::Map::new();
             thinking_obj.insert(
-                "display".to_string(),
-                serde_json::Value::String("summarized".to_string()),
+                "type".to_string(),
+                serde_json::Value::String(type_value.to_string()),
+            );
+            // display：透传客户端设置；未设置时用 summarized（让 Claude Code 能看到思考摘要）
+            if want_thinking
+                && thinking_schema
+                    .and_then(|t| t.get("properties"))
+                    .and_then(|p| p.get("display"))
+                    .is_some()
+            {
+                let display = req
+                    .thinking
+                    .as_ref()
+                    .and_then(|t| t.display.as_deref())
+                    .filter(|d| schema_enum_allows(thinking_schema, "display", d))
+                    .unwrap_or("summarized");
+                thinking_obj.insert(
+                    "display".to_string(),
+                    serde_json::Value::String(display.to_string()),
+                );
+            }
+            fields.insert(
+                "thinking".to_string(),
+                serde_json::Value::Object(thinking_obj),
             );
         }
-        fields.insert(
-            "thinking".to_string(),
-            serde_json::Value::Object(thinking_obj),
-        );
 
         // output_config.effort：仅当 schema 支持且客户端提供了 effort 时透传
         if want_thinking
@@ -1420,7 +1442,7 @@ fn build_additional_model_request_fields(
             );
         }
 
-        return Some(serde_json::Value::Object(fields));
+        return (!fields.is_empty()).then_some(serde_json::Value::Object(fields));
     }
 
     // GPT 系：reasoning.effort
@@ -1472,6 +1494,11 @@ fn build_history(
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
+    //
+    // 注意：不要因为新模型有结构化 thinking 字段（additionalModelRequestFields）就去掉这段
+    // 系统提示标签。2026-10-12 实测 claude-opus-5.5（effort low/max 各两次）：只发结构化字段
+    // 时 reasoningContentEvent 为 0，带上标签后为 25~34 —— 上游真正触发思考靠的是标签，
+    // 结构化字段只影响 effort/display。两者并存不是重复注入。
     let thinking_prefix = generate_thinking_prefix(req);
 
     // 仅在开启分块写入策略且请求包含 Write/Edit 工具时注入
@@ -2062,9 +2089,10 @@ mod tests {
             thinking: thinking_type.map(|t| super::super::types::Thinking {
                 thinking_type: t.to_string(),
                 budget_tokens: 8000,
+                display: None,
             }),
             output_config: effort.map(|e| super::super::types::OutputConfig {
-                effort: e.to_string(),
+                effort: Some(e.to_string()),
             }),
             metadata: None,
         }
@@ -2105,10 +2133,48 @@ mod tests {
         assert_eq!(fields["thinking"]["type"], "disabled");
         // disabled 时不应带 output_config（effort 只在开启思考时有意义）
         assert!(fields.get("output_config").is_none());
-        // 完全未设 thinking → disabled
+        // 完全未设 thinking → 不写 thinking 字段，交由上游默认（官方 5.x 默认开启思考）
         let req2 = req_with_thinking(None, None);
-        let fields2 = build_additional_model_request_fields(&req2, Some(&schema)).unwrap();
-        assert_eq!(fields2["thinking"]["type"], "disabled");
+        assert!(build_additional_model_request_fields(&req2, Some(&schema)).is_none());
+    }
+
+    #[test]
+    fn test_amrf_disabled_dropped_when_schema_disallows() {
+        // claude-opus-5.5 的 thinking.type 枚举只有 adaptive：显式 disabled 不能原样下发
+        let schema = serde_json::json!({"type": "object", "properties": {
+            "thinking": {"type": "object", "properties": {
+                "type": {"type": "string", "enum": ["adaptive"]},
+                "display": {"type": "string", "enum": ["summarized", "omitted"]}}},
+            "output_config": {"type": "object"}}});
+        let req = req_with_thinking(Some("disabled"), None);
+        assert!(build_additional_model_request_fields(&req, Some(&schema)).is_none());
+    }
+
+    #[test]
+    fn test_amrf_display_passthrough_and_validated() {
+        let schema = claude_schema();
+        let mut req = req_with_thinking(Some("adaptive"), Some("medium"));
+        req.thinking.as_mut().unwrap().display = Some("omitted".to_string());
+        let fields = build_additional_model_request_fields(&req, Some(&schema)).unwrap();
+        assert_eq!(
+            fields["thinking"]["display"], "omitted",
+            "客户端 display 应透传"
+        );
+        // 未设置 → summarized；非法值 → 回退 summarized
+        req.thinking.as_mut().unwrap().display = None;
+        let fields = build_additional_model_request_fields(&req, Some(&schema)).unwrap();
+        assert_eq!(fields["thinking"]["display"], "summarized");
+        req.thinking.as_mut().unwrap().display = Some("verbose".to_string());
+        let fields = build_additional_model_request_fields(&req, Some(&schema)).unwrap();
+        assert_eq!(fields["thinking"]["display"], "summarized");
+    }
+
+    #[test]
+    fn test_output_config_without_effort_is_none() {
+        // 只带 format 等字段时 effort 不再被默认填成 high
+        let cfg: super::super::types::OutputConfig =
+            serde_json::from_value(serde_json::json!({"format": {"type": "json_schema"}})).unwrap();
+        assert!(cfg.effort.is_none());
     }
 
     #[test]
@@ -3680,9 +3746,10 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "adaptive".to_string(),
                 budget_tokens: 0,
+                display: None,
             }),
             output_config: Some(OutputConfig {
-                effort: "low".to_string(),
+                effort: Some("low".to_string()),
             }),
             metadata: None,
         };
@@ -3705,9 +3772,10 @@ mod tests {
             thinking: Some(Thinking {
                 thinking_type: "adaptive".to_string(),
                 budget_tokens: 0,
+                display: None,
             }),
             output_config: Some(OutputConfig {
-                effort: "ultra".to_string(),
+                effort: Some("ultra".to_string()),
             }),
             metadata: None,
         };

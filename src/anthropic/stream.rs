@@ -121,6 +121,27 @@ fn find_real_thinking_end_tag_at_buffer_end(buffer: &str) -> Option<usize> {
     None
 }
 
+/// 从完整文本中拆出老模型的内联 `<thinking>...</thinking>` 块（非流式用）
+///
+/// 仅当文本以 thinking 开始标签开头（允许前导空白）且存在真正的结束标签时才拆分，
+/// 返回 `(thinking, 剩余正文)`；否则返回 None，调用方保持原文不变。
+/// 判定规则与流式路径一致（`find_real_thinking_*`：跳过被引号包裹的标签）。
+pub(crate) fn split_inline_thinking(text: &str) -> Option<(String, String)> {
+    const START: &str = "<thinking>";
+    const END: &str = "</thinking>";
+    let start = find_real_thinking_start_tag(text)?;
+    if !text[..start].trim().is_empty() {
+        return None;
+    }
+    let body_start = start + START.len();
+    let rest = &text[body_start..];
+    let end = find_real_thinking_end_tag(rest)
+        .or_else(|| find_real_thinking_end_tag_at_buffer_end(rest))?;
+    let thinking = rest[..end].trim_start_matches('\n').trim_end().to_string();
+    let remaining = rest[end + END.len()..].trim_start_matches('\n').to_string();
+    Some((thinking, remaining))
+}
+
 /// 查找真正的 thinking 开始标签（不被引用字符包裹）
 ///
 /// 与 `find_real_thinking_end_tag` 类似，跳过被引用字符包裹的开始标签。
@@ -1528,6 +1549,26 @@ mod tests {
             json!(200)
         );
         assert_eq!(usage["input_tokens"], json!(200));
+    }
+
+    #[test]
+    fn test_split_inline_thinking() {
+        // 标准形式：开头 thinking，后接双换行和正文
+        let (t, rest) =
+            split_inline_thinking("<thinking>\nstep 1\nstep 2\n</thinking>\n\nThe answer is 9.")
+                .unwrap();
+        assert_eq!(t, "step 1\nstep 2");
+        assert_eq!(rest, "The answer is 9.");
+        // 只有 thinking、没有正文
+        let (t, rest) = split_inline_thinking("<thinking>only thoughts</thinking>").unwrap();
+        assert_eq!(t, "only thoughts");
+        assert_eq!(rest, "");
+        // 不以 thinking 开头：不拆分（正文里提到标签）
+        assert!(split_inline_thinking("Use the <thinking> tag like this.").is_none());
+        // 被引号包裹的标签不算
+        assert!(split_inline_thinking("`<thinking>` is a tag").is_none());
+        // 没有结束标签：不拆分
+        assert!(split_inline_thinking("<thinking>unfinished").is_none());
     }
 
     #[test]
