@@ -112,6 +112,6 @@ AppState {
 8. **网络错误分类**: 连接关闭/重置、发送失败等网络错误被归类为瞬态上游错误，返回 502（不记录请求体）
 9. **Rust edition**: 项目使用 Rust 2024 edition
 10. **图片处理**: GIF 会被抽帧并重编码为 JPEG 静态帧序列（最多 20 帧、最多 5fps），以降低请求体大小并提升内容识别效果。图片缩放规则：长边超过 4000px 或总像素超过 400 万时等比缩放
-11. **上游限制（2026-10-12 实测）**: 请求体约 29~30MiB（`maxRequestBodyBytes` 默认 29MiB，超出本地返回 413 `request_too_large`，与官方一致）、单请求图片 100 张（`MAX_TOTAL_IMAGES`，超出时丢弃最旧的历史图片）、工具定义 ≥2MB 均可；真正的硬上限是模型上下文窗口。上游其余 400 透传为 400，不再变成 502
+11. **上游限制（2026-10-12 实测）**: 请求体约 29~30MiB（`maxRequestBodyBytes` 默认 29MiB，超出本地返回 413 `request_too_large`，与官方一致）、单请求图片 100 张（`MAX_TOTAL_IMAGES`，超出时丢弃最旧的历史图片）、工具定义 ≥2MB 均可；真正的硬上限是模型上下文窗口。上游其余 400 透传为 400，不再变成 502。Write/Edit 分块写入策略（`compression.chunkedWritePolicy`）默认关闭：实测上游可完整返回单次 2600+ 行的 Write，不再需要"每次 ≤50 行"约束
 12. **输入压缩**（`compression.enabled`，生产默认关闭）: 当请求体接近 `maxRequestBodyBytes` 时，自动执行多层压缩（空白压缩 → thinking 截断 → tool_result 截断 → tool_use input 截断 → 历史截断），并自动修复 tool_use/tool_result 配对以避免上游 400 错误
 13. **上游 400 排障**: 若遇到 `Improperly formed request` 错误，参考 `docs/troubleshooting/400-improperly-formed-request.md` 和 `tools/test_400_improperly_formed.py` 进行诊断

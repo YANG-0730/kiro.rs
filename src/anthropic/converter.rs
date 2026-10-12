@@ -434,6 +434,7 @@ pub fn convert_request(
     let mut tools = convert_tools(
         &req.tools,
         compression_config.tool_description_max_chars,
+        compression_config.chunked_write_policy,
         &mut tool_name_map,
     );
 
@@ -988,6 +989,7 @@ fn remove_orphaned_tool_uses(
 fn convert_tools(
     tools: &Option<Vec<AnthropicTool>>,
     max_description_chars: usize,
+    chunked_write_policy: bool,
     tool_name_map: &mut HashMap<String, String>,
 ) -> Vec<KiroTool> {
     let Some(tools) = tools else {
@@ -1016,10 +1018,10 @@ fn convert_tools(
                 t.description.clone()
             };
 
-            // 对 Write/Edit 工具追加自定义描述后缀
+            // 对 Write/Edit 工具追加分块写入说明（可通过 chunked_write_policy 关闭）
             let suffix = match t.name.as_str() {
-                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
-                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
+                "Write" if chunked_write_policy => WRITE_TOOL_DESCRIPTION_SUFFIX,
+                "Edit" if chunked_write_policy => EDIT_TOOL_DESCRIPTION_SUFFIX,
                 _ => "",
             };
             if !suffix.is_empty() {
@@ -1228,8 +1230,9 @@ fn build_history(
     // 生成thinking前缀（如果需要）
     let thinking_prefix = generate_thinking_prefix(req);
 
-    // 仅在请求包含 Write/Edit 工具时注入分块写入策略
-    let should_inject_chunked_policy = has_write_or_edit_tool(req);
+    // 仅在开启分块写入策略且请求包含 Write/Edit 工具时注入
+    let should_inject_chunked_policy =
+        compression_config.chunked_write_policy && has_write_or_edit_tool(req);
 
     // 1. 处理系统消息
     if let Some(ref system) = req.system {
@@ -2462,7 +2465,7 @@ mod tests {
             },
         ];
 
-        let converted = convert_tools(&Some(tools), 4000, &mut HashMap::new());
+        let converted = convert_tools(&Some(tools), 4000, true, &mut HashMap::new());
 
         // 应该只有 1 个工具（web_search 被过滤）
         assert_eq!(converted.len(), 1, "web_search 应该被过滤");
@@ -2497,7 +2500,7 @@ mod tests {
             },
         ];
 
-        let converted = convert_tools(&Some(tools), 4000, &mut HashMap::new());
+        let converted = convert_tools(&Some(tools), 4000, true, &mut HashMap::new());
 
         // 所有 web_search 工具都应被过滤
         assert!(converted.is_empty(), "所有 web_search 变体都应被过滤");
@@ -2961,6 +2964,10 @@ mod tests {
 
     #[test]
     fn test_chunked_policy_injected_only_with_write_edit_tools() {
+        let chunked_on = CompressionConfig {
+            chunked_write_policy: true,
+            ..CompressionConfig::default()
+        };
         use super::super::types::{
             Message as AnthropicMessage, SystemMessage, Tool as AnthropicTool,
         };
@@ -2989,7 +2996,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req_no_tools, &CompressionConfig::default(), None).unwrap();
+        let result = convert_request(&req_no_tools, &chunked_on, None).unwrap();
         let first_user = &result.conversation_state.history[0];
         match first_user {
             Message::User(u) => {
@@ -3025,7 +3032,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req_with_write, &CompressionConfig::default(), None).unwrap();
+        let result = convert_request(&req_with_write, &chunked_on, None).unwrap();
         let first_user = &result.conversation_state.history[0];
         match first_user {
             Message::User(u) => {
@@ -3036,6 +3043,28 @@ mod tests {
             }
             _ => panic!("history[0] 应该是 User 消息"),
         }
+
+        // 默认配置（策略关闭）：即使有 Write 工具也不注入，且工具描述不追加分块后缀
+        let result = convert_request(&req_with_write, &CompressionConfig::default(), None).unwrap();
+        match &result.conversation_state.history[0] {
+            Message::User(u) => assert!(
+                !u.user_input_message.content.contains("chunked operations"),
+                "默认关闭时不应注入 chunked policy"
+            ),
+            _ => panic!("history[0] 应该是 User 消息"),
+        }
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+        assert!(
+            tools
+                .iter()
+                .all(|t| !t.tool_specification.description.contains("50 lines")),
+            "默认关闭时 Write 描述不应追加分块后缀"
+        );
 
         // system: None + 有 Edit 工具 → 也应注入 chunked policy
         let req_no_system_with_edit = MessagesRequest {
@@ -3061,12 +3090,7 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(
-            &req_no_system_with_edit,
-            &CompressionConfig::default(),
-            None,
-        )
-        .unwrap();
+        let result = convert_request(&req_no_system_with_edit, &chunked_on, None).unwrap();
         let first_user = &result.conversation_state.history[0];
         match first_user {
             Message::User(u) => {

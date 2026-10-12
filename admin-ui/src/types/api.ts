@@ -352,6 +352,7 @@ export interface CompressionConfigResponse {
   toolUseInputMaxChars: number
   toolDescriptionMaxChars: number
   toolDefinitionsMaxBytes: number
+  chunkedWritePolicy: boolean
   maxHistoryTurns: number
   maxHistoryChars: number
   maxRequestBodyBytes: number
@@ -379,6 +380,7 @@ export interface UpdateCompressionConfigRequest {
   toolUseInputMaxChars?: number
   toolDescriptionMaxChars?: number
   toolDefinitionsMaxBytes?: number
+  chunkedWritePolicy?: boolean
   maxHistoryTurns?: number
   maxHistoryChars?: number
   maxRequestBodyBytes?: number

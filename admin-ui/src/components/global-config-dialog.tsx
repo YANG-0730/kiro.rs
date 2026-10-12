@@ -48,6 +48,7 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
   // 压缩配置
   const [cEnabled, setCEnabled] = useState(true)
   const [cWhitespace, setCWhitespace] = useState(true)
+  const [cChunkedWrite, setCChunkedWrite] = useState(false)
   const [cThinkingStrategy, setCThinkingStrategy] = useState('discard')
   const [cToolResultMaxChars, setCToolResultMaxChars] = useState('')
   const [cToolResultHeadLines, setCToolResultHeadLines] = useState('')
@@ -75,6 +76,7 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
       const c = globalConfig.compression
       setCEnabled(c.enabled)
       setCWhitespace(c.whitespaceCompression)
+      setCChunkedWrite(c.chunkedWritePolicy)
       setCThinkingStrategy(c.thinkingStrategy)
       setCToolResultMaxChars(c.toolResultMaxChars.toString())
       setCToolResultHeadLines(c.toolResultHeadLines.toString())
@@ -156,6 +158,7 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
       }
       setIf('enabled', cEnabled, oc.enabled)
       setIf('whitespaceCompression', cWhitespace, oc.whitespaceCompression)
+      setIf('chunkedWritePolicy', cChunkedWrite, oc.chunkedWritePolicy)
       setIf('thinkingStrategy', cThinkingStrategy, oc.thinkingStrategy)
       setIf('toolResultMaxChars', parseInt(cToolResultMaxChars) || 0, oc.toolResultMaxChars)
       setIf('toolResultHeadLines', parseInt(cToolResultHeadLines) || 0, oc.toolResultHeadLines)
@@ -320,6 +323,10 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
               <div className="flex items-center justify-between">
                 <label className="text-sm font-medium">空白压缩</label>
                 <Switch checked={cWhitespace} onCheckedChange={setCWhitespace} disabled={isPending} />
+              </div>
+              <div className="flex items-center justify-between">
+                <label className="text-sm font-medium">Write/Edit 分块写入（每次 ≤50 行）</label>
+                <Switch checked={cChunkedWrite} onCheckedChange={setCChunkedWrite} disabled={isPending} />
               </div>
               <div className="space-y-1">
                 <label htmlFor="gcThinking" className="text-sm font-medium">Thinking 策略</label>

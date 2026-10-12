@@ -285,6 +285,11 @@ pub struct CompressionConfig {
     /// 约四成工具说明并删除参数描述/anyOf 等约束，影响工具调用质量。
     #[serde(default = "default_tool_definitions_max_bytes")]
     pub tool_definitions_max_bytes: usize,
+    /// 是否给 Write/Edit 工具追加"每次最多 50 行、分块写入"的说明并注入对应系统提示。
+    /// 早期为规避上游截断长工具调用而加；官方 Claude Code 无此约束。默认 false：
+    /// 2026-10-12 实测上游可完整返回单次 2600+ 行 / ~97KB 的 Write，不会截断。
+    #[serde(default)]
+    pub chunked_write_policy: bool,
     /// 历史最大轮数，默认 80（0=不限）
     #[serde(default = "default_80_turns")]
     pub max_history_turns: usize,
@@ -320,6 +325,7 @@ impl Default for CompressionConfig {
             tool_use_input_max_chars: default_6000(),
             tool_description_max_chars: default_tool_description_max_chars(),
             tool_definitions_max_bytes: default_tool_definitions_max_bytes(),
+            chunked_write_policy: false,
             max_history_turns: default_80_turns(),
             max_history_chars: default_400k(),
             image_max_long_edge: default_image_max_long_edge(),
