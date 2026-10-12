@@ -114,6 +114,12 @@ pub struct UserInputMessage {
     /// 图片列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<KiroImage>,
+    /// 文档列表（PDF / 文本等，对应 Anthropic 的 `document` 块）
+    ///
+    /// 2026-10-12 实测：仅 currentMessage 层生效（history 中的会被上游忽略）；
+    /// 单请求最多 5 个，`name` 须唯一且只含字母数字、空白、`-_()[]`。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documents: Vec<KiroDocument>,
     /// 消息来源（通常为 "AI_EDITOR"）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
@@ -133,6 +139,7 @@ impl UserInputMessage {
             content: content.into(),
             model_id: model_id.into(),
             images: Vec::new(),
+            documents: Vec::new(),
             origin: Some("AI_EDITOR".to_string()),
             additional_model_request_fields: None,
         }
@@ -223,6 +230,17 @@ impl KiroImage {
 pub struct KiroImageSource {
     /// base64 编码的图片数据
     pub bytes: String,
+}
+
+/// Kiro 文档（`userInputMessage.documents[]`）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KiroDocument {
+    /// 文档格式（"pdf" / "txt" / "md" / "csv" / "html" 等）
+    pub format: String,
+    /// 文档名（上游校验：1-200 字符，字母数字、空白、`-_()[]`，不可重复）
+    pub name: String,
+    /// 文档数据源（base64，与图片相同结构）
+    pub source: KiroImageSource,
 }
 
 /// 历史消息
