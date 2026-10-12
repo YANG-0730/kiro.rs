@@ -16,7 +16,7 @@ use crate::kiro::model::requests::tool::{
     InputSchema, Tool as KiroTool, ToolResult, ToolSpecification, ToolUseEntry,
 };
 
-use super::types::{ContentBlock, MessagesRequest, Tool as AnthropicTool};
+use super::types::{ContentBlock, ImageSource, MessagesRequest, Tool as AnthropicTool};
 use crate::anthropic::compressor::CompressionStats;
 use crate::model::config::CompressionConfig;
 
@@ -124,8 +124,15 @@ fn count_images_in_content(content: &serde_json::Value) -> usize {
     match content {
         serde_json::Value::Array(arr) => arr
             .iter()
-            .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("image"))
-            .count(),
+            .map(|item| match item.get("type").and_then(|v| v.as_str()) {
+                Some("image") => 1,
+                // tool_result 内嵌的图片同样会上送，计入总数以决定压缩策略
+                Some("tool_result") => {
+                    extract_tool_result_images(&item.get("content").cloned()).len()
+                }
+                _ => 0,
+            })
+            .sum(),
         _ => 0,
     }
 }
@@ -617,140 +624,31 @@ fn process_message_content(
                             }
                         }
                         "image" => {
-                            if let Some(source) = block.source
-                                && let Some(format) = get_image_format(&source.media_type)
-                            {
-                                // GIF：抽帧为多张静态图，避免动图 base64 体积巨大导致上游 400
-                                if format.eq_ignore_ascii_case("gif") {
-                                    if *remaining_image_budget == 0 {
-                                        tracing::warn!("图片配额已用尽，跳过 GIF");
-                                        continue;
-                                    }
-                                    match process_gif_frames(
-                                        &source.data,
-                                        compression_config,
-                                        total_image_count,
-                                        *remaining_image_budget,
-                                    ) {
-                                        Ok(gif) => {
-                                            let total_final_bytes: usize =
-                                                gif.frames.iter().map(|f| f.final_bytes_len).sum();
-                                            tracing::info!(
-                                                duration_ms = gif.duration_ms,
-                                                source_frames = gif.source_frames,
-                                                sampled_frames = gif.frames.len(),
-                                                sampling_interval_ms = gif.sampling_interval_ms,
-                                                output_format = gif.output_format,
-                                                original_bytes_len =
-                                                    gif.frames[0].original_bytes_len,
-                                                total_final_bytes = total_final_bytes,
-                                                "GIF 已抽帧并重编码"
-                                            );
-
-                                            let frame_count = gif.frames.len();
-                                            for f in gif.frames {
-                                                images.push(KiroImage::from_base64(
-                                                    gif.output_format,
-                                                    f.data,
-                                                ));
-                                            }
-                                            *remaining_image_budget =
-                                                remaining_image_budget.saturating_sub(frame_count);
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "GIF 抽帧失败，回退为静态图（可能丢失动图信息）: {}",
-                                                e
-                                            );
-                                            if *remaining_image_budget == 0 {
-                                                tracing::warn!("图片配额已用尽，跳过 GIF 回退");
-                                                continue;
-                                            }
-                                            match process_image_to_format(
-                                                &source.data,
-                                                "jpeg",
-                                                compression_config,
-                                                total_image_count,
-                                            ) {
-                                                Ok(result) => {
-                                                    images.push(KiroImage::from_base64(
-                                                        "jpeg",
-                                                        result.data,
-                                                    ));
-                                                    *remaining_image_budget -= 1;
-                                                }
-                                                Err(e2) => {
-                                                    tracing::warn!(
-                                                        "GIF 回退重编码失败，尝试静态 GIF: {}",
-                                                        e2
-                                                    );
-                                                    match process_image(
-                                                        &source.data,
-                                                        &format,
-                                                        compression_config,
-                                                        total_image_count,
-                                                    ) {
-                                                        Ok(result) => {
-                                                            images.push(KiroImage::from_base64(
-                                                                format,
-                                                                result.data,
-                                                            ));
-                                                            *remaining_image_budget -= 1;
-                                                        }
-                                                        Err(e3) => {
-                                                            tracing::warn!(
-                                                                "图片处理失败，使用原始数据: {}",
-                                                                e3
-                                                            );
-                                                            images.push(KiroImage::from_base64(
-                                                                format,
-                                                                source.data,
-                                                            ));
-                                                            *remaining_image_budget -= 1;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    // 处理静态图片（可能缩放）
-                                    if *remaining_image_budget == 0 {
-                                        tracing::warn!("图片配额已用尽，跳过静态图片");
-                                        continue;
-                                    }
-                                    match process_image(
-                                        &source.data,
-                                        &format,
-                                        compression_config,
-                                        total_image_count,
-                                    ) {
-                                        Ok(result) => {
-                                            if result.was_resized {
-                                                tracing::info!(
-                                                    "图片已缩放: {:?} -> {:?}, tokens: {}",
-                                                    result.original_size,
-                                                    result.final_size,
-                                                    result.tokens
-                                                );
-                                            }
-                                            images
-                                                .push(KiroImage::from_base64(format, result.data));
-                                            *remaining_image_budget -= 1;
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("图片处理失败，使用原始数据: {}", e);
-                                            images
-                                                .push(KiroImage::from_base64(format, source.data));
-                                            *remaining_image_budget -= 1;
-                                        }
-                                    }
-                                }
+                            if let Some(source) = block.source {
+                                push_processed_image(
+                                    source,
+                                    compression_config,
+                                    total_image_count,
+                                    remaining_image_budget,
+                                    &mut images,
+                                );
                             }
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
                                 let result_content = extract_tool_result_content(&block.content);
+                                // tool_result 中夹带的 image 块（Read 读图片、截图类 MCP 工具等）：
+                                // Kiro 的 ToolResult 只承载文本，故把图片提出来与普通图片同路径
+                                // 处理（缩放 / GIF 抽帧 / 配额），合并进本条消息的 images 上送
+                                for source in extract_tool_result_images(&block.content) {
+                                    push_processed_image(
+                                        source,
+                                        compression_config,
+                                        total_image_count,
+                                        remaining_image_budget,
+                                        &mut images,
+                                    );
+                                }
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
@@ -776,6 +674,117 @@ fn process_message_content(
     }
 
     Ok((text_parts.join("\n"), images, tool_results))
+}
+
+/// 处理单张图片（GIF 抽帧 / 静态图缩放）并追加到 `images`，同时扣减全请求图片配额。
+///
+/// 普通 image 块与 tool_result 内嵌的 image 块共用此路径，保证缩放、GIF 抽帧和
+/// `MAX_TOTAL_IMAGES` 上限对两者一致生效。配额用尽或格式不支持时跳过（打 warn）。
+fn push_processed_image(
+    source: ImageSource,
+    compression_config: &CompressionConfig,
+    total_image_count: usize,
+    remaining_image_budget: &mut usize,
+    images: &mut Vec<KiroImage>,
+) {
+    if let Some(format) = get_image_format(&source.media_type) {
+        // GIF：抽帧为多张静态图，避免动图 base64 体积巨大导致上游 400
+        if format.eq_ignore_ascii_case("gif") {
+            if *remaining_image_budget == 0 {
+                tracing::warn!("图片配额已用尽，跳过 GIF");
+                return;
+            }
+            match process_gif_frames(
+                &source.data,
+                compression_config,
+                total_image_count,
+                *remaining_image_budget,
+            ) {
+                Ok(gif) => {
+                    let total_final_bytes: usize =
+                        gif.frames.iter().map(|f| f.final_bytes_len).sum();
+                    tracing::info!(
+                        duration_ms = gif.duration_ms,
+                        source_frames = gif.source_frames,
+                        sampled_frames = gif.frames.len(),
+                        sampling_interval_ms = gif.sampling_interval_ms,
+                        output_format = gif.output_format,
+                        original_bytes_len = gif.frames[0].original_bytes_len,
+                        total_final_bytes = total_final_bytes,
+                        "GIF 已抽帧并重编码"
+                    );
+
+                    let frame_count = gif.frames.len();
+                    for f in gif.frames {
+                        images.push(KiroImage::from_base64(gif.output_format, f.data));
+                    }
+                    *remaining_image_budget = remaining_image_budget.saturating_sub(frame_count);
+                }
+                Err(e) => {
+                    tracing::warn!("GIF 抽帧失败，回退为静态图（可能丢失动图信息）: {}", e);
+                    if *remaining_image_budget == 0 {
+                        tracing::warn!("图片配额已用尽，跳过 GIF 回退");
+                        return;
+                    }
+                    match process_image_to_format(
+                        &source.data,
+                        "jpeg",
+                        compression_config,
+                        total_image_count,
+                    ) {
+                        Ok(result) => {
+                            images.push(KiroImage::from_base64("jpeg", result.data));
+                            *remaining_image_budget -= 1;
+                        }
+                        Err(e2) => {
+                            tracing::warn!("GIF 回退重编码失败，尝试静态 GIF: {}", e2);
+                            match process_image(
+                                &source.data,
+                                &format,
+                                compression_config,
+                                total_image_count,
+                            ) {
+                                Ok(result) => {
+                                    images.push(KiroImage::from_base64(format, result.data));
+                                    *remaining_image_budget -= 1;
+                                }
+                                Err(e3) => {
+                                    tracing::warn!("图片处理失败，使用原始数据: {}", e3);
+                                    images.push(KiroImage::from_base64(format, source.data));
+                                    *remaining_image_budget -= 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // 处理静态图片（可能缩放）
+            if *remaining_image_budget == 0 {
+                tracing::warn!("图片配额已用尽，跳过静态图片");
+                return;
+            }
+            match process_image(&source.data, &format, compression_config, total_image_count) {
+                Ok(result) => {
+                    if result.was_resized {
+                        tracing::info!(
+                            "图片已缩放: {:?} -> {:?}, tokens: {}",
+                            result.original_size,
+                            result.final_size,
+                            result.tokens
+                        );
+                    }
+                    images.push(KiroImage::from_base64(format, result.data));
+                    *remaining_image_budget -= 1;
+                }
+                Err(e) => {
+                    tracing::warn!("图片处理失败，使用原始数据: {}", e);
+                    images.push(KiroImage::from_base64(format, source.data));
+                    *remaining_image_budget -= 1;
+                }
+            }
+        }
+    }
 }
 
 /// 从 media_type 获取图片格式
@@ -805,6 +814,23 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
         Some(v) => v.to_string(),
         None => String::new(),
     }
+}
+
+/// 提取 tool_result content 数组中的 base64 image 块
+///
+/// 形如 `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}`。
+/// 非 base64 来源（如 url）或结构不完整的块跳过。
+fn extract_tool_result_images(content: &Option<serde_json::Value>) -> Vec<ImageSource> {
+    let Some(serde_json::Value::Array(arr)) = content else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("image"))
+        .filter_map(|item| {
+            let source: ImageSource = serde_json::from_value(item.get("source")?.clone()).ok()?;
+            (source.source_type == "base64").then_some(source)
+        })
+        .collect()
 }
 
 /// 验证并过滤 tool_use/tool_result 配对
@@ -2522,6 +2548,108 @@ mod tests {
             "http://json-schema.org/draft-07/schema#"
         );
         assert_eq!(tool.tool_specification.input_schema.json["type"], "object");
+    }
+
+    #[test]
+    fn test_tool_result_images_are_forwarded_with_text_kept() {
+        use super::super::types::Message as AnthropicMessage;
+        use base64::Engine;
+
+        // 生成一张真实的 2x2 PNG，确保走完整的 process_image 路径
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(2, 2)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let data = base64::engine::general_purpose::STANDARD.encode(&png);
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 128,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("look at the screenshot"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tool-1", "name": "Read", "input": {"file_path": "/tmp/a.png"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": [
+                            {"type": "text", "text": "image file"},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}},
+                            // 非 base64 来源与不支持的格式应被跳过
+                            {"type": "image", "source": {"type": "url", "media_type": "image/png", "data": "https://x/y.png"}},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/bmp", "data": data}}
+                        ]}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req, &CompressionConfig::default(), None).unwrap();
+        let user = &result.conversation_state.current_message.user_input_message;
+        assert_eq!(user.images.len(), 1, "tool_result 中的 base64 图片应被上送");
+        assert_eq!(user.images[0].format, "png");
+
+        let tool_result = &user.user_input_message_context.tool_results[0];
+        let text = serde_json::to_string(&tool_result.content).unwrap();
+        assert!(
+            text.contains("image file"),
+            "tool_result 文本应保留: {text}"
+        );
+    }
+
+    #[test]
+    fn test_count_images_includes_tool_result_images() {
+        let content = serde_json::json!([
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}},
+            {"type": "tool_result", "tool_use_id": "t", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "AA=="}},
+                {"type": "text", "text": "x"}
+            ]},
+            {"type": "tool_result", "tool_use_id": "t2", "content": "plain"}
+        ]);
+        assert_eq!(count_images_in_content(&content), 3);
+    }
+
+    #[test]
+    fn test_tool_result_images_respect_global_image_budget() {
+        let source = || ImageSource {
+            source_type: "base64".to_string(),
+            media_type: "image/png".to_string(),
+            data: "AA==".to_string(),
+        };
+        let mut images = Vec::new();
+        let mut budget = 1;
+        push_processed_image(
+            source(),
+            &CompressionConfig::default(),
+            2,
+            &mut budget,
+            &mut images,
+        );
+        push_processed_image(
+            source(),
+            &CompressionConfig::default(),
+            2,
+            &mut budget,
+            &mut images,
+        );
+        assert_eq!(images.len(), 1, "配额用尽后应跳过后续图片");
+        assert_eq!(budget, 0);
     }
 
     #[test]
