@@ -861,6 +861,7 @@ impl AdminService {
                 tool_result_tail_lines: c.tool_result_tail_lines,
                 tool_use_input_max_chars: c.tool_use_input_max_chars,
                 tool_description_max_chars: c.tool_description_max_chars,
+                tool_definitions_max_bytes: c.tool_definitions_max_bytes,
                 max_history_turns: c.max_history_turns,
                 max_history_chars: c.max_history_chars,
                 max_request_body_bytes: c.max_request_body_bytes,
@@ -1023,6 +1024,9 @@ impl AdminService {
         }
         if let Some(v) = src.tool_description_max_chars {
             target.tool_description_max_chars = v;
+        }
+        if let Some(v) = src.tool_definitions_max_bytes {
+            target.tool_definitions_max_bytes = v;
         }
         if let Some(v) = src.max_history_turns {
             target.max_history_turns = v;

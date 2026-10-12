@@ -236,6 +236,10 @@ fn default_image_multi_threshold() -> usize {
     20
 }
 
+fn default_tool_definitions_max_bytes() -> usize {
+    256 * 1024
+}
+
 fn default_max_request_body_bytes() -> usize {
     // 上游对请求体大小存在硬性限制（实测约 5MiB 左右会触发 400），
     // 这里默认设置为 4.5MiB 留出安全余量。
@@ -273,6 +277,11 @@ pub struct CompressionConfig {
     /// 工具描述截断阈值（字符数），覆盖原 10000 硬编码，默认 4000
     #[serde(default = "default_4000")]
     pub tool_description_max_chars: usize,
+    /// 工具定义总大小阈值（字节），超过后简化 schema 并按比例截断描述；默认 256KB（0=不压缩）。
+    /// 2026-10 实测上游可正常接受 ~246KB 的完整工具定义；原 20KB 硬编码会截掉 Claude Code
+    /// 约四成工具说明并删除参数描述/anyOf 等约束，影响工具调用质量。
+    #[serde(default = "default_tool_definitions_max_bytes")]
+    pub tool_definitions_max_bytes: usize,
     /// 历史最大轮数，默认 80（0=不限）
     #[serde(default = "default_80_turns")]
     pub max_history_turns: usize,
@@ -307,6 +316,7 @@ impl Default for CompressionConfig {
             tool_result_tail_lines: default_40(),
             tool_use_input_max_chars: default_6000(),
             tool_description_max_chars: default_4000(),
+            tool_definitions_max_bytes: default_tool_definitions_max_bytes(),
             max_history_turns: default_80_turns(),
             max_history_chars: default_400k(),
             image_max_long_edge: default_image_max_long_edge(),

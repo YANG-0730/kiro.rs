@@ -351,6 +351,7 @@ export interface CompressionConfigResponse {
   toolResultTailLines: number
   toolUseInputMaxChars: number
   toolDescriptionMaxChars: number
+  toolDefinitionsMaxBytes: number
   maxHistoryTurns: number
   maxHistoryChars: number
   maxRequestBodyBytes: number
@@ -377,6 +378,7 @@ export interface UpdateCompressionConfigRequest {
   toolResultTailLines?: number
   toolUseInputMaxChars?: number
   toolDescriptionMaxChars?: number
+  toolDefinitionsMaxBytes?: number
   maxHistoryTurns?: number
   maxHistoryChars?: number
   maxRequestBodyBytes?: number

@@ -54,6 +54,7 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
   const [cToolResultTailLines, setCToolResultTailLines] = useState('')
   const [cToolUseInputMaxChars, setCToolUseInputMaxChars] = useState('')
   const [cToolDescMaxChars, setCToolDescMaxChars] = useState('')
+  const [cToolDefsMaxBytes, setCToolDefsMaxBytes] = useState('')
   const [cMaxHistoryTurns, setCMaxHistoryTurns] = useState('')
   const [cMaxHistoryChars, setCMaxHistoryChars] = useState('')
   const [cMaxRequestBodyBytes, setCMaxRequestBodyBytes] = useState('')
@@ -80,6 +81,7 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
       setCToolResultTailLines(c.toolResultTailLines.toString())
       setCToolUseInputMaxChars(c.toolUseInputMaxChars.toString())
       setCToolDescMaxChars(c.toolDescriptionMaxChars.toString())
+      setCToolDefsMaxBytes(c.toolDefinitionsMaxBytes.toString())
       setCMaxHistoryTurns(c.maxHistoryTurns.toString())
       setCMaxHistoryChars(c.maxHistoryChars.toString())
       setCMaxRequestBodyBytes(c.maxRequestBodyBytes.toString())
@@ -160,6 +162,7 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
       setIf('toolResultTailLines', parseInt(cToolResultTailLines) || 0, oc.toolResultTailLines)
       setIf('toolUseInputMaxChars', parseInt(cToolUseInputMaxChars) || 0, oc.toolUseInputMaxChars)
       setIf('toolDescriptionMaxChars', parseInt(cToolDescMaxChars) || 0, oc.toolDescriptionMaxChars)
+      setIf('toolDefinitionsMaxBytes', parseInt(cToolDefsMaxBytes) || 0, oc.toolDefinitionsMaxBytes)
       setIf('maxHistoryTurns', parseInt(cMaxHistoryTurns) || 0, oc.maxHistoryTurns)
       setIf('maxHistoryChars', parseInt(cMaxHistoryChars) || 0, oc.maxHistoryChars)
       setIf('maxRequestBodyBytes', parseInt(cMaxRequestBodyBytes) || 0, oc.maxRequestBodyBytes)
@@ -339,6 +342,7 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
               </div>
               {numInput('gcTuMaxChars', 'tool_use input 截断阈值（字符）', cToolUseInputMaxChars, setCToolUseInputMaxChars)}
               {numInput('gcTdMaxChars', '工具描述截断阈值（字符）', cToolDescMaxChars, setCToolDescMaxChars)}
+              {numInput('gcToolDefsMaxBytes', '工具定义总大小阈值（字节，0=不压缩）', cToolDefsMaxBytes, setCToolDefsMaxBytes)}
               <div className="grid grid-cols-2 gap-2">
                 {numInput('gcMaxTurns', '历史最大轮数', cMaxHistoryTurns, setCMaxHistoryTurns, '0 = 不限')}
                 {numInput('gcMaxChars', '历史最大字符数', cMaxHistoryChars, setCMaxHistoryChars, '0 = 不限')}

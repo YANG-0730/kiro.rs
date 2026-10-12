@@ -473,7 +473,10 @@ pub fn convert_request(
     }
 
     // 10.5. 工具压缩：在所有工具（含 placeholder）就绪后执行
-    tools = super::tool_compression::compress_tools_if_needed(&tools);
+    tools = super::tool_compression::compress_tools_if_needed(
+        &tools,
+        compression_config.tool_definitions_max_bytes,
+    );
 
     // 10.6. 工具统计诊断日志
     {
