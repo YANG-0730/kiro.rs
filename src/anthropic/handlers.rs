@@ -93,6 +93,9 @@ fn build_cache_profile(
 /// 用于核实客户端（如 Claude Code）是否总把断点打在最后一条消息上，
 /// 从而判断本地 `input_tokens`（断点之后的未缓存尾部）是否应接近 0。
 fn log_cache_control_positions(payload: &MessagesRequest) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
     let has_cc = |v: &serde_json::Value| v.get("cache_control").is_some();
     let tool_bps: Vec<usize> = payload
         .tools
@@ -125,7 +128,7 @@ fn log_cache_control_positions(payload: &MessagesRequest) {
     let last_bp_on_last_message = message_bps
         .last()
         .is_some_and(|(mi, bi, n)| *mi == last_msg && *bi + 1 == *n);
-    tracing::info!(
+    tracing::debug!(
         model = %payload.model,
         message_count = payload.messages.len(),
         tool_breakpoints = ?tool_bps,

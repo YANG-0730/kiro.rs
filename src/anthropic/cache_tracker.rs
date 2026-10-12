@@ -13,7 +13,9 @@ use super::types::{CacheControl, Message, MessagesRequest};
 
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
 const ONE_HOUR_CACHE_TTL: Duration = Duration::from_secs(3600);
-const PREFIX_LOOKBACK_LIMIT: usize = 10;
+/// 官方 lookback 窗口：每个显式断点最多向前检查 20 个块位置（含断点自身）
+/// https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+const PREFIX_LOOKBACK_BLOCKS: usize = 20;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CacheResult {
@@ -90,10 +92,6 @@ impl CacheTracker {
         let mut breakpoints = Vec::new();
         let mut cumulative_tokens = 0i32;
 
-        let mut active_ttl: Option<Duration> = None;
-        let mut seen_breakpoints: std::collections::BTreeSet<usize> =
-            std::collections::BTreeSet::new();
-
         for (index, block) in flattened.into_iter().enumerate() {
             cumulative_tokens = cumulative_tokens.saturating_add(block.tokens);
 
@@ -111,25 +109,12 @@ impl CacheTracker {
                 cumulative_tokens,
             });
 
+            // 只有客户端显式 cache_control 才是断点：官方语义下写入只发生在显式断点处，
+            // 最后一个断点之后的内容既不读也不写缓存（计入 input_tokens）
             if let Some(ttl) = block.breakpoint_ttl {
-                let ttl = ttl.min(self.max_supported_ttl);
-                active_ttl = Some(ttl);
-                if seen_breakpoints.insert(index) {
-                    breakpoints.push(CacheBreakpoint {
-                        block_index: index,
-                        ttl,
-                    });
-                }
-            }
-
-            if block.is_message_end
-                && block.message_index.is_some()
-                && let Some(ttl) = active_ttl
-                && seen_breakpoints.insert(index)
-            {
                 breakpoints.push(CacheBreakpoint {
                     block_index: index,
-                    ttl,
+                    ttl: ttl.min(self.max_supported_ttl),
                 });
             }
         }
@@ -172,25 +157,25 @@ impl CacheTracker {
             "查找缓存匹配"
         );
 
+        // 官方规则：从每个显式断点向前逐块回看（最多 20 个位置），找之前请求写入过的前缀；
+        // 取能命中的最长前缀。查找的是"之前的写入"，而不是"内容是否稳定"。
         let mut matched_tokens = 0;
-
-        let cacheable_breakpoints = profile.cacheable_breakpoints();
-        let candidate_breakpoints: Vec<_> = cacheable_breakpoints
-            .iter()
-            .rev()
-            .take(PREFIX_LOOKBACK_LIMIT)
-            .copied()
-            .collect();
-
-        'outer: for breakpoint in candidate_breakpoints {
-            let candidate = &profile.blocks[breakpoint.block_index];
-            if let Some(entry) = credential_entries.get_mut(&candidate.prefix_fingerprint) {
+        for breakpoint in profile.cacheable_breakpoints().iter().rev() {
+            let lowest = breakpoint
+                .block_index
+                .saturating_sub(PREFIX_LOOKBACK_BLOCKS - 1);
+            let hit = (lowest..=breakpoint.block_index).rev().find_map(|i| {
+                let block = &profile.blocks[i];
+                let entry = credential_entries.get_mut(&block.prefix_fingerprint)?;
                 if entry.expires_at <= now {
-                    continue;
+                    return None;
                 }
                 entry.expires_at = now + entry.ttl;
-                matched_tokens = breakpoint.cumulative_tokens.min(profile.total_input_tokens);
-                break 'outer;
+                Some(block.cumulative_tokens)
+            });
+            if let Some(tokens) = hit {
+                matched_tokens = matched_tokens.max(tokens.min(profile.total_input_tokens));
+                break;
             }
         }
 
@@ -310,8 +295,6 @@ struct PendingBlock {
     value: serde_json::Value,
     tokens: i32,
     breakpoint_ttl: Option<Duration>,
-    message_index: Option<usize>,
-    is_message_end: bool,
 }
 
 fn flatten_cacheable_blocks(payload: &MessagesRequest) -> Vec<PendingBlock> {
@@ -331,8 +314,6 @@ fn flatten_cacheable_blocks(payload: &MessagesRequest) -> Vec<PendingBlock> {
                 })),
                 tokens: count_tool_definition_tokens(tool) as i32,
                 breakpoint_ttl,
-                message_index: None,
-                is_message_end: false,
             });
         }
     }
@@ -352,8 +333,6 @@ fn flatten_cacheable_blocks(payload: &MessagesRequest) -> Vec<PendingBlock> {
                 })),
                 tokens: count_system_message_tokens(block) as i32,
                 breakpoint_ttl,
-                message_index: None,
-                is_message_end: false,
             });
         }
     }
@@ -462,8 +441,6 @@ fn build_message_block(
             "block": block,
         })),
         breakpoint_ttl,
-        message_index: Some(message_index),
-        is_message_end,
     }
 }
 
@@ -621,35 +598,46 @@ mod tests {
     #[test]
     fn full_prefix_hit_leaves_only_new_turn_uncached_in_long_conversation() {
         // 复现：1000 条消息的长对话全部前缀命中时，旧实现因每条消息 4 token 的结构开销
-        // 只计入总量、不计入缓存块，会剩下 ~4000 "未缓存"输入（换算上游口径后约 8000）
+        // 只计入总量、不计入缓存块，会剩下 ~4000 "未缓存"输入（换算上游口径后约 8000）。
+        // 断点按 Claude Code 形态每轮移到最新一条 user 消息上。
         let tracker = CacheTracker::new(Duration::from_secs(3600));
-        let turns = |n: usize| {
-            // 第一条消息带缓存锚点（Claude Code 在 system/首轮打断点，后续消息由
-            // message_end 派生断点延伸前缀）
-            let mut v = vec![msg("user", cache_text(&long_cacheable_text()))];
+        let history = || {
+            let mut v = vec![msg("user", serde_json::json!(long_cacheable_text()))];
             v.push(msg("assistant", serde_json::json!("R0")));
-            for i in 1..n {
+            for i in 1..500 {
                 v.push(msg("user", serde_json::json!(format!("question {i}"))));
                 v.push(msg("assistant", serde_json::json!(format!("answer {i}"))));
             }
             v
         };
-        let req1 = build_request(turns(500));
-        let profile1 = tracker.build_profile(&req1, estimate_input_tokens(&req1));
-        tracker.update(1, &profile1);
+        let mut first = history();
+        first.push(msg("user", cache_text("question 500")));
+        let req1 = build_request(first);
+        tracker.update(
+            1,
+            &tracker.build_profile(&req1, estimate_input_tokens(&req1)),
+        );
 
-        // 下一轮：原样历史 + 新的一问一答
-        let mut next = turns(500);
-        next.push(msg("user", serde_json::json!("next question")));
-        next.push(msg("assistant", serde_json::json!("next answer")));
+        let mut next = history();
+        next.push(msg(
+            "user",
+            serde_json::json!([{"type": "text", "text": "question 500"}]),
+        ));
+        next.push(msg("assistant", serde_json::json!("answer 500")));
+        next.push(msg("user", cache_text("next question")));
         let req2 = build_request(next);
         let total = estimate_input_tokens(&req2);
         let result = tracker.compute(1, &tracker.build_profile(&req2, total));
         let uncached = total - result.cache_read_input_tokens - result.cache_creation_input_tokens;
         assert!(result.cache_read_input_tokens > 0, "应命中上一轮缓存前缀");
         assert!(
+            result.cache_creation_input_tokens < 50,
+            "只有新增一轮应写入缓存，实际 {}",
+            result.cache_creation_input_tokens
+        );
+        assert!(
             uncached < 20,
-            "全部命中时未缓存部分只应是零头，实际 {uncached}（total={total}, read={}, write={}）",
+            "断点在最后一条消息末尾时未缓存部分只应是零头，实际 {uncached}（total={total}, read={}, write={}）",
             result.cache_read_input_tokens,
             result.cache_creation_input_tokens
         );
@@ -768,29 +756,92 @@ mod tests {
 
     #[test]
     fn same_content_with_shape_drift_does_not_false_hit() {
+        // 字符串内容与单块数组等价；断点挪到后面的 assistant 上时，回看窗口内能找到上一轮
+        // 在 user 消息处的写入 → 命中，新增 assistant 写入缓存
         let tracker = CacheTracker::new(Duration::from_secs(3600));
         let req1 = build_request(vec![msg("user", cache_text(&long_cacheable_text()))]);
-        let total1 = estimate_input_tokens(&req1);
-        let profile1 = tracker.build_profile(&req1, total1);
-        tracker.update(1, &profile1);
+        tracker.update(
+            1,
+            &tracker.build_profile(&req1, estimate_input_tokens(&req1)),
+        );
 
         let req2 = build_request(vec![
             msg("user", serde_json::json!(long_cacheable_text())),
-            msg(
-                "assistant",
-                serde_json::json!([{
-                    "type": "text",
-                    "text": "ok",
-                    "cache_control": { "type": "ephemeral" }
-                }]),
-            ),
+            msg("assistant", cache_text("ok")),
         ]);
-        let total2 = estimate_input_tokens(&req2);
-        let profile2 = tracker.build_profile(&req2, total2);
-        let result = tracker.compute(1, &profile2);
-
-        assert_eq!(result.cache_read_input_tokens, 0);
+        let result = tracker.compute(
+            1,
+            &tracker.build_profile(&req2, estimate_input_tokens(&req2)),
+        );
+        assert!(result.cache_read_input_tokens > 0);
         assert!(result.cache_creation_input_tokens > 0);
+    }
+
+    #[test]
+    fn changed_earlier_content_does_not_false_hit() {
+        // 真正的"误命中"防线：前面的内容变了，之后的前缀都不能命中
+        let tracker = CacheTracker::new(Duration::from_secs(3600));
+        let req1 = build_request(vec![msg("user", cache_text(&long_cacheable_text()))]);
+        tracker.update(
+            1,
+            &tracker.build_profile(&req1, estimate_input_tokens(&req1)),
+        );
+
+        let req2 = build_request(vec![
+            msg(
+                "user",
+                serde_json::json!(format!("{} changed", long_cacheable_text())),
+            ),
+            msg("assistant", cache_text("ok")),
+        ]);
+        let r = tracker.compute(
+            1,
+            &tracker.build_profile(&req2, estimate_input_tokens(&req2)),
+        );
+        assert_eq!(r.cache_read_input_tokens, 0);
+        assert!(r.cache_creation_input_tokens > 0);
+    }
+
+    #[test]
+    fn tail_after_last_breakpoint_counts_as_input_tokens() {
+        // 用户场景：断点不在最后一个块（如 Claude Code 辅助请求、或 system-reminder 附在末尾），
+        // 断点之后的尾部既不读也不写缓存 → input_tokens > 0（此前被错算进 cache_creation）
+        let tracker = CacheTracker::new(Duration::from_secs(3600));
+        let req = build_request(vec![msg(
+            "user",
+            serde_json::json!([
+                {"type": "text", "text": long_cacheable_text(), "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": medium_turn_text("uncached tail")}
+            ]),
+        )]);
+        let total = estimate_input_tokens(&req);
+        let r = tracker.compute(1, &tracker.build_profile(&req, total));
+        let input = total - r.cache_read_input_tokens - r.cache_creation_input_tokens;
+        assert!(
+            input > 50,
+            "断点之后的尾部应计入 input_tokens，实际 {input}"
+        );
+    }
+
+    #[test]
+    fn previous_write_outside_lookback_window_misses() {
+        // 官方：每个断点最多回看 20 个块；上一轮的写入在窗口外则不命中
+        let tracker = CacheTracker::new(Duration::from_secs(3600));
+        let mut base = vec![msg("user", cache_text(&long_cacheable_text()))];
+        let req1 = build_request(base.clone());
+        tracker.update(
+            1,
+            &tracker.build_profile(&req1, estimate_input_tokens(&req1)),
+        );
+
+        base[0] = msg("user", serde_json::json!(long_cacheable_text()));
+        for i in 0..12 {
+            base.push(msg("assistant", serde_json::json!(format!("a{i}"))));
+            base.push(msg("user", serde_json::json!(format!("u{i}"))));
+        }
+        base.push(msg("assistant", cache_text("final")));
+        let r = tracker.compute(1, &tracker.build_profile(&build_request(base), 100_000));
+        assert_eq!(r.cache_read_input_tokens, 0, "超过 20 块的回看窗口不应命中");
     }
 
     #[test]
@@ -818,41 +869,39 @@ mod tests {
 
     #[test]
     fn prefix_match_with_appended_turn_reads_previous_prefix_cache() {
+        // 断点只在第一条消息上：之后追加的轮次落在最后一个断点之后，计入 input_tokens
         let tracker = CacheTracker::new(Duration::from_secs(3600));
         let req1 = build_request(vec![
             msg("user", cache_text(&long_cacheable_text())),
             msg("assistant", serde_json::json!("R1")),
-            msg("user", serde_json::json!("Follow-up")),
-            msg("assistant", serde_json::json!("R2")),
         ]);
-        let total1 = estimate_input_tokens(&req1);
-        let profile1 = tracker.build_profile(&req1, total1);
+        let profile1 = tracker.build_profile(&req1, estimate_input_tokens(&req1));
         tracker.update(1, &profile1);
 
         let req2 = build_request(vec![
             msg("user", cache_text(&long_cacheable_text())),
             msg("assistant", serde_json::json!("R1")),
-            msg("user", serde_json::json!("Follow-up")),
-            msg("assistant", serde_json::json!("R2")),
             msg("user", serde_json::json!("New feedback")),
             msg("assistant", serde_json::json!("R3")),
         ]);
         let total2 = estimate_input_tokens(&req2);
-        let profile2 = tracker.build_profile(&req2, total2);
-        let result = tracker.compute(1, &profile2);
+        let result = tracker.compute(1, &tracker.build_profile(&req2, total2));
 
         let matched_tokens = profile1
             .last_cacheable_breakpoint()
             .map(|bp| bp.cumulative_tokens)
             .unwrap_or(0);
-
         assert!(matched_tokens > 0);
         assert_eq!(result.cache_read_input_tokens, matched_tokens);
-        assert!(result.cache_creation_input_tokens > 0);
+        assert_eq!(result.cache_creation_input_tokens, 0);
+        assert!(
+            total2 - result.cache_read_input_tokens > 0,
+            "断点之后的内容计入 input_tokens"
+        );
     }
 
     #[test]
-    fn prefix_lookback_limits_to_recent_ten_breakpoints() {
+    fn every_explicit_cache_control_becomes_a_breakpoint() {
         let tracker = CacheTracker::new(Duration::from_secs(3600));
         let mut messages = Vec::new();
         for i in 0..12 {
@@ -865,80 +914,45 @@ mod tests {
         let req = build_request(messages);
         let total = estimate_input_tokens(&req);
         let profile = tracker.build_profile(&req, total);
-        assert!(profile.cacheable_breakpoints().len() >= 10);
-    }
-
-    #[test]
-    fn message_end_after_anchor_creates_additional_breakpoint() {
-        let req = build_request(vec![
-            msg("user", cache_text(&long_cacheable_text())),
-            msg("assistant", serde_json::json!("R1")),
-        ]);
-        let tracker = CacheTracker::new(Duration::from_secs(3600));
-        let profile = tracker.build_profile(&req, estimate_input_tokens(&req));
-        let breakpoints = profile.cacheable_breakpoints();
-        assert!(breakpoints.len() >= 2);
+        // 12 个显式 cache_control → 12 个断点；不再在每条消息末尾派生额外断点
+        assert_eq!(profile.cacheable_breakpoints().len(), 12);
     }
 
     #[test]
     fn multi_turn_history_extends_cacheable_prefix() {
+        // Claude Code 形态：断点每轮移到最新一条 user 消息；上一轮断点处的前缀
+        // 在新断点的 20 块回看窗口内，应命中并逐轮增长
         let tracker = CacheTracker::new(Duration::from_secs(3600));
         let long = long_cacheable_text();
+        let plain = |t: &str| serde_json::json!([{"type": "text", "text": t}]);
 
         let req1 = build_request(vec![msg("user", cache_text(&long))]);
-        let total1 = estimate_input_tokens(&req1);
-        let profile1 = tracker.build_profile(&req1, total1);
+        let profile1 = tracker.build_profile(&req1, estimate_input_tokens(&req1));
         let result1 = tracker.compute(1, &profile1);
         assert!(result1.cache_creation_input_tokens > 0);
         tracker.update(1, &profile1);
 
         let req2 = build_request(vec![
-            msg("user", cache_text(&long)),
+            msg("user", plain(&long)),
             msg("assistant", serde_json::json!(medium_turn_text("R1"))),
-            msg("user", serde_json::json!(medium_turn_text("R2"))),
+            msg("user", cache_text(&medium_turn_text("R2"))),
         ]);
-        let total2 = estimate_input_tokens(&req2);
-        let profile2 = tracker.build_profile(&req2, total2);
+        let profile2 = tracker.build_profile(&req2, estimate_input_tokens(&req2));
         let result2 = tracker.compute(1, &profile2);
         assert!(result2.cache_read_input_tokens >= result1.cache_creation_input_tokens);
+        assert!(result2.cache_creation_input_tokens > 0);
         tracker.update(1, &profile2);
 
         let req3 = build_request(vec![
-            msg("user", cache_text(&long)),
+            msg("user", plain(&long)),
             msg("assistant", serde_json::json!(medium_turn_text("R1"))),
-            msg("user", serde_json::json!(medium_turn_text("R2"))),
+            msg("user", plain(&medium_turn_text("R2"))),
             msg("assistant", serde_json::json!(medium_turn_text("R2A"))),
-            msg("user", serde_json::json!(medium_turn_text("R3"))),
+            msg("user", cache_text(&medium_turn_text("R3"))),
         ]);
-        let total3 = estimate_input_tokens(&req3);
-        let profile3 = tracker.build_profile(&req3, total3);
+        let profile3 = tracker.build_profile(&req3, estimate_input_tokens(&req3));
         let result3 = tracker.compute(1, &profile3);
         assert!(result3.cache_read_input_tokens > result2.cache_read_input_tokens);
-    }
-
-    #[test]
-    fn ttl_is_inherited_for_derived_message_breakpoints() {
-        let req = build_request(vec![
-            msg(
-                "user",
-                serde_json::json!([{
-                    "type": "text",
-                    "text": long_cacheable_text(),
-                    "cache_control": { "type": "ephemeral", "ttl": "1h" }
-                }]),
-            ),
-            msg("assistant", serde_json::json!("R1")),
-            msg("user", serde_json::json!("R2")),
-        ]);
-        let tracker = CacheTracker::new(Duration::from_secs(3600));
-        let profile = tracker.build_profile(&req, estimate_input_tokens(&req));
-        let breakpoints = profile.cacheable_breakpoints();
-        assert!(breakpoints.len() >= 2);
-        assert!(
-            breakpoints
-                .iter()
-                .all(|bp| bp.ttl == Duration::from_secs(3600))
-        );
     }
 
     #[test]
