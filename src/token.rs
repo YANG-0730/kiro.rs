@@ -7,6 +7,8 @@
 //! - 其他非空白字符：约 3.5 字符/token
 //! - 忽略空白字符
 //! - 最终四舍五入
+//! - 图片按像素尺寸估算（Anthropic 视觉规则），不计 base64 文本
+//! - 工具定义按名称 + 描述 + schema 实际内容计数
 
 use crate::anthropic::types::{
     CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool,
@@ -16,7 +18,8 @@ use crate::model::config::TlsBackend;
 use parking_lot::RwLock;
 use std::sync::OnceLock;
 
-const TOKENS_PER_TOOL: u64 = 150;
+/// 每个工具定义的固定包装开销（名称/描述/schema 之外的结构 token）
+const TOKENS_PER_TOOL_OVERHEAD: u64 = 10;
 const TOKENS_PER_MESSAGE: u64 = 4;
 
 /// Count Tokens API 配置
@@ -189,13 +192,16 @@ async fn call_remote_count_tokens(
     Ok(result.input_tokens as u64)
 }
 
+/// 估算消息列表的 tokens
+///
+/// 按内容块计数（与 cache_tracker 的分块口径一致），而不是把整个 messages 序列化成
+/// JSON 再计数——后者会把键名/引号/转义算进去，并把图片 base64 当作文本，导致含图
+/// 请求的估算偏高几个数量级。
 fn estimate_messages_tokens(messages: &[Message]) -> u64 {
-    if messages.is_empty() {
-        return 0;
-    }
-
-    let json = serde_json::to_string(messages).unwrap_or_default();
-    count_tokens(&json) + messages.len() as u64 * TOKENS_PER_MESSAGE
+    messages
+        .iter()
+        .map(|m| count_message_content_tokens(&m.content) + TOKENS_PER_MESSAGE)
+        .sum()
 }
 
 fn count_serialized_value_tokens(value: &serde_json::Value) -> u64 {
@@ -203,7 +209,29 @@ fn count_serialized_value_tokens(value: &serde_json::Value) -> u64 {
     count_tokens(&json)
 }
 
+/// 无法解析尺寸的图片按此估算（约等于 Anthropic 缩放上限 1.15MP / 750）
+const FALLBACK_IMAGE_TOKENS: u64 = 1_600;
+
+/// 按 Anthropic 视觉计费规则估算图片 tokens（基于像素尺寸，而非 base64 长度）
+fn estimate_image_block_tokens(obj: &serde_json::Map<String, serde_json::Value>) -> u64 {
+    let Some(source) = obj.get("source") else {
+        return FALLBACK_IMAGE_TOKENS;
+    };
+    match source.get("data").and_then(|v| v.as_str()) {
+        Some(data) if source.get("type").and_then(|v| v.as_str()) == Some("base64") => {
+            crate::image::estimate_image_tokens(data)
+                .map(|(tokens, _, _)| tokens)
+                .unwrap_or(FALLBACK_IMAGE_TOKENS)
+        }
+        _ => FALLBACK_IMAGE_TOKENS,
+    }
+}
+
 fn estimate_content_block_tokens(obj: &serde_json::Map<String, serde_json::Value>) -> u64 {
+    if obj.get("type").and_then(|v| v.as_str()) == Some("image") {
+        return estimate_image_block_tokens(obj);
+    }
+
     if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
         return count_tokens(text);
     }
@@ -213,7 +241,9 @@ fn estimate_content_block_tokens(obj: &serde_json::Map<String, serde_json::Value
     }
 
     if let Some(input) = obj.get("input") {
-        return count_serialized_value_tokens(input);
+        // tool_use：工具名 + 参数
+        let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+        return count_tokens(name) + count_serialized_value_tokens(input);
     }
 
     if let Some(content) = obj.get("content") {
@@ -235,9 +265,9 @@ fn count_all_tokens_local(
         .map(count_system_message_tokens)
         .sum();
     let message_tokens = estimate_messages_tokens(&messages);
-    let tool_tokens = tools
+    let tool_tokens: u64 = tools
         .as_ref()
-        .map(|items| items.len() as u64 * TOKENS_PER_TOOL)
+        .map(|items| items.iter().map(count_tool_definition_tokens).sum())
         .unwrap_or(0);
 
     (system_tokens + message_tokens + tool_tokens).max(1)
@@ -259,8 +289,21 @@ pub(crate) fn count_system_message_tokens(message: &SystemMessage) -> u64 {
 }
 
 /// 计算工具定义的 tokens
-pub(crate) fn count_tool_definition_tokens(_tool: &Tool) -> u64 {
-    TOKENS_PER_TOOL
+///
+/// 按名称 + 描述 + input_schema 的实际内容计数，外加少量固定开销（工具定义包装）。
+/// 此前固定 150/个，Claude Code 这类工具描述很长的客户端会被严重低估。
+pub(crate) fn count_tool_definition_tokens(tool: &Tool) -> u64 {
+    let schema_tokens = if tool.input_schema.is_empty() {
+        0
+    } else {
+        serde_json::to_string(&tool.input_schema)
+            .map(|s| count_tokens(&s))
+            .unwrap_or(0)
+    };
+    TOKENS_PER_TOOL_OVERHEAD
+        + count_tokens(&tool.name)
+        + count_tokens(&tool.description)
+        + schema_tokens
 }
 
 /// 计算消息内容的 tokens
@@ -271,5 +314,100 @@ pub(crate) fn count_message_content_tokens(value: &serde_json::Value) -> u64 {
         serde_json::Value::Array(arr) => arr.iter().map(count_message_content_tokens).sum(),
         serde_json::Value::Object(obj) => estimate_content_block_tokens(obj),
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use std::collections::HashMap;
+
+    fn png_base64(w: u32, h: u32) -> String {
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(w, h)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(&png)
+    }
+
+    #[test]
+    fn image_tokens_follow_pixel_size_not_base64_length() {
+        // 1000x1000 → 1_000_000 / 750 ≈ 1333 tokens，无论 base64 多长
+        let msg = Message {
+            role: "user".to_string(),
+            content: serde_json::json!([
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": png_base64(1000, 1000)}}
+            ]),
+        };
+        let tokens = estimate_messages_tokens(&[msg]);
+        assert_eq!(tokens, 1333 + TOKENS_PER_MESSAGE);
+    }
+
+    #[test]
+    fn image_with_unparseable_data_uses_fallback() {
+        let msg = Message {
+            role: "user".to_string(),
+            content: serde_json::json!([
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "not-an-image"}}
+            ]),
+        };
+        assert_eq!(
+            estimate_messages_tokens(&[msg]),
+            FALLBACK_IMAGE_TOKENS + TOKENS_PER_MESSAGE
+        );
+    }
+
+    #[test]
+    fn tool_result_images_are_counted_by_pixels() {
+        let msg = Message {
+            role: "user".to_string(),
+            content: serde_json::json!([
+                {"type": "tool_result", "tool_use_id": "t", "content": [
+                    {"type": "text", "text": "ok"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": png_base64(750, 100)}}
+                ]}
+            ]),
+        };
+        // "ok" ≈ 1 token；750*100/750 = 100 tokens
+        assert_eq!(
+            estimate_messages_tokens(&[msg]),
+            1 + 100 + TOKENS_PER_MESSAGE
+        );
+    }
+
+    #[test]
+    fn message_estimate_excludes_json_structure_overhead() {
+        let text = "hello world ".repeat(100);
+        let msg = Message {
+            role: "user".to_string(),
+            content: serde_json::json!([{"type": "text", "text": text}]),
+        };
+        assert_eq!(
+            estimate_messages_tokens(&[msg]),
+            count_tokens(&text) + TOKENS_PER_MESSAGE
+        );
+    }
+
+    #[test]
+    fn tool_definition_tokens_scale_with_content() {
+        let mut schema = HashMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+        let small = Tool {
+            tool_type: None,
+            name: "a".to_string(),
+            description: "short".to_string(),
+            input_schema: schema.clone(),
+            max_uses: None,
+            cache_control: None,
+        };
+        let large = Tool {
+            description: "do something carefully ".repeat(500),
+            ..small.clone()
+        };
+        let small_tokens = count_tool_definition_tokens(&small);
+        let large_tokens = count_tool_definition_tokens(&large);
+        assert!(small_tokens < 30, "small={small_tokens}");
+        assert!(large_tokens > 2_500, "large={large_tokens}");
     }
 }
