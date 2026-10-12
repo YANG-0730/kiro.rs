@@ -20,7 +20,8 @@ use std::sync::OnceLock;
 
 /// 每个工具定义的固定包装开销（名称/描述/schema 之外的结构 token）
 const TOKENS_PER_TOOL_OVERHEAD: u64 = 10;
-const TOKENS_PER_MESSAGE: u64 = 4;
+/// 每条消息的结构开销（role/分隔符）；cache_tracker 计入每条消息最后一个块，两边口径一致
+pub(crate) const TOKENS_PER_MESSAGE: u64 = 4;
 
 /// Count Tokens API 配置
 #[derive(Clone, Default)]

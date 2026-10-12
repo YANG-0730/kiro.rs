@@ -5,7 +5,8 @@ use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
 use crate::token::{
-    count_message_content_tokens, count_system_message_tokens, count_tool_definition_tokens,
+    TOKENS_PER_MESSAGE, count_message_content_tokens, count_system_message_tokens,
+    count_tool_definition_tokens,
 };
 
 use super::types::{CacheControl, Message, MessagesRequest};
@@ -443,8 +444,16 @@ fn build_message_block(
     breakpoint_ttl: Option<Duration>,
     is_message_end: bool,
 ) -> PendingBlock {
+    // 消息结构开销计入该消息的最后一个块，使各块累计 token 与 count_all_tokens 的总量对齐；
+    // 否则长对话（上千条消息）每条差 4 个 token，全部前缀命中时仍会剩下数千"未缓存"输入，
+    // 换算成上游口径后更被放大约 2 倍。
+    let structure = if is_message_end {
+        TOKENS_PER_MESSAGE
+    } else {
+        0
+    };
     PendingBlock {
-        tokens: count_message_content_tokens(&block) as i32,
+        tokens: (count_message_content_tokens(&block) + structure) as i32,
         value: canonicalize_json(serde_json::json!({
             "kind": "message",
             "message_index": message_index,
@@ -607,6 +616,43 @@ mod tests {
             request.messages.clone(),
             request.tools.clone(),
         ) as i32
+    }
+
+    #[test]
+    fn full_prefix_hit_leaves_only_new_turn_uncached_in_long_conversation() {
+        // 复现：1000 条消息的长对话全部前缀命中时，旧实现因每条消息 4 token 的结构开销
+        // 只计入总量、不计入缓存块，会剩下 ~4000 "未缓存"输入（换算上游口径后约 8000）
+        let tracker = CacheTracker::new(Duration::from_secs(3600));
+        let turns = |n: usize| {
+            // 第一条消息带缓存锚点（Claude Code 在 system/首轮打断点，后续消息由
+            // message_end 派生断点延伸前缀）
+            let mut v = vec![msg("user", cache_text(&long_cacheable_text()))];
+            v.push(msg("assistant", serde_json::json!("R0")));
+            for i in 1..n {
+                v.push(msg("user", serde_json::json!(format!("question {i}"))));
+                v.push(msg("assistant", serde_json::json!(format!("answer {i}"))));
+            }
+            v
+        };
+        let req1 = build_request(turns(500));
+        let profile1 = tracker.build_profile(&req1, estimate_input_tokens(&req1));
+        tracker.update(1, &profile1);
+
+        // 下一轮：原样历史 + 新的一问一答
+        let mut next = turns(500);
+        next.push(msg("user", serde_json::json!("next question")));
+        next.push(msg("assistant", serde_json::json!("next answer")));
+        let req2 = build_request(next);
+        let total = estimate_input_tokens(&req2);
+        let result = tracker.compute(1, &tracker.build_profile(&req2, total));
+        let uncached = total - result.cache_read_input_tokens - result.cache_creation_input_tokens;
+        assert!(result.cache_read_input_tokens > 0, "应命中上一轮缓存前缀");
+        assert!(
+            uncached < 20,
+            "全部命中时未缓存部分只应是零头，实际 {uncached}（total={total}, read={}, write={}）",
+            result.cache_read_input_tokens,
+            result.cache_creation_input_tokens
+        );
     }
 
     #[test]
