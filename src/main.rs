@@ -200,6 +200,24 @@ async fn main() {
         });
     }
 
+    // 启动额度耗尽凭据自动恢复（每 10 分钟比对一次本地时间）：
+    // 到达额度重置时间（每月 1 日 00:00 UTC / 上游 nextDateReset）后复查余额并自动重新启用
+    {
+        let tm = token_manager.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                crate::kiro::token_manager::EXHAUSTED_RECOVERY_INTERVAL_SECS,
+            ));
+            interval.tick().await; // 跳过首次立即触发（启动时 initialize_balances 已检查过）
+            loop {
+                interval.tick().await;
+                tm.recover_exhausted_credentials().await;
+                // 超额中凭据很少被选中，跨月后补查一次余额，避免整月被误判为超额
+                tm.refresh_stale_overage_balances().await;
+            }
+        });
+    }
+
     // 启动 Token 主动刷新后台任务（每 60s 检查，过期前 15 分钟预刷新）
     // 避免空闲期 IdC Token 过期后，下一批请求撞到过期窗口报"没有可用的凭据"。
     // 返回的 Arc<BackgroundRefresher> 一旦 drop 会 stop() 后台任务，

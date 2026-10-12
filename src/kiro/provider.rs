@@ -41,6 +41,10 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 2;
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 3;
 
+/// 上游 MODEL_TEMPORARILY_UNAVAILABLE（模型级过载/抖动）时单请求的最大尝试次数。
+/// 这类错误与凭据无关，不禁用/不冷却凭据，只做更长退避的原地重试。
+const MODEL_UNAVAILABLE_MAX_ATTEMPTS: usize = 4;
+
 /// 429 冷却默认时长（无 Retry-After 时使用 CooldownManager 的默认递增策略）
 const DEFAULT_RATE_LIMIT_COOLDOWN_SECS: u64 = 60;
 
@@ -204,7 +208,7 @@ impl KiroProvider {
                     tracing::debug!("凭据 #{} 余额缓存已刷新: {:.2}", id, remaining);
                     // 余额耗尽才禁用；开启超额且未达上限的账号即使基础余额为 0 也保持启用
                     if resp.is_exhausted(BALANCE_INSUFFICIENT_THRESHOLD) {
-                        tm.mark_insufficient_balance(id);
+                        tm.mark_insufficient_balance(id, resp.next_date_reset);
                         tracing::warn!("凭据 #{} 余额不足 ({:.2})，已主动禁用", id, remaining);
                     } else if remaining < BALANCE_INSUFFICIENT_THRESHOLD
                         && resp.has_available_overage()
@@ -289,11 +293,16 @@ impl KiroProvider {
         if available == 0 {
             anyhow::bail!("没有可用的凭据");
         }
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let mut max_retries =
+            (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut forced_token_refresh: HashSet<u64> = HashSet::new();
+        let mut model_unavailable_hits: usize = 0;
 
-        for attempt in 0..max_retries {
+        let mut next_attempt = 0;
+        while next_attempt < max_retries {
+            let attempt = next_attempt;
+            next_attempt += 1;
             // 获取调用上下文
             let ctx = match self.token_manager.acquire_context().await {
                 Ok(c) => c,
@@ -470,17 +479,31 @@ impl KiroProvider {
                 continue;
             }
 
-            if status.as_u16() == 429 {
-                if Self::is_model_temporarily_unavailable(&body)
-                    && self.token_manager.report_model_unavailable()
-                {
-                    anyhow::bail!(
-                        "MCP 请求失败（模型暂时不可用，已触发熔断）: {} {}",
-                        status,
-                        body
-                    );
+            // MODEL_TEMPORARILY_UNAVAILABLE：模型级过载，与凭据无关，退避后原地重试
+            if (status.as_u16() == 429 || status.is_server_error())
+                && Self::is_model_temporarily_unavailable(&body)
+            {
+                model_unavailable_hits += 1;
+                max_retries = max_retries.max(MODEL_UNAVAILABLE_MAX_ATTEMPTS);
+                tracing::warn!(
+                    "MCP 请求失败（模型暂时不可用，尝试 {}/{}）: {} {}",
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+                last_error = Some(anyhow::anyhow!(
+                    "MCP 请求失败（模型暂时不可用）: {} {}",
+                    status,
+                    body
+                ));
+                if attempt + 1 < max_retries {
+                    sleep(Self::model_unavailable_retry_delay(model_unavailable_hits)).await;
                 }
+                continue;
+            }
 
+            if status.as_u16() == 429 {
                 let cooldown = self.handle_rate_limited_response(ctx.id, &body, retry_after);
                 tracing::warn!(
                     credential_id = %ctx.id,
@@ -500,18 +523,6 @@ impl KiroProvider {
                     status,
                     body
                 );
-
-                // 检测 MODEL_TEMPORARILY_UNAVAILABLE 并触发熔断机制
-                if Self::is_model_temporarily_unavailable(&body)
-                    && self.token_manager.report_model_unavailable()
-                {
-                    // 熔断已触发，所有凭据已禁用，立即返回错误
-                    anyhow::bail!(
-                        "MCP 请求失败（模型暂时不可用，已触发熔断）: {} {}",
-                        status,
-                        body
-                    );
-                }
 
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 if attempt + 1 < max_retries {
@@ -555,12 +566,18 @@ impl KiroProvider {
         if available == 0 {
             anyhow::bail!("没有可用的凭据");
         }
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let mut max_retries =
+            (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut forced_token_refresh: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
+        // 本请求遇到 MODEL_TEMPORARILY_UNAVAILABLE 的次数（决定退避时长）
+        let mut model_unavailable_hits: usize = 0;
 
-        for attempt in 0..max_retries {
+        let mut next_attempt = 0;
+        while next_attempt < max_retries {
+            let attempt = next_attempt;
+            next_attempt += 1;
             // 获取调用上下文（绑定 index、credentials、token），支持用户亲和性 + 模型过滤
             let ctx = match self
                 .token_manager
@@ -795,18 +812,35 @@ impl KiroProvider {
                 continue;
             }
 
-            if status.as_u16() == 429 {
-                if Self::is_model_temporarily_unavailable(&body)
-                    && self.token_manager.report_model_unavailable()
-                {
-                    anyhow::bail!(
-                        "{} API 请求失败（模型暂时不可用，已触发熔断）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    );
+            // MODEL_TEMPORARILY_UNAVAILABLE（上游模型级过载，可能是 429 或 5xx）：
+            // 与凭据无关，不计失败、不冷却、不禁用，按更长退避原地重试，吸收抖动。
+            if (status.as_u16() == 429 || status.is_server_error())
+                && Self::is_model_temporarily_unavailable(&body)
+            {
+                model_unavailable_hits += 1;
+                max_retries = max_retries.max(MODEL_UNAVAILABLE_MAX_ATTEMPTS);
+                tracing::warn!(
+                    credential_id = %ctx.id,
+                    "{} API 请求失败（模型暂时不可用，尝试 {}/{}）: {} {}",
+                    api_type,
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败（模型暂时不可用）: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                if attempt + 1 < max_retries {
+                    sleep(Self::model_unavailable_retry_delay(model_unavailable_hits)).await;
                 }
+                continue;
+            }
 
+            if status.as_u16() == 429 {
                 let cooldown = self.handle_rate_limited_response(ctx.id, &body, retry_after);
                 tracing::warn!(
                     credential_id = %ctx.id,
@@ -833,17 +867,6 @@ impl KiroProvider {
                     status,
                     body
                 );
-
-                if Self::is_model_temporarily_unavailable(&body)
-                    && self.token_manager.report_model_unavailable()
-                {
-                    anyhow::bail!(
-                        "{} API 请求失败（模型暂时不可用，已触发熔断）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    );
-                }
 
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
@@ -899,6 +922,17 @@ impl KiroProvider {
         let backoff = exp.min(MAX_MS);
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
+        Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
+    /// MODEL_TEMPORARILY_UNAVAILABLE 的退避：1s → 2s → 4s（上限 8s）+ 最多 25% 抖动。
+    /// 比普通瞬态错误更长，给上游过载留出恢复时间；`hit` 从 1 开始。
+    fn model_unavailable_retry_delay(hit: usize) -> Duration {
+        const BASE_MS: u64 = 1_000;
+        const MAX_MS: u64 = 8_000;
+        let exp = BASE_MS.saturating_mul(2u64.saturating_pow(hit.saturating_sub(1).min(6) as u32));
+        let backoff = exp.min(MAX_MS);
+        let jitter = fastrand::u64(0..=backoff / 4);
         Duration::from_millis(backoff.saturating_add(jitter))
     }
 
@@ -1593,6 +1627,29 @@ mod tests {
             .unwrap();
         assert_eq!(reason, CooldownReason::RateLimitExceeded);
         assert!(remaining <= Duration::from_secs(15));
+    }
+
+    #[test]
+    fn test_model_unavailable_retry_delay_grows_and_caps() {
+        for _ in 0..50 {
+            let d1 = KiroProvider::model_unavailable_retry_delay(1).as_millis();
+            let d2 = KiroProvider::model_unavailable_retry_delay(2).as_millis();
+            let d3 = KiroProvider::model_unavailable_retry_delay(3).as_millis();
+            let d9 = KiroProvider::model_unavailable_retry_delay(9).as_millis();
+            assert!((1_000..=1_250).contains(&d1), "d1={d1}");
+            assert!((2_000..=2_500).contains(&d2), "d2={d2}");
+            assert!((4_000..=5_000).contains(&d3), "d3={d3}");
+            assert!((8_000..=10_000).contains(&d9), "d9={d9}");
+        }
+    }
+
+    #[test]
+    fn test_is_model_temporarily_unavailable_detects_upstream_body() {
+        let body = r#"{"message":"Encountered unexpectedly high load when processing the request, please try again.","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#;
+        assert!(KiroProvider::is_model_temporarily_unavailable(body));
+        assert!(!KiroProvider::is_model_temporarily_unavailable(
+            r#"{"reason":"THROTTLING"}"#
+        ));
     }
 
     #[test]

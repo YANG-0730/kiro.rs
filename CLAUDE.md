@@ -62,7 +62,7 @@ POST /v1/messages (Anthropic 格式)
 ## 核心设计模式
 
 1. **Provider Pattern** - `kiro/provider.rs`: 统一的 API 提供者接口，处理请求转发和重试。支持凭据级代理（每个凭据可配独立 HTTP/SOCKS5 代理，缓存对应 HTTP Client 避免重复创建）
-2. **Multi-Token Manager** - `kiro/token_manager.rs`: 多凭据管理，按优先级故障转移，后台异步刷新 Token（支持 Social 和 IdC 两种认证方式）。余额缓存动态 TTL：高频用户 10 分钟、低频用户 30 分钟、低余额用户 24 小时，过期时异步刷新不阻塞请求
+2. **Multi-Token Manager** - `kiro/token_manager.rs`: 多凭据管理，按优先级故障转移，后台异步刷新 Token（支持 Social 和 IdC 两种认证方式）。余额缓存动态 TTL：高频用户 10 分钟、低频用户 30 分钟、低余额（超额计费中）用户 10 分钟，过期时异步刷新不阻塞请求。因额度耗尽（InsufficientBalance / QuotaExceeded）被禁用的凭据记录重置时间（上游 `nextDateReset`，缺省为下月 1 日 00:00 UTC），到点后复查余额并自动重新启用（Kiro 额度按 UTC 自然月重置）
 3. **Protocol Converter** - `anthropic/converter.rs`: Anthropic ↔ Kiro 双向协议转换，包括模型映射（sonnet/opus/haiku → Kiro 模型 ID）、JSON Schema 规范化（修复 MCP 工具的 `required: null` / `properties: null`）、工具占位符生成、图片格式转换
 4. **Event Stream Parser** - `kiro/parser/`: AWS Event Stream 二进制协议解析（header + payload + CRC32C 校验）
 5. **Streaming Response** - `anthropic/stream.rs`: 使用 `StreamContext` 实时将 Kiro 事件转换为 Anthropic SSE，最终 usage 采用本地估算口径并透传上游 `meteringEvent` 诊断信息
@@ -85,9 +85,10 @@ AppState {
 ## 凭据故障转移与冷却
 
 - 凭据按 `priority` 字段排序，优先使用高优先级凭据
+- 同优先级内先用仍有基础额度的凭据，全部进入超额后才用超额（超额另行计费，基础额度月底作废）；亲和绑定在超额凭据上的会话，若同优先级（或更高）还有基础额度凭据会改绑。跨月后对超额中凭据补查一次余额，避免整月误判
 - 请求失败时 `report_failure()` 触发故障转移到下一个可用凭据
 - 冷却分类管理：`FailureLimit` / `InsufficientBalance` / `ModelUnavailable` / `QuotaExceeded`
-- `MODEL_TEMPORARILY_UNAVAILABLE` 触发全局熔断，禁用所有凭据
+- `MODEL_TEMPORARILY_UNAVAILABLE`（上游模型级过载）与凭据无关：不禁用/不冷却凭据，单请求最多 4 次、1s→2s→4s 退避重试，仍失败返回 529 `overloaded_error` 交给客户端重试
 
 ## API 端点
 

@@ -200,6 +200,10 @@ fn is_transient_upstream_error(err: &Error) -> bool {
         || is_network_error(&s)
 }
 
+fn is_model_overloaded_error(err: &Error) -> bool {
+    err.to_string().contains("MODEL_TEMPORARILY_UNAVAILABLE")
+}
+
 fn is_improperly_formed_request_error(err: &Error) -> bool {
     let s = err.to_string();
     s.contains("Improperly formed request")
@@ -526,6 +530,19 @@ fn map_kiro_provider_error_to_response(request_body: &str, err: Error) -> Respon
             Json(ErrorResponse::new(
                 "rate_limit_error",
                 "All credentials quota exhausted. Please wait for quota reset or add new credentials.",
+            )),
+        )
+            .into_response();
+    }
+
+    if is_model_overloaded_error(&err) {
+        // 与 Anthropic 官方语义对齐：529 overloaded_error，客户端（如 Claude Code）会自行退避重试
+        tracing::warn!(error = %err, "上游模型暂时不可用（重试已用尽），返回 529 overloaded");
+        return (
+            StatusCode::from_u16(529).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+            Json(ErrorResponse::new(
+                "overloaded_error",
+                "Upstream model is temporarily overloaded (MODEL_TEMPORARILY_UNAVAILABLE). Please retry shortly.",
             )),
         )
             .into_response();
@@ -1874,5 +1891,16 @@ mod tests {
             anyhow::anyhow!("400 Improperly formed request"),
         );
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_model_temporarily_unavailable_maps_to_529_overloaded() {
+        let response = map_kiro_provider_error_to_response(
+            "{}",
+            anyhow::anyhow!(
+                "流式 API 请求失败（模型暂时不可用）: 500 Internal Server Error {{\"reason\":\"MODEL_TEMPORARILY_UNAVAILABLE\"}}"
+            ),
+        );
+        assert_eq!(response.status().as_u16(), 529);
     }
 }

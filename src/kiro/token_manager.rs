@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 use tokio::sync::Mutex as TokioMutex;
 
@@ -624,8 +624,6 @@ pub enum DisableReason {
     /// 余额不足
     #[allow(dead_code)]
     InsufficientBalance,
-    /// 模型临时不可用（全局禁用）
-    ModelUnavailable,
     /// 手动禁用
     Manual,
     /// 额度已用尽（如 MONTHLY_REQUEST_COUNT）
@@ -657,6 +655,48 @@ struct CredentialEntry {
     last_used_at: Option<String>,
     /// refreshToken 的 SHA-256 哈希缓存（避免 snapshot 重复计算）
     refresh_token_hash: Option<String>,
+    /// 额度类禁用（InsufficientBalance / QuotaExceeded）的恢复检查时间：
+    /// 到达该时间（额度重置）前不复查，到达后才查询余额决定是否自动启用
+    quota_recover_at: Option<DateTime<Utc>>,
+}
+
+/// 计算额度类禁用的恢复检查时间
+///
+/// 优先使用上游 getUsageLimits 返回的 `nextDateReset`（Unix 秒）；缺失或已过期时
+/// 退化为下个自然月 1 日 00:00 UTC（Kiro 额度按 UTC 自然月重置）。
+fn quota_recover_at(next_date_reset: Option<f64>, now: DateTime<Utc>) -> DateTime<Utc> {
+    future_reset_time(next_date_reset, now).unwrap_or_else(|| next_utc_month_start(now))
+}
+
+/// 将上游 `nextDateReset` 解析为时间，仅当其晚于 `now` 时返回
+fn future_reset_time(next_date_reset: Option<f64>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    next_date_reset
+        .filter(|t| t.is_finite())
+        .and_then(|t| DateTime::<Utc>::from_timestamp(t as i64, 0))
+        .filter(|t| *t > now)
+}
+
+/// 本自然月 1 日 00:00 UTC（即最近一次额度重置时间）
+fn current_utc_month_start(now: DateTime<Utc>) -> DateTime<Utc> {
+    use chrono::{Datelike, NaiveDate};
+    NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| dt.and_utc())
+        .unwrap_or(now)
+}
+
+/// 下个自然月 1 日 00:00 UTC
+fn next_utc_month_start(now: DateTime<Utc>) -> DateTime<Utc> {
+    use chrono::{Datelike, NaiveDate};
+    let (year, month) = if now.month() == 12 {
+        (now.year() + 1, 1)
+    } else {
+        (now.year(), now.month() + 1)
+    };
+    NaiveDate::from_ymd_opt(year, month, 1)
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| dt.and_utc())
+        .unwrap_or(now + Duration::days(1))
 }
 
 /// 自愈原因（内部使用，用于判断是否可自动恢复）
@@ -766,8 +806,16 @@ struct CachedBalance {
 const BALANCE_TTL_HIGH_FREQ_SECS: u64 = 600;
 /// 低频渠道 TTL（30 分钟）
 const BALANCE_TTL_LOW_FREQ_SECS: u64 = 1800;
-/// 低余额渠道 TTL（24 小时）
-const BALANCE_TTL_LOW_BALANCE_SECS: u64 = 86400;
+/// 低余额渠道 TTL（10 分钟）
+///
+/// 基础余额耗尽的账号若仍保持启用，说明正处于超额计费中，需要较频繁地复查
+/// 超额是否已用到上限，以便及时禁用并切号（真正耗尽的账号已被禁用，不会再触发刷新）。
+const BALANCE_TTL_LOW_BALANCE_SECS: u64 = 600;
+/// 额度耗尽凭据的恢复检查周期（10 分钟）
+///
+/// 只是本地时间比对，到达额度重置时间（`quota_recover_at`）前不会发起任何上游查询；
+/// 周期决定的是重置后最多多久能自动启用。
+pub const EXHAUSTED_RECOVERY_INTERVAL_SECS: u64 = 600;
 /// 高频判定阈值（10分钟内使用超过此次数视为高频）
 const HIGH_FREQ_THRESHOLD: u32 = 20;
 /// 使用计数重置周期（10 分钟）
@@ -799,12 +847,8 @@ pub struct MultiTokenManager {
     credentials_path: Option<PathBuf>,
     /// 是否为多凭据格式（数组格式才回写）
     is_multiple_format: bool,
-    /// MODEL_TEMPORARILY_UNAVAILABLE 错误计数
-    model_unavailable_count: AtomicU32,
     /// 选择抖动计数器（用于同权重候选的轮询，避免总选第一个）
     selection_rr: AtomicU64,
-    /// 全局禁用恢复时间（None 表示未被全局禁用）
-    global_recovery_time: Mutex<Option<DateTime<Utc>>>,
     /// 用户亲和性管理器
     affinity: UserAffinityManager,
     /// 余额缓存（用于负载均衡和故障转移时选择最优凭据）
@@ -852,12 +896,6 @@ struct RateLimitedCredentialDiag {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
-
-/// MODEL_TEMPORARILY_UNAVAILABLE 触发全局禁用的阈值
-const MODEL_UNAVAILABLE_THRESHOLD: u32 = 2;
-
-/// 全局禁用恢复时间（分钟）
-const GLOBAL_DISABLE_RECOVERY_MINUTES: i64 = 5;
 
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
@@ -985,6 +1023,7 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     refresh_token_hash,
+                    quota_recover_at: None,
                 }
             })
             .collect();
@@ -1026,9 +1065,7 @@ impl MultiTokenManager {
             refresh_lock: TokioMutex::new(()),
             credentials_path,
             is_multiple_format,
-            model_unavailable_count: AtomicU32::new(0),
             selection_rr: AtomicU64::new(0),
-            global_recovery_time: Mutex::new(None),
             affinity: UserAffinityManager::new(),
             balance_cache: Mutex::new(initial_cache),
             rate_limiter: RateLimiter::new(rate_limit_config),
@@ -1208,7 +1245,7 @@ impl MultiTokenManager {
         );
     }
 
-    /// 选择最佳凭据（两级排序：使用次数最少 + 余额最多；完全相同则轮询）
+    /// 选择最佳凭据（先基础额度后超额 → 使用次数最少 → 余额最多；完全相同则轮询）
     fn select_best_candidate_id(&self, candidate_ids: &[u64]) -> Option<u64> {
         if candidate_ids.is_empty() {
             return None;
@@ -1228,6 +1265,17 @@ impl MultiTokenManager {
             // NaN 余额归一化为 0.0，避免 total_cmp 将 NaN 视为最大值
             let effective_balance = if balance.is_finite() { balance } else { 0.0 };
             scored.push((id, effective_usage, effective_balance));
+        }
+
+        // 第零优先级：先用基础额度（订阅内、月底作废），基础额度都用完才用超额（另行计费）。
+        // 未初始化（余额未知）的凭据不算"有基础额度"；没有任何有基础额度的候选时不过滤。
+        let has_base = |id: u64| {
+            cache
+                .get(&id)
+                .is_some_and(|c| c.initialized && c.remaining >= LOW_BALANCE_THRESHOLD)
+        };
+        if scored.iter().any(|(id, _, _)| has_base(*id)) {
+            scored.retain(|(id, _, _)| has_base(*id));
         }
 
         // 第一优先级：使用次数最少
@@ -1252,6 +1300,46 @@ impl MultiTokenManager {
         Some(scored[index].0)
     }
 
+    /// 判断亲和绑定的凭据是否"已进入超额，且有更省钱的替代"
+    ///
+    /// 条件：绑定凭据余额已知且基础额度 < 阈值（超额计费中），同时存在另一个
+    /// 未禁用、在模型白名单内、优先级不低于它、且基础额度仍充足的凭据。
+    fn overage_bound_has_base_alternative(
+        &self,
+        bound_id: u64,
+        model_whitelist: Option<&std::collections::HashSet<u64>>,
+    ) -> bool {
+        // 先取 entries 快照再查 balance_cache，避免同时持有两把锁
+        let others: Vec<u64> = {
+            let entries = self.entries.lock();
+            let Some(bound) = entries.iter().find(|e| e.id == bound_id) else {
+                return false;
+            };
+            let p = bound.credentials.priority;
+            entries
+                .iter()
+                .filter(|e| {
+                    e.id != bound_id
+                        && !e.disabled
+                        && e.credentials.priority <= p
+                        && model_whitelist.is_none_or(|w| w.contains(&e.id))
+                })
+                .map(|e| e.id)
+                .collect()
+        };
+
+        let cache = self.balance_cache.lock();
+        let bound_in_overage = cache
+            .get(&bound_id)
+            .is_some_and(|c| c.initialized && c.remaining < LOW_BALANCE_THRESHOLD);
+        bound_in_overage
+            && others.iter().any(|id| {
+                cache
+                    .get(id)
+                    .is_some_and(|c| c.initialized && c.remaining >= LOW_BALANCE_THRESHOLD)
+            })
+    }
+
     /// 获取 API 调用上下文
     ///
     /// 返回绑定了 id、credentials 和 token 的调用上下文
@@ -1273,9 +1361,6 @@ impl MultiTokenManager {
         &self,
         model_id: Option<&str>,
     ) -> anyhow::Result<CallContext> {
-        // 检查是否需要自动恢复
-        self.check_and_recover();
-
         // 模型级凭据白名单（None 表示不过滤）
         let model_whitelist = self.model_credential_whitelist(model_id);
 
@@ -1569,7 +1654,19 @@ impl MultiTokenManager {
                 .as_ref()
                 .is_none_or(|w| w.contains(&bound_id));
 
-            if is_enabled {
+            // 绑定凭据已进入超额、而同优先级（或更高）还有基础额度可用的凭据时，放弃绑定重新选择，
+            // 避免长会话一直粘在超额账号上花钱、其他账号的基础额度月底白白作废。
+            let should_leave_overage = is_enabled
+                && self.overage_bound_has_base_alternative(bound_id, model_whitelist.as_ref());
+            if should_leave_overage {
+                tracing::info!(
+                    user_id = %mask_user_id(Some(user_id)),
+                    credential_id = %bound_id,
+                    "亲和性绑定凭据已进入超额，切换到仍有基础额度的凭据"
+                );
+            }
+
+            if is_enabled && !should_leave_overage {
                 if let Some((reason, remaining)) = self.cooldown_manager.check_cooldown(bound_id) {
                     // 对“长冷却”原因不保留绑定，避免长期命中后每次都先失败再回退。
                     keep_affinity_binding = matches!(
@@ -2196,9 +2293,6 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_success(&self, id: u64) {
-        // 重置 MODEL_TEMPORARILY_UNAVAILABLE 计数器
-        self.model_unavailable_count.store(0, Ordering::SeqCst);
-
         // 记录使用次数（用于动态 TTL）
         self.record_usage(id);
 
@@ -2296,97 +2390,20 @@ impl MultiTokenManager {
             entry.last_used_at = Some(Utc::now().to_rfc3339());
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+            // 402 响应不带重置时间：按下个自然月 1 日 00:00 UTC 复查
+            let recover_at = quota_recover_at(None, Utc::now());
+            entry.quota_recover_at = Some(recover_at);
 
-            tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
+            tracing::error!(
+                "凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用，将于 {} 额度重置后自动复查",
+                id,
+                recover_at.to_rfc3339()
+            );
 
             entries.iter().any(|e| !e.disabled)
         };
         self.save_stats_debounced();
         result
-    }
-
-    /// 报告 MODEL_TEMPORARILY_UNAVAILABLE 错误
-    ///
-    /// 累计达到阈值后禁用所有凭据，5分钟后自动恢复
-    /// 返回是否触发了全局禁用
-    pub fn report_model_unavailable(&self) -> bool {
-        let count = self.model_unavailable_count.fetch_add(1, Ordering::SeqCst) + 1;
-        tracing::warn!(
-            "MODEL_TEMPORARILY_UNAVAILABLE 错误（{}/{}）",
-            count,
-            MODEL_UNAVAILABLE_THRESHOLD
-        );
-
-        if count >= MODEL_UNAVAILABLE_THRESHOLD {
-            self.disable_all_credentials(DisableReason::ModelUnavailable);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// 禁用所有凭据
-    fn disable_all_credentials(&self, reason: DisableReason) {
-        let mut entries = self.entries.lock();
-        let mut recovery_time = self.global_recovery_time.lock();
-
-        for entry in entries.iter_mut() {
-            if !entry.disabled {
-                entry.disabled = true;
-                entry.disable_reason = Some(reason);
-            }
-        }
-
-        // 设置恢复时间
-        let recover_at = Utc::now() + Duration::minutes(GLOBAL_DISABLE_RECOVERY_MINUTES);
-        *recovery_time = Some(recover_at);
-
-        tracing::error!(
-            "所有凭据已被禁用（原因: {:?}），将于 {} 自动恢复",
-            reason,
-            recover_at.format("%H:%M:%S")
-        );
-    }
-
-    /// 检查并执行自动恢复
-    ///
-    /// 如果已到恢复时间，恢复因 ModelUnavailable 禁用的凭据
-    /// 余额不足的凭据不会被恢复
-    ///
-    /// 返回是否执行了恢复
-    pub fn check_and_recover(&self) -> bool {
-        let should_recover = {
-            let recovery_time = self.global_recovery_time.lock();
-            recovery_time.map(|t| Utc::now() >= t).unwrap_or(false)
-        };
-
-        if !should_recover {
-            return false;
-        }
-
-        let mut entries = self.entries.lock();
-        let mut recovery_time = self.global_recovery_time.lock();
-        let mut recovered_count = 0;
-
-        for entry in entries.iter_mut() {
-            // 只恢复因 ModelUnavailable 禁用的凭据，余额不足的不恢复
-            if entry.disabled && entry.disable_reason == Some(DisableReason::ModelUnavailable) {
-                entry.disabled = false;
-                entry.disable_reason = None;
-                entry.failure_count = 0;
-                recovered_count += 1;
-            }
-        }
-
-        // 重置全局状态
-        *recovery_time = None;
-        self.model_unavailable_count.store(0, Ordering::SeqCst);
-
-        if recovered_count > 0 {
-            tracing::info!("已自动恢复 {} 个凭据", recovered_count);
-        }
-
-        recovered_count > 0
     }
 
     /// 标记凭据为认证失败（如 invalid_grant，不会被自动恢复）
@@ -2416,20 +2433,23 @@ impl MultiTokenManager {
     }
 
     /// 标记凭据为余额不足（不会被自动恢复）
-    pub fn mark_insufficient_balance(&self, id: u64) {
+    ///
+    /// `next_date_reset` 为上游 getUsageLimits 的 `nextDateReset`，用于确定额度重置后
+    /// 何时复查并自动启用（见 `recover_exhausted_credentials`）。
+    pub fn mark_insufficient_balance(&self, id: u64, next_date_reset: Option<f64>) {
         let mut entries = self.entries.lock();
         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            let recover_at = quota_recover_at(next_date_reset, Utc::now());
             entry.disabled = true;
             entry.auto_heal_reason = None; // 清除自愈原因，防止被自愈循环错误恢复
             entry.disable_reason = Some(DisableReason::InsufficientBalance);
-            tracing::warn!("凭据 #{} 已标记为余额不足", id);
+            entry.quota_recover_at = Some(recover_at);
+            tracing::warn!(
+                "凭据 #{} 已标记为余额不足，将于 {} 额度重置后自动复查",
+                id,
+                recover_at.to_rfc3339()
+            );
         }
-    }
-
-    /// 获取全局恢复时间（用于 Admin API）
-    #[allow(dead_code)]
-    pub fn get_recovery_time(&self) -> Option<DateTime<Utc>> {
-        *self.global_recovery_time.lock()
     }
 
     /// 获取使用额度信息
@@ -2480,12 +2500,8 @@ impl MultiTokenManager {
 
                     // 余额耗尽时自动禁用凭据（但开启超额且未达上限的账号不禁用）
                     if limits.is_exhausted(LOW_BALANCE_THRESHOLD) {
-                        let mut entries = self.entries.lock();
-                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.disabled = true;
-                            entry.disable_reason = Some(DisableReason::InsufficientBalance);
-                            tracing::warn!("凭据 #{} 余额不足 ({:.2})，已自动禁用", id, remaining);
-                        }
+                        tracing::warn!("凭据 #{} 余额不足 ({:.2})，已自动禁用", id, remaining);
+                        self.mark_insufficient_balance(id, limits.next_date_reset);
                     } else if remaining < LOW_BALANCE_THRESHOLD && limits.has_available_overage() {
                         tracing::info!(
                             "凭据 #{} 基础余额为 {:.2}，但已开启超额计费，保持启用",
@@ -2515,6 +2531,166 @@ impl MultiTokenManager {
         );
 
         success_count
+    }
+
+    /// 自动恢复因额度耗尽被禁用的凭据（月度额度重置后自动重新启用）
+    ///
+    /// 只处理 `InsufficientBalance` / `QuotaExceeded` 两类自动禁用；手动禁用、认证失败、
+    /// 账户暂停等不受影响。按日期而非轮询：只有到达禁用时记录的 `quota_recover_at`
+    /// （上游 `nextDateReset`，缺省为下个自然月 1 日 00:00 UTC）后才查询 getUsageLimits，
+    /// 若已不再耗尽（基础额度已重置，或仍有可用超额）则重新启用。
+    ///
+    /// # 返回
+    /// - 本次恢复的凭据数量
+    pub async fn recover_exhausted_credentials(&self) -> usize {
+        let now = Utc::now();
+        let candidate_ids: Vec<u64> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .filter(|e| {
+                    e.disabled
+                        && matches!(
+                            e.disable_reason,
+                            Some(DisableReason::InsufficientBalance)
+                                | Some(DisableReason::QuotaExceeded)
+                        )
+                        // 未到重置时间不查询；缺失记录（理论上不会发生）则直接复查
+                        && e.quota_recover_at.is_none_or(|t| now >= t)
+                })
+                .map(|e| e.id)
+                .collect()
+        };
+
+        if candidate_ids.is_empty() {
+            return 0;
+        }
+
+        tracing::info!(
+            "检查 {} 个额度耗尽凭据是否已重置: {:?}",
+            candidate_ids.len(),
+            candidate_ids
+        );
+
+        let mut recovered = 0;
+        for (index, &id) in candidate_ids.iter().enumerate() {
+            match self.get_usage_limits_for(id).await {
+                Ok(limits) => {
+                    let remaining = (limits.usage_limit() - limits.current_usage()).max(0.0);
+                    if limits.is_exhausted(LOW_BALANCE_THRESHOLD) {
+                        // 已过重置时间但上游仍显示耗尽：若上游给出了未来的重置时间则顺延到该时间，
+                        // 否则（上游尚未完成重置）保持 recover_at 不变，下个检查周期继续复查
+                        if let Some(next) = future_reset_time(limits.next_date_reset, Utc::now())
+                            && let Some(entry) = self.entries.lock().iter_mut().find(|e| e.id == id)
+                        {
+                            entry.quota_recover_at = Some(next);
+                        }
+                        tracing::info!("凭据 #{} 额度仍耗尽 ({:.2})，保持禁用", id, remaining);
+                    } else {
+                        let restored = {
+                            let mut entries = self.entries.lock();
+                            match entries.iter_mut().find(|e| e.id == id) {
+                                // 查询期间状态可能被管理员改动，二次确认仍是额度类禁用
+                                Some(entry)
+                                    if entry.disabled
+                                        && matches!(
+                                            entry.disable_reason,
+                                            Some(DisableReason::InsufficientBalance)
+                                                | Some(DisableReason::QuotaExceeded)
+                                        ) =>
+                                {
+                                    entry.disabled = false;
+                                    entry.disable_reason = None;
+                                    entry.auto_heal_reason = None;
+                                    entry.failure_count = 0;
+                                    entry.quota_recover_at = None;
+                                    true
+                                }
+                                _ => false,
+                            }
+                        };
+                        if restored {
+                            self.update_balance_cache(id, remaining);
+                            recovered += 1;
+                            tracing::info!(
+                                "凭据 #{} 额度已重置（剩余 {:.2}），已自动重新启用",
+                                id,
+                                remaining
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("凭据 #{} 额度恢复检查失败: {}", id, e);
+                }
+            }
+
+            // 与 initialize_balances 一致：间隔 0.5 秒避免触发限流
+            if index < candidate_ids.len() - 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+
+        recovered
+    }
+
+    /// 月度重置后刷新"超额中"凭据的余额缓存
+    ///
+    /// "先基础额度后超额"的选择策略会让超额中的凭据很少被选中，其余额缓存（基础额度 0）
+    /// 在月初重置后也不会因使用而刷新，导致它整月被误判为超额。这里对缓存时间早于
+    /// 本月 1 日 00:00 UTC 的超额中凭据补查一次余额；未跨月时不发起任何上游查询。
+    ///
+    /// # 返回
+    /// - 本次刷新的凭据数量
+    pub async fn refresh_stale_overage_balances(&self) -> usize {
+        let month_start = current_utc_month_start(Utc::now());
+        // 本月已经过去的时长；缓存年龄大于它，说明缓存写于上个计费月
+        let since_month_start = (Utc::now() - month_start).to_std().unwrap_or_default();
+
+        let enabled: Vec<u64> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .map(|e| e.id)
+                .collect()
+        };
+        let stale_ids: Vec<u64> = {
+            let cache = self.balance_cache.lock();
+            enabled
+                .into_iter()
+                .filter(|id| {
+                    cache.get(id).is_some_and(|c| {
+                        c.initialized
+                            && c.remaining < LOW_BALANCE_THRESHOLD
+                            && c.cached_at.elapsed() > since_month_start
+                    })
+                })
+                .collect()
+        };
+
+        let mut refreshed = 0;
+        for (index, &id) in stale_ids.iter().enumerate() {
+            match self.get_usage_limits_for(id).await {
+                Ok(limits) => {
+                    let remaining = (limits.usage_limit() - limits.current_usage()).max(0.0);
+                    self.update_balance_cache(id, remaining);
+                    refreshed += 1;
+                    tracing::info!("凭据 #{} 跨月后余额已刷新: {:.2}", id, remaining);
+                    // 与其他余额检查点保持一致：真正耗尽（无可用超额）则禁用
+                    if limits.is_exhausted(LOW_BALANCE_THRESHOLD) {
+                        self.mark_insufficient_balance(id, limits.next_date_reset);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("凭据 #{} 跨月余额刷新失败: {}", id, e);
+                }
+            }
+            if index < stale_ids.len() - 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+        refreshed
     }
 
     /// 设置模型注册表引用（用于按模型过滤候选凭据）
@@ -3146,6 +3322,7 @@ impl MultiTokenManager {
                 success_count: 0,
                 last_used_at: None,
                 refresh_token_hash: entry_secret_hash,
+                quota_recover_at: None,
             });
         }
 
@@ -3765,6 +3942,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_select_prefers_base_quota_over_overage_and_falls_back_when_all_overage() {
+        let config = Config::default();
+        let creds: Vec<KiroCredentials> = (1..=3)
+            .map(|i| {
+                let mut c = KiroCredentials::default();
+                c.access_token = Some(format!("t{i}"));
+                c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+                c
+            })
+            .collect();
+        let manager = MultiTokenManager::new(config, creds, None, None, false).unwrap();
+
+        // #1 超额中但最近没用过；#2/#3 还有基础额度但用过多次
+        manager.update_balance_cache(1, 0.0);
+        manager.update_balance_cache(2, 500.0);
+        manager.update_balance_cache(3, 800.0);
+        for _ in 0..5 {
+            manager.record_usage(2);
+            manager.record_usage(3);
+        }
+        for _ in 0..10 {
+            // 排除单凭据最小请求间隔的干扰（被限流时溢出到其他号是正确行为，不是本测试关注点）
+            manager.rate_limiter.reset(2);
+            manager.rate_limiter.reset(3);
+            let ctx = manager.acquire_context().await.unwrap();
+            assert_ne!(ctx.id, 1, "有基础额度可用时不应选超额中的凭据");
+        }
+
+        // 全部进入超额：退化为原有排序，仍可正常选号
+        manager.update_balance_cache(2, 0.0);
+        manager.update_balance_cache(3, 0.0);
+        assert!(manager.acquire_context().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_affinity_leaves_overage_credential_only_for_same_or_higher_priority_base() {
+        let config = Config::default();
+        let mk = |i: u32, priority: u32| {
+            let mut c = KiroCredentials::default();
+            c.access_token = Some(format!("t{i}"));
+            c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+            c.priority = priority;
+            c
+        };
+        // #1、#2 同优先级 0；#3 优先级 1（更低）
+        let manager = MultiTokenManager::new(
+            config,
+            vec![mk(1, 0), mk(2, 0), mk(3, 1)],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.update_balance_cache(1, 900.0);
+        manager.update_balance_cache(2, 0.0);
+        manager.update_balance_cache(3, 900.0);
+
+        // 用户已绑定在超额中的 #2，同优先级的 #1 仍有基础额度 → 改绑 #1
+        manager.affinity.set("user-a", 2);
+        let ctx = manager
+            .acquire_context_for_user(Some("user-a"), None)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 1);
+        assert_eq!(manager.affinity.get("user-a"), Some(1));
+
+        // #1 也进入超额：只剩低优先级 #3 有基础额度，不应为省钱而越级，保持绑定 #2
+        manager.update_balance_cache(1, 0.0);
+        manager.affinity.set("user-b", 2);
+        let ctx = manager
+            .acquire_context_for_user(Some("user-b"), None)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 2);
+    }
+
+    #[test]
+    fn test_current_utc_month_start() {
+        let now = DateTime::parse_from_rfc3339("2026-10-12T06:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            current_utc_month_start(now),
+            DateTime::parse_from_rfc3339("2026-10-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
+    }
+
+    #[tokio::test]
     async fn test_multi_token_manager_acquire_context_round_robin_when_balance_and_usage_equal() {
         let config = Config::default();
         let mut cred1 = KiroCredentials::default();
@@ -3802,6 +4069,71 @@ mod tests {
         // 再禁用第二个后，无可用凭据
         assert!(!manager.report_quota_exhausted(2));
         assert_eq!(manager.available_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_recover_exhausted_credentials_skips_non_quota_and_keeps_on_query_failure() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 手动禁用不属于额度类禁用：不应被检查/恢复
+        manager.set_disabled(1, true).unwrap();
+        assert_eq!(manager.recover_exhausted_credentials().await, 0);
+
+        // 额度类禁用：未到重置时间（下月 1 日）前不查询，保持禁用
+        manager.report_quota_exhausted(2);
+        let recover_at = manager
+            .entries
+            .lock()
+            .iter()
+            .find(|e| e.id == 2)
+            .and_then(|e| e.quota_recover_at)
+            .expect("额度禁用应记录恢复检查时间");
+        assert!(recover_at > Utc::now());
+        assert_eq!(manager.recover_exhausted_credentials().await, 0);
+        assert_eq!(manager.available_count(), 0);
+
+        // 到达重置时间后会复查；余额查询失败（无可用 token）时保持禁用
+        if let Some(e) = manager.entries.lock().iter_mut().find(|e| e.id == 2) {
+            e.quota_recover_at = Some(Utc::now() - Duration::seconds(1));
+        }
+        assert_eq!(manager.recover_exhausted_credentials().await, 0);
+        assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn test_quota_recover_at_prefers_future_upstream_reset_else_next_utc_month() {
+        let now = DateTime::parse_from_rfc3339("2026-10-12T06:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let nov1 = DateTime::parse_from_rfc3339("2026-11-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // 上游给出未来的 nextDateReset：直接使用
+        assert_eq!(quota_recover_at(Some(1793491200.0), now), nov1);
+        // 缺失 / 已过期 / 非法：退化为下个自然月 1 日 00:00 UTC
+        assert_eq!(quota_recover_at(None, now), nov1);
+        assert_eq!(quota_recover_at(Some(1_000_000.0), now), nov1);
+        assert_eq!(quota_recover_at(Some(f64::NAN), now), nov1);
+
+        // 跨年
+        let dec = DateTime::parse_from_rfc3339("2026-12-31T23:59:59Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            next_utc_month_start(dec),
+            DateTime::parse_from_rfc3339("2027-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
     }
 
     #[tokio::test]
