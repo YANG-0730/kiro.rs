@@ -265,7 +265,7 @@ impl KiroCredentials {
             .as_deref()
             .filter(|s| !s.trim().is_empty())
             .or(default_endpoint)
-            .unwrap_or("ide")
+            .unwrap_or("cli")
     }
 
     /// 从 JSON 字符串解析凭证

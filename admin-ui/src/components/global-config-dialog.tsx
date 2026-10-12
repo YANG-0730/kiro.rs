@@ -38,7 +38,7 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
   const [rateLimitCooldownSecs, setRateLimitCooldownSecs] = useState('')
   const [promptCacheTtlSeconds, setPromptCacheTtlSeconds] = useState('300')
   const [promptCacheAccountingEnabled, setPromptCacheAccountingEnabled] = useState(true)
-  const [defaultEndpoint, setDefaultEndpoint] = useState('ide')
+  const [defaultEndpoint, setDefaultEndpoint] = useState('cli')
 
   // 代理设置
   const [proxyUrl, setProxyUrl] = useState('')
@@ -72,7 +72,7 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
       setRateLimitCooldownSecs(globalConfig.rateLimitCooldownSecs?.toString() || '')
       setPromptCacheTtlSeconds(globalConfig.promptCacheTtlSeconds.toString())
       setPromptCacheAccountingEnabled(globalConfig.promptCacheAccountingEnabled)
-      setDefaultEndpoint(globalConfig.defaultEndpoint || 'ide')
+      setDefaultEndpoint(globalConfig.defaultEndpoint || 'cli')
       const c = globalConfig.compression
       setCEnabled(c.enabled)
       setCWhitespace(c.whitespaceCompression)
@@ -141,7 +141,7 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
       hasGlobalChanges = true
     }
 
-    if (defaultEndpoint !== (globalConfig?.defaultEndpoint || 'ide')) {
+    if (defaultEndpoint !== (globalConfig?.defaultEndpoint || 'cli')) {
       globalPayload.defaultEndpoint = defaultEndpoint
       hasGlobalChanges = true
     }

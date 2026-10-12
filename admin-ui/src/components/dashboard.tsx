@@ -622,7 +622,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <CardContent>
               <div className="text-xs space-y-0.5">
                 <div className="truncate">{globalConfig?.region || '-'} | RPM: {globalConfig?.credentialRpm ?? '默认'}</div>
-                <div className="truncate">Endpoint: {globalConfig?.defaultEndpoint || 'ide'} | 压缩: {globalConfig?.compression.enabled ? '开' : '关'}</div>
+                <div className="truncate">Endpoint: {globalConfig?.defaultEndpoint || 'cli'} | 压缩: {globalConfig?.compression.enabled ? '开' : '关'}</div>
                 <div className="truncate">代理: {proxyConfig?.proxyUrl || '无'}</div>
               </div>
             </CardContent>
