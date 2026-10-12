@@ -676,7 +676,7 @@ pub async fn handle_websearch_request(
                 (Some(cache_tracker), Some(cache_profile)) => {
                     let resolved_cache_context =
                         resolve_cache_usage(cache_tracker, api_result.credential_id, cache_profile);
-                    tracing::info!(
+                    tracing::debug!(
                         credential_id = api_result.credential_id,
                         final_cache_creation_input_tokens =
                             resolved_cache_context.cache_creation_input_tokens,

@@ -358,7 +358,7 @@ pub fn convert_request(
         .map(|m| m.role != "user")
         .unwrap_or(false)
     {
-        tracing::info!("检测到末尾 assistant 消息（prefill），静默丢弃，回退到最后一条 user 消息");
+        tracing::debug!("检测到末尾 assistant 消息（prefill），静默丢弃，回退到最后一条 user 消息");
         let last_user_idx = req
             .messages
             .iter()
@@ -504,7 +504,7 @@ pub fn convert_request(
                 "检测到重复工具名称（大小写不敏感）"
             );
         }
-        tracing::info!(
+        tracing::debug!(
             tool_count = tools.len(),
             placeholder_count = placeholder_count,
             "工具定义统计"
@@ -1361,7 +1361,7 @@ fn build_history(
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             history_len = history.len(),
             user_messages = user_count,
             assistant_messages = assistant_count,

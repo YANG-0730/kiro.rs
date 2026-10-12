@@ -1245,6 +1245,9 @@ impl StreamContext {
             upstream_input_tokens = ?self.context_input_tokens,
             final_input_tokens,
             billed_input_tokens,
+            cache_read_input_tokens = ?final_cache_usage.map(|c| c.cache_read_input_tokens),
+            cache_creation_input_tokens =
+                ?final_cache_usage.map(|c| c.cache_creation_input_tokens),
             output_tokens = self.output_tokens,
             stream = true,
             "请求完成 credit 消耗"

@@ -843,7 +843,7 @@ pub async fn post_messages(
         .map(|profile| provisional_cache_usage(prompt_cache.tracker.as_ref(), profile))
         .unwrap_or_default();
 
-    tracing::info!(
+    tracing::debug!(
         provisional_cache_creation_input_tokens =
             provisional_cache_context.cache_creation_input_tokens,
         provisional_cache_read_input_tokens = provisional_cache_context.cache_read_input_tokens,
@@ -1054,7 +1054,7 @@ async fn handle_stream_request(
     let final_cache_context = match (context.cache_tracker, context.cache_profile) {
         (Some(tracker), Some(profile)) => {
             let resolved = resolved_cache_usage(tracker, api_result.credential_id, profile);
-            tracing::info!(
+            tracing::debug!(
                 credential_id = api_result.credential_id,
                 final_cache_creation_input_tokens = resolved.cache_creation_input_tokens,
                 final_cache_read_input_tokens = resolved.cache_read_input_tokens,
@@ -1221,7 +1221,7 @@ async fn handle_non_stream_request(
     let final_cache_context = match (context.cache_tracker, context.cache_profile) {
         (Some(tracker), Some(profile)) => {
             let resolved = resolved_cache_usage(tracker, api_result.credential_id, profile);
-            tracing::info!(
+            tracing::debug!(
                 credential_id = api_result.credential_id,
                 final_cache_creation_input_tokens = resolved.cache_creation_input_tokens,
                 final_cache_read_input_tokens = resolved.cache_read_input_tokens,
@@ -1472,6 +1472,8 @@ async fn handle_non_stream_request(
         upstream_input_tokens = ?context_input_tokens,
         final_input_tokens,
         billed_input_tokens,
+        cache_read_input_tokens = ?final_cache_context.map(|c| c.cache_read_input_tokens),
+        cache_creation_input_tokens = ?final_cache_context.map(|c| c.cache_creation_input_tokens),
         output_tokens,
         stream = false,
         "请求完成 credit 消耗"
