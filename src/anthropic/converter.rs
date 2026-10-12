@@ -447,11 +447,16 @@ pub fn convert_request(
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     // history 使用 currentMessage 消耗后的剩余图片配额
+    // 模型 schema 声明了 thinking 字段时，思考由结构化字段控制
+    let structured_thinking = model_registry
+        .and_then(|r| r.additional_fields_schema_for(&req.model))
+        .is_some_and(|schema| schema_has_property(&schema, "thinking"));
     let mut history = build_history(
         req,
         messages,
         BuildHistoryContext {
             model_id: &model_id,
+            structured_thinking,
             compression_config,
             total_image_count,
             remaining_image_budget: &mut remaining_image_budget,
@@ -678,7 +683,7 @@ fn process_message_content(
                                     }
                                     result_content.push_str(&match &doc {
                                         DocumentPayload::Base64 { .. } => {
-                                            "[Document returned by this tool is attached to the message]".to_string()
+                                            "[Document returned by this tool: see the document attachment or the note in this message]".to_string()
                                         }
                                         other => document_placeholder_text(other, ""),
                                     });
@@ -874,6 +879,9 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
 /// 单请求文档上限（Kiro 实测：5 个通过，6 个返回 "Input is too long"）
 const MAX_DOCUMENTS: usize = 5;
 
+/// 文档名长度上限（Kiro 实测：200 通过，201 返回 INVALID_DOCUMENT_NAME）
+const MAX_DOCUMENT_NAME_CHARS: usize = 200;
+
 /// 从 Anthropic `document` 块中解析出的文档
 #[derive(Debug, Clone)]
 pub(crate) enum DocumentPayload {
@@ -907,10 +915,16 @@ fn parse_document_block(item: &serde_json::Value) -> DocumentPayload {
                 .and_then(|s| s.get("media_type"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("application/pdf");
-            DocumentPayload::Base64 {
-                format: document_format_from_media_type(media_type),
-                title,
-                data: data.to_string(),
+            match document_format_from_media_type(media_type) {
+                Some(format) => DocumentPayload::Base64 {
+                    format: format.to_string(),
+                    title,
+                    data: data.to_string(),
+                },
+                None => DocumentPayload::Unsupported {
+                    title,
+                    kind: format!("base64 {}", media_type),
+                },
             }
         }
         ("text", Some(text)) => DocumentPayload::Text {
@@ -924,17 +938,20 @@ fn parse_document_block(item: &serde_json::Value) -> DocumentPayload {
     }
 }
 
-/// media_type → Kiro 文档 format
-fn document_format_from_media_type(media_type: &str) -> String {
-    match media_type {
+/// media_type → Kiro 文档 format；未知类型返回 None（上游对未知 format 返回 400）
+fn document_format_from_media_type(media_type: &str) -> Option<&'static str> {
+    Some(match media_type {
         "application/pdf" => "pdf",
         "text/plain" => "txt",
         "text/markdown" => "md",
         "text/csv" => "csv",
         "text/html" => "html",
-        other => other.rsplit('/').next().unwrap_or("pdf"),
-    }
-    .to_string()
+        "application/msword" => "doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+        "application/vnd.ms-excel" => "xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+        _ => return None,
+    })
 }
 
 /// 把标题清洗成 Kiro 允许的文档名（字母数字、空白、`-_()[]`，1-200 字符，无连续空白）
@@ -942,13 +959,15 @@ fn sanitize_document_name(raw: &str) -> String {
     let mut out = String::new();
     let mut last_space = false;
     for ch in raw.chars() {
-        let mapped = if ch.is_alphanumeric() || matches!(ch, '-' | '_' | '(' | ')' | '[' | ']') {
-            Some(ch)
-        } else if ch.is_whitespace() || ch == '.' || ch == '/' {
-            Some(' ')
-        } else {
-            None
-        };
+        // 上游只接受 ASCII 字母数字（实测中文、é 等 Unicode 字母返回 400 INVALID_DOCUMENT_NAME）
+        let mapped =
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '(' | ')' | '[' | ']') {
+                Some(ch)
+            } else if ch.is_whitespace() || ch == '.' || ch == '/' {
+                Some(' ')
+            } else {
+                None
+            };
         match mapped {
             Some(' ') if last_space || out.is_empty() => {}
             Some(' ') => {
@@ -961,7 +980,7 @@ fn sanitize_document_name(raw: &str) -> String {
             }
             None => {}
         }
-        if out.chars().count() >= 200 {
+        if out.chars().count() >= MAX_DOCUMENT_NAME_CHARS {
             break;
         }
     }
@@ -1031,7 +1050,11 @@ fn attach_current_documents(
                 let mut name = base.clone();
                 let mut n = 2;
                 while !used_names.insert(name.to_lowercase()) {
-                    name = format!("{} ({})", base, n);
+                    // 加后缀前先截短，保证总长不超过上游 200 字符上限
+                    let suffix = format!(" ({})", n);
+                    let keep = MAX_DOCUMENT_NAME_CHARS - suffix.chars().count();
+                    let head: String = base.chars().take(keep).collect();
+                    name = format!("{}{}", head.trim_end(), suffix);
                     n += 1;
                 }
                 out.push(KiroDocument {
@@ -1398,6 +1421,13 @@ fn build_additional_model_request_fields(
             Some("disabled") if schema_enum_allows(thinking_schema, "type", "disabled") => {
                 Some("disabled")
             }
+            Some("disabled") => {
+                tracing::warn!(
+                    model = %req.model,
+                    "客户端要求关闭 thinking，但该模型不支持 disabled，交由上游默认（可能仍会思考）"
+                );
+                None
+            }
             _ => None,
         };
         if let Some(type_value) = thinking_type_value {
@@ -1471,6 +1501,9 @@ fn has_write_or_edit_tool(req: &MessagesRequest) -> bool {
 
 struct BuildHistoryContext<'a> {
     model_id: &'a str,
+    /// 模型是否通过结构化字段（additionalModelRequestFields.thinking）控制思考；
+    /// 是则不再注入 `<thinking_mode>` 系统提示标签，避免重复
+    structured_thinking: bool,
     compression_config: &'a CompressionConfig,
     total_image_count: usize,
     remaining_image_budget: &'a mut usize,
@@ -1486,6 +1519,7 @@ fn build_history(
 ) -> Result<Vec<Message>, ConversionError> {
     let BuildHistoryContext {
         model_id,
+        structured_thinking,
         compression_config,
         total_image_count,
         remaining_image_budget,
@@ -1493,13 +1527,15 @@ fn build_history(
     } = ctx;
     let mut history = Vec::new();
 
-    // 生成thinking前缀（如果需要）
-    //
-    // 注意：不要因为新模型有结构化 thinking 字段（additionalModelRequestFields）就去掉这段
-    // 系统提示标签。2026-10-12 实测 claude-opus-5.5（effort low/max 各两次）：只发结构化字段
-    // 时 reasoningContentEvent 为 0，带上标签后为 25~34 —— 上游真正触发思考靠的是标签，
-    // 结构化字段只影响 effort/display。两者并存不是重复注入。
-    let thinking_prefix = generate_thinking_prefix(req);
+    // 生成 thinking 前缀：仅用于没有结构化 thinking 字段的老模型（如 sonnet-4.5）。
+    // 新模型已通过 additionalModelRequestFields.thinking 控制，再注入标签属于重复，
+    // 还会多占系统提示、影响缓存前缀。2026-10-12 实测（较难题目、各 3 次）：
+    // opus-5.5 / sonnet-5.5 只发结构化字段时 reasoningContentEvent 55~75，与只发标签相当。
+    let thinking_prefix = if structured_thinking {
+        None
+    } else {
+        generate_thinking_prefix(req)
+    };
 
     // 仅在开启分块写入策略且请求包含 Write/Edit 工具时注入
     let should_inject_chunked_policy =
@@ -2148,6 +2184,55 @@ mod tests {
             "output_config": {"type": "object"}}});
         let req = req_with_thinking(Some("disabled"), None);
         assert!(build_additional_model_request_fields(&req, Some(&schema)).is_none());
+    }
+
+    #[test]
+    fn test_thinking_tag_only_for_models_without_structured_thinking() {
+        use crate::kiro::model::available_models::AvailableModelEntry;
+        let entry = |id: &str, schema: Option<serde_json::Value>| AvailableModelEntry {
+            model_id: id.to_string(),
+            model_name: None,
+            description: None,
+            rate_multiplier: None,
+            rate_unit: None,
+            token_limits: None,
+            supported_input_types: None,
+            prompt_caching: None,
+            model_provider: None,
+            status: None,
+            available_origins: None,
+            additional_model_request_fields_schema: schema,
+        };
+        let reg = crate::kiro::model_registry::ModelRegistry::new();
+        reg.update_credential(
+            1,
+            vec![
+                entry("claude-opus-5.5", Some(claude_schema())),
+                entry("claude-sonnet-4.5", None),
+            ],
+        );
+        let first_history_text = |model: &str| {
+            let mut req = req_with_thinking(Some("adaptive"), Some("high"));
+            req.model = model.to_string();
+            req.system = Some(vec![super::super::types::SystemMessage {
+                block_type: None,
+                text: "You are Claude Code.".to_string(),
+                cache_control: None,
+            }]);
+            req.messages = vec![super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("hi"),
+            }];
+            let r = convert_request(&req, &CompressionConfig::default(), Some(&reg)).unwrap();
+            match &r.conversation_state.history[0] {
+                Message::User(u) => u.user_input_message.content.clone(),
+                _ => panic!("history[0] 应为系统消息"),
+            }
+        };
+        // 新模型：思考由结构化字段控制，系统提示里不再重复注入标签
+        assert!(!first_history_text("claude-opus-5-5").contains("<thinking_mode>"));
+        // 老模型（无 schema）：仍需靠标签触发思考
+        assert!(first_history_text("claude-sonnet-4-5").contains("<thinking_mode>adaptive"));
     }
 
     #[test]
@@ -3083,7 +3168,7 @@ mod tests {
         assert_eq!(u.documents.len(), 1, "Read 返回的 PDF 应附加到当前消息");
         let tr = serde_json::to_string(&u.user_input_message_context.tool_results).unwrap();
         assert!(
-            tr.contains("attached to the message"),
+            tr.contains("Document returned by this tool"),
             "tool_result 应留指引而非空: {tr}"
         );
     }
@@ -3154,10 +3239,63 @@ mod tests {
     }
 
     #[test]
+    fn test_document_name_edge_cases_stay_within_upstream_rules() {
+        use super::super::types::Message as AnthropicMessage;
+        let long = "x".repeat(300);
+        let pdf = |t: &str| {
+            serde_json::json!({"type": "document", "title": t,
+            "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0x"}})
+        };
+        let docx = serde_json::json!({"type": "document", "title": "a",
+            "source": {"type": "base64", "media_type":
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "data": "UEsDBA=="}});
+        let unknown = serde_json::json!({"type": "document", "title": "b",
+            "source": {"type": "base64", "media_type": "application/x-unknown", "data": "AAAA"}});
+        let req = doc_req(vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!([pdf(&long), pdf(&long), pdf("报告"), docx, unknown,
+                {"type": "text", "text": "go"}]),
+        }]);
+        let r = convert_request(&req, &CompressionConfig::default(), None).unwrap();
+        let u = &r.conversation_state.current_message.user_input_message;
+        for d in &u.documents {
+            let n = d.name.chars().count();
+            assert!(
+                (1..=MAX_DOCUMENT_NAME_CHARS).contains(&n),
+                "名称长度越界: {n} {:?}",
+                d.name
+            );
+            assert!(d.name.is_ascii(), "名称必须为 ASCII: {:?}", d.name);
+            assert!(
+                !d.name.contains("  ") && d.name.trim() == d.name,
+                "空白不合法: {:?}",
+                d.name
+            );
+        }
+        assert_eq!(
+            u.documents[1].name.chars().count(),
+            MAX_DOCUMENT_NAME_CHARS,
+            "去重后缀不应超长"
+        );
+        assert!(u.documents[1].name.ends_with(" (2)"));
+        assert_eq!(u.documents[2].name, "document 3", "纯中文标题回退为默认名");
+        assert_eq!(u.documents[3].format, "docx");
+        assert_eq!(u.documents.len(), 4, "未知 media_type 不附加");
+        assert!(
+            u.content.contains("application/x-unknown"),
+            "未知类型应留占位说明: {}",
+            u.content
+        );
+    }
+
+    #[test]
     fn test_sanitize_document_name() {
         assert_eq!(sanitize_document_name("a/b.c  d!!e"), "a b c de");
         assert_eq!(sanitize_document_name("  ..  "), "");
-        assert_eq!(sanitize_document_name("报告(1)[v2]_x-y"), "报告(1)[v2]_x-y");
+        // 非 ASCII 字母被丢弃（上游实测拒绝中文/重音字母），合法 ASCII 符号保留
+        assert_eq!(sanitize_document_name("报告(1)[v2]_x-y"), "(1)[v2]_x-y");
+        assert_eq!(sanitize_document_name("résumé"), "rsum");
+        assert_eq!(sanitize_document_name("报告"), "");
         assert_eq!(
             sanitize_document_name(&"x".repeat(300)).chars().count(),
             200

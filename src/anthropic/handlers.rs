@@ -244,9 +244,12 @@ fn total_image_bytes(kiro_request: &KiroRequest) -> usize {
     let state = &kiro_request.conversation_state;
     let mut total = 0usize;
 
-    // currentMessage 中的图片
+    // currentMessage 中的图片与文档（文档 base64 同样计入"二进制载荷"，便于 413 归因）
     for img in &state.current_message.user_input_message.images {
         total += img.source.bytes.len();
+    }
+    for doc in &state.current_message.user_input_message.documents {
+        total += doc.source.bytes.len();
     }
 
     // 历史消息中的图片
@@ -951,6 +954,33 @@ pub async fn post_messages(
 
     // 请求体大小预检（上游存在硬性请求体大小限制；按实际序列化后的总字节数判断）
     let max_body = compression_config.max_request_body_bytes;
+    // 文档（PDF 等）本身已超过上限时，压缩历史/截断提问都无济于事，直接 413 并说明原因
+    let document_bytes: usize = kiro_request
+        .conversation_state
+        .current_message
+        .user_input_message
+        .documents
+        .iter()
+        .map(|d| d.source.bytes.len())
+        .sum();
+    if max_body > 0 && document_bytes > max_body {
+        tracing::warn!(
+            document_bytes,
+            threshold = max_body,
+            "附加文档超过请求体上限，拒绝发送"
+        );
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ErrorResponse::new(
+                "request_too_large",
+                format!(
+                    "Attached documents are too large ({} bytes base64; limit {}). Split or shrink the document.",
+                    document_bytes, max_body
+                ),
+            )),
+        )
+            .into_response();
+    }
     if max_body > 0 && request_body.len() > max_body && compression_config.enabled {
         // 自适应二次压缩：按 request_body_bytes 迭代截断，尽量把请求缩到阈值内
         match adaptive_shrink_request_body(
