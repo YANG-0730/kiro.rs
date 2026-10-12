@@ -84,7 +84,56 @@ fn build_cache_profile(
     payload: &MessagesRequest,
     total_input_tokens: i32,
 ) -> crate::anthropic::cache_tracker::CacheProfile {
+    log_cache_control_positions(payload);
     cache_tracker.build_profile(payload, total_input_tokens)
+}
+
+/// 诊断：记录客户端 `cache_control` 断点的位置（只记位置，不记内容）
+///
+/// 用于核实客户端（如 Claude Code）是否总把断点打在最后一条消息上，
+/// 从而判断本地 `input_tokens`（断点之后的未缓存尾部）是否应接近 0。
+fn log_cache_control_positions(payload: &MessagesRequest) {
+    let has_cc = |v: &serde_json::Value| v.get("cache_control").is_some();
+    let tool_bps: Vec<usize> = payload
+        .tools
+        .iter()
+        .flatten()
+        .enumerate()
+        .filter(|(_, t)| t.cache_control.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    let system_bps: Vec<usize> = payload
+        .system
+        .iter()
+        .flatten()
+        .enumerate()
+        .filter(|(_, s)| s.cache_control.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    // (消息下标, 块下标, 该消息块数)
+    let mut message_bps: Vec<(usize, usize, usize)> = Vec::new();
+    for (mi, m) in payload.messages.iter().enumerate() {
+        if let serde_json::Value::Array(blocks) = &m.content {
+            for (bi, b) in blocks.iter().enumerate() {
+                if has_cc(b) {
+                    message_bps.push((mi, bi, blocks.len()));
+                }
+            }
+        }
+    }
+    let last_msg = payload.messages.len().saturating_sub(1);
+    let last_bp_on_last_message = message_bps
+        .last()
+        .is_some_and(|(mi, bi, n)| *mi == last_msg && *bi + 1 == *n);
+    tracing::info!(
+        model = %payload.model,
+        message_count = payload.messages.len(),
+        tool_breakpoints = ?tool_bps,
+        system_breakpoints = ?system_bps,
+        message_breakpoints = ?message_bps,
+        last_bp_on_last_message,
+        "cache_control 断点位置（诊断）"
+    );
 }
 
 fn compute_cache_usage(
