@@ -15,6 +15,7 @@
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use image::AnimationDecoder;
 use image::codecs::gif::GifDecoder;
+use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, ImageFormat, ImageReader};
 use std::io::{BufReader, Cursor};
 use std::time::Duration;
@@ -25,6 +26,8 @@ const GIF_MAX_OUTPUT_FRAMES: usize = 20;
 const GIF_MAX_FPS: usize = 5;
 const GIF_MIN_FRAME_DELAY: Duration = Duration::from_millis(10);
 const GIF_FRAME_OUTPUT_FORMAT: &str = "jpeg";
+/// JPEG 重编码质量（显式指定，避免依赖库默认值导致体积不可控）
+const JPEG_REENCODE_QUALITY: u8 = 85;
 
 #[derive(Debug)]
 pub struct GifSamplingResult {
@@ -352,21 +355,35 @@ pub fn process_image(
         };
         let size = (processed.width(), processed.height());
         let (data, bytes_len) = encode_image(&processed, format)?;
-        let was_reencoded = (force_reencode_gif || force_reencode_large) && !needs_resize;
 
-        if force_reencode_large && !needs_resize {
+        // 只为降低体积而重编码（未缩放、非 GIF）时，若结果不比原图小（原图已高度压缩），
+        // 保留原图：避免体积反增，也避免 JPEG 二次压缩带来的画质损失
+        if force_reencode_large
+            && !needs_resize
+            && !force_reencode_gif
+            && bytes_len >= original_bytes_len
+        {
             tracing::info!(
                 original_bytes = original_bytes_len,
-                final_bytes = bytes_len,
-                compression_ratio = format!(
-                    "{:.1}%",
-                    (1.0 - bytes_len as f64 / original_bytes_len as f64) * 100.0
-                ),
-                "大文件重新编码完成"
+                reencoded_bytes = bytes_len,
+                "重编码未能减小体积，保留原图"
             );
+            (base64_data.to_string(), size, original_bytes_len, false)
+        } else {
+            let was_reencoded = (force_reencode_gif || force_reencode_large) && !needs_resize;
+            if force_reencode_large && !needs_resize {
+                tracing::info!(
+                    original_bytes = original_bytes_len,
+                    final_bytes = bytes_len,
+                    compression_ratio = format!(
+                        "{:.1}%",
+                        (1.0 - bytes_len as f64 / original_bytes_len as f64) * 100.0
+                    ),
+                    "大文件重新编码完成"
+                );
+            }
+            (data, size, bytes_len, was_reencoded)
         }
-
-        (data, size, bytes_len, was_reencoded)
     } else {
         (
             base64_data.to_string(),
@@ -435,8 +452,15 @@ fn encode_image(img: &DynamicImage, format: &str) -> Result<(String, usize), Str
         _ => return Err(format!("不支持的图片格式: {}", format)),
     };
 
-    img.write_to(&mut buffer, image_format)
-        .map_err(|e| format!("图片编码失败: {}", e))?;
+    if image_format == ImageFormat::Jpeg {
+        let encoder = JpegEncoder::new_with_quality(&mut buffer, JPEG_REENCODE_QUALITY);
+        img.to_rgb8()
+            .write_with_encoder(encoder)
+            .map_err(|e| format!("图片编码失败: {}", e))?;
+    } else {
+        img.write_to(&mut buffer, image_format)
+            .map_err(|e| format!("图片编码失败: {}", e))?;
+    }
 
     let encoded = buffer.into_inner();
     let bytes_len = encoded.len();
@@ -490,6 +514,60 @@ mod tests {
                 "{fmt:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_large_jpeg_reencode_never_grows_and_shrinks_bloated_ones() {
+        // 平滑渐变图：高质量 JPEG 体积大（可被压缩），低质量 JPEG 已很小（重编码只会变大）
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(1600, 1200, |x, y| {
+            image::Rgb([(x / 7) as u8, (y / 5) as u8, ((x + y) / 11) as u8])
+        }));
+        let encode = |q: u8| {
+            let mut buf = Cursor::new(Vec::new());
+            img.to_rgb8()
+                .write_with_encoder(JpegEncoder::new_with_quality(&mut buf, q))
+                .unwrap();
+            buf.into_inner()
+        };
+        let cfg = CompressionConfig::default();
+
+        // 1) 质量 100 的"臃肿"大图（>200KB）→ 重编码后应变小
+        let bloated = encode(100);
+        assert!(
+            bloated.len() > 200_000,
+            "测试图应超过阈值: {}",
+            bloated.len()
+        );
+        let r = process_image(&BASE64.encode(&bloated), "jpeg", &cfg, 1).unwrap();
+        assert!(r.was_reencoded);
+        assert!(
+            r.final_bytes_len < bloated.len(),
+            "应变小: {} -> {}",
+            bloated.len(),
+            r.final_bytes_len
+        );
+
+        // 2) 已高度压缩的图（质量 40）补齐到阈值以上触发重编码路径（JPEG EOI 之后追加的
+        //    字节会被解码器忽略）；按质量 85 重编码必然比"真实内容"大、但这里原图被
+        //    填充到 >200KB，重编码结果远小于它 —— 所以改用"不填充、直接构造 >200KB 的低质量图"
+        let big = DynamicImage::ImageRgb8(image::RgbImage::from_fn(1900, 1400, |x, y| {
+            let n = (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)) as u8;
+            image::Rgb([n, n.rotate_left(3), n.rotate_left(5)])
+        }));
+        let mut buf = Cursor::new(Vec::new());
+        big.to_rgb8()
+            .write_with_encoder(JpegEncoder::new_with_quality(&mut buf, 40))
+            .unwrap();
+        let tight = buf.into_inner();
+        assert!(tight.len() > 200_000, "测试图应超过阈值: {}", tight.len());
+        let b64 = BASE64.encode(&tight);
+        let r = process_image(&b64, "jpeg", &cfg, 1).unwrap();
+        assert!(r.final_bytes_len <= tight.len(), "重编码结果绝不应比原图大");
+        assert_eq!(
+            r.data, b64,
+            "质量 40 的原图按 85 重编码只会更大，应保留原图"
+        );
+        assert!(!r.was_reencoded);
     }
 
     #[test]
