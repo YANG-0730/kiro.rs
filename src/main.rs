@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
-use kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint};
+use kiro::endpoint::{Cli3Endpoint, CliEndpoint, IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -82,6 +82,8 @@ async fn main() {
         endpoints.insert(ide.name().to_string(), ide);
         let cli: Arc<dyn KiroEndpoint> = Arc::new(CliEndpoint::new());
         endpoints.insert(cli.name().to_string(), cli);
+        let cli3: Arc<dyn KiroEndpoint> = Arc::new(Cli3Endpoint::new());
+        endpoints.insert(cli3.name().to_string(), cli3);
     }
     let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
 
@@ -165,6 +167,7 @@ async fn main() {
     if init_count == 0 && token_manager.total_count() > 0 {
         tracing::warn!("所有凭据余额初始化失败，将按优先级选择凭据");
     }
+    token_manager.prefetch_profile_arns().await;
 
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),

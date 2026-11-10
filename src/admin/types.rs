@@ -139,6 +139,9 @@ pub struct AddCredentialRequest {
     /// 未配置时回退到 config.json 的 machineId
     pub machine_id: Option<String>,
 
+    /// Profile ARN（可选；cli 端点需要，留空时首次使用自动经 ListAvailableProfiles 获取）
+    pub profile_arn: Option<String>,
+
     /// 凭据级 endpoint（未配置时回退到 config.defaultEndpoint；当前已注册端点由服务端校验）
     pub endpoint: Option<String>,
 
@@ -277,6 +280,7 @@ pub struct TokenJsonItem {
     pub region: Option<String>,
     pub api_region: Option<String>,
     pub machine_id: Option<String>,
+    pub profile_arn: Option<String>,
 }
 
 /// 批量导入请求

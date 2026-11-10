@@ -17,7 +17,7 @@ use tokio::time::sleep;
 use crate::common::utf8::floor_char_boundary;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{
-    CliEndpoint, IDE_ENDPOINT_NAME, IdeEndpoint, KiroEndpoint, RequestContext,
+    Cli3Endpoint, CliEndpoint, IDE_ENDPOINT_NAME, IdeEndpoint, KiroEndpoint, RequestContext,
 };
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -79,6 +79,8 @@ impl KiroProvider {
         endpoints.insert(ide.name().to_string(), ide);
         let cli: Arc<dyn KiroEndpoint> = Arc::new(CliEndpoint::new());
         endpoints.insert(cli.name().to_string(), cli);
+        let cli3: Arc<dyn KiroEndpoint> = Arc::new(Cli3Endpoint::new());
+        endpoints.insert(cli3.name().to_string(), cli3);
         endpoints
     }
 
@@ -1358,6 +1360,69 @@ mod tests {
             built.headers().get("x-amzn-kiro-profile-arn").unwrap(),
             "arn:own"
         );
+    }
+
+    #[test]
+    fn test_cli3_endpoint_uses_kiro_runtime_service() {
+        let config = Config::default();
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_method = Some("idc".to_string());
+        credentials.profile_arn = Some("arn:own".to_string());
+        let endpoint = Cli3Endpoint::new();
+        let machine_id = "a".repeat(64);
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "test_token",
+            machine_id: &machine_id,
+            config: &config,
+        };
+        assert_eq!(
+            endpoint.api_url(&ctx),
+            "https://runtime.us-east-1.kiro.dev/"
+        );
+
+        // provider 先设 application/json，端点必须覆盖为唯一的 awsJson
+        let built = endpoint
+            .decorate_api(
+                reqwest::Client::new()
+                    .post("https://example.com")
+                    .header("content-type", "application/json"),
+                &ctx,
+            )
+            .build()
+            .unwrap();
+        let content_types: Vec<_> = built.headers().get_all(CONTENT_TYPE).iter().collect();
+        assert_eq!(content_types, vec!["application/x-amz-json-1.0"]);
+        assert_eq!(
+            built.headers().get("x-amz-target").unwrap(),
+            "KiroRuntimeService.GenerateAssistantResponse"
+        );
+        assert_eq!(built.headers().get("tokentype").unwrap(), "SSO_OIDC");
+        assert!(
+            built
+                .headers()
+                .get("user-agent")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with("KiroCLI/3.1.0 KAS/0.66.91 os/linux md/appVersion-3.1.0")
+        );
+
+        let mcp = endpoint
+            .decorate_mcp(reqwest::Client::new().post("https://example.com"), &ctx)
+            .build()
+            .unwrap();
+        assert_eq!(
+            mcp.headers().get("x-amz-target").unwrap(),
+            "KiroRuntimeService.InvokeMCP"
+        );
+        let body: serde_json::Value = serde_json::from_str(
+            &endpoint
+                .transform_mcp_body(r#"{"jsonrpc":"2.0","method":"tools/call"}"#, &ctx)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["profileArn"], "arn:own");
     }
 
     #[test]

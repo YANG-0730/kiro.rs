@@ -31,7 +31,8 @@ use crate::kiro::background_refresh::{
 };
 use crate::kiro::cooldown::{CooldownManager, CooldownReason};
 use crate::kiro::endpoint::{
-    CLI_ENDPOINT_NAME, CliEndpoint, IDE_ENDPOINT_NAME, IdeEndpoint, KiroEndpoint, RequestContext,
+    CLI_ENDPOINT_NAME, CLI3_ENDPOINT_NAME, Cli3Endpoint, CliEndpoint, IDE_ENDPOINT_NAME,
+    IdeEndpoint, KiroEndpoint, RequestContext,
 };
 use crate::kiro::fingerprint::Fingerprint;
 use crate::kiro::machine_id;
@@ -441,8 +442,14 @@ fn endpoint_for_credentials(
     match credentials.effective_endpoint_name(Some(&config.default_endpoint)) {
         IDE_ENDPOINT_NAME => Ok(Box::new(IdeEndpoint::new())),
         CLI_ENDPOINT_NAME => Ok(Box::new(CliEndpoint::new())),
+        CLI3_ENDPOINT_NAME => Ok(Box::new(Cli3Endpoint::new())),
         name => bail!("未知 endpoint: {}", name),
     }
+}
+
+/// cli / cli3 端点的对话接口要求请求体带 profileArn
+fn endpoint_requires_profile_arn(endpoint_name: &str) -> bool {
+    matches!(endpoint_name, CLI_ENDPOINT_NAME | CLI3_ENDPOINT_NAME)
 }
 
 /// 获取使用额度信息
@@ -2149,7 +2156,9 @@ impl MultiTokenManager {
         config: &Config,
     ) -> KiroCredentials {
         if creds.profile_arn.is_some()
-            || creds.effective_endpoint_name(Some(&config.default_endpoint)) != CLI_ENDPOINT_NAME
+            || !endpoint_requires_profile_arn(
+                creds.effective_endpoint_name(Some(&config.default_endpoint)),
+            )
         {
             return creds;
         }
@@ -2645,6 +2654,39 @@ impl MultiTokenManager {
         );
 
         success_count
+    }
+
+    /// 启动时为缺 profileArn 的 cli 凭据预取（放在余额初始化之后，此时 token 已刷新）。
+    ///
+    /// 免得每个凭据的首个请求多一次 ListAvailableProfiles；失败只记 warn，首个请求时再补。
+    pub async fn prefetch_profile_arns(&self) {
+        let config = self.config.read().clone();
+        let pending: Vec<(u64, KiroCredentials)> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .filter(|e| {
+                    !e.disabled
+                        && e.credentials.profile_arn.is_none()
+                        && endpoint_requires_profile_arn(
+                            e.credentials
+                                .effective_endpoint_name(Some(&config.default_endpoint)),
+                        )
+                })
+                .map(|e| (e.id, e.credentials.clone()))
+                .collect()
+        };
+
+        for (id, creds) in pending {
+            let token = if creds.is_api_key_credential() {
+                creds.kiro_api_key.clone()
+            } else {
+                creds.access_token.clone()
+            };
+            if let Some(token) = token {
+                self.ensure_profile_arn(id, creds, &token, &config).await;
+            }
+        }
     }
 
     /// 自动恢复因额度耗尽被禁用的凭据（月度额度重置后自动重新启用）

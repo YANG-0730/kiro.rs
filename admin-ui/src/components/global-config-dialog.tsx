@@ -290,6 +290,7 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
                 >
                   <option value="ide">ide</option>
                   <option value="cli">cli</option>
+                  <option value="cli3">cli3（CLI 3.x / KAS）</option>
                 </select>
                 <p className="text-xs text-muted-foreground">凭据未显式指定 endpoint 时使用此默认值</p>
               </div>

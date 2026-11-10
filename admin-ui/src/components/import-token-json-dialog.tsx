@@ -100,6 +100,7 @@ export function ImportTokenJsonDialog({ open, onOpenChange }: ImportTokenJsonDia
           region: typeof obj.region === 'string' ? obj.region : undefined,
           authMethod: typeof obj.authMethod === 'string' ? obj.authMethod : undefined,
           startUrl: typeof obj.startUrl === 'string' ? obj.startUrl : undefined,
+          profileArn: typeof obj.profileArn === 'string' ? obj.profileArn : undefined,
         },
       }
     }
@@ -123,6 +124,7 @@ export function ImportTokenJsonDialog({ open, onOpenChange }: ImportTokenJsonDia
       authMethod: (!authMethod && cred.clientId && cred.clientSecret) ? 'idc' : authMethod,
       region: cred.region as string | undefined,
       machineId: account.machineId as string | undefined,
+      profileArn: (cred.profileArn ?? account.profileArn) as string | undefined,
     }
   }, [])
 

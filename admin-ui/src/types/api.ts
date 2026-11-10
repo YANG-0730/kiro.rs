@@ -146,6 +146,8 @@ export interface AddCredentialRequest {
   /** 单独覆盖 API 请求使用的 region */
   apiRegion?: string
   machineId?: string
+  /** 留空时首次使用自动获取 */
+  profileArn?: string
   endpoint?: string
   proxyUrl?: string
   proxyUsername?: string
@@ -293,6 +295,7 @@ export interface TokenJsonItem {
   priority?: number
   region?: string
   machineId?: string
+  profileArn?: string
 }
 
 // 批量导入请求

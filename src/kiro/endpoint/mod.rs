@@ -9,9 +9,11 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
 pub mod cli;
+pub mod cli3;
 pub mod ide;
 
 pub use cli::{CLI_ENDPOINT_NAME, CliEndpoint};
+pub use cli3::{CLI3_ENDPOINT_NAME, Cli3Endpoint};
 pub use ide::{IDE_ENDPOINT_NAME, IdeEndpoint};
 
 pub struct UsageRequestParts {

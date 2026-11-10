@@ -442,6 +442,7 @@ export function CredentialCard({
                     <option value="">默认值</option>
                     <option value="ide">ide</option>
                     <option value="cli">cli</option>
+                    <option value="cli3">cli3（CLI 3.x / KAS）</option>
                   </select>
                   <Button
                     size="sm"

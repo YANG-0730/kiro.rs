@@ -368,7 +368,7 @@ impl AdminService {
             access_token: None,
             refresh_token: req.refresh_token,
             kiro_api_key: req.kiro_api_key,
-            profile_arn: None,
+            profile_arn: non_empty_trimmed(req.profile_arn),
             expires_at: None,
             auth_method: Some(effective_auth_method),
             client_id: req.client_id,
@@ -692,7 +692,7 @@ impl AdminService {
             access_token: None,
             refresh_token: Some(refresh_token),
             kiro_api_key: None,
-            profile_arn: None,
+            profile_arn: non_empty_trimmed(item.profile_arn),
             expires_at: None,
             auth_method: Some(auth_method),
             client_id: item.client_id,
@@ -1042,6 +1042,13 @@ impl AdminService {
             target.max_request_body_bytes = v;
         }
     }
+}
+
+/// trim 后的非空字符串
+fn non_empty_trimmed(value: Option<String>) -> Option<String> {
+    value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]

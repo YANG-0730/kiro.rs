@@ -29,6 +29,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [clientSecret, setClientSecret] = useState('')
   const [priority, setPriority] = useState('0')
   const [machineId, setMachineId] = useState('')
+  const [profileArn, setProfileArn] = useState('')
   const [endpoint, setEndpoint] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
@@ -47,6 +48,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setClientSecret('')
     setPriority('0')
     setMachineId('')
+    setProfileArn('')
     setEndpoint('')
     setProxyUrl('')
     setProxyUsername('')
@@ -84,6 +86,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         clientSecret: isApiKey ? undefined : clientSecret.trim() || undefined,
         priority: parseInt(priority) || 0,
         machineId: machineId.trim() || undefined,
+        profileArn: isApiKey ? undefined : profileArn.trim() || undefined,
         endpoint: endpoint.trim() || undefined,
         proxyUrl: proxyUrl.trim() || undefined,
         proxyUsername: proxyUsername.trim() || undefined,
@@ -255,6 +258,25 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </p>
             </div>
 
+            {/* Profile ARN */}
+            {!isApiKey && (
+              <div className="space-y-2">
+                <label htmlFor="profileArn" className="text-sm font-medium">
+                  Profile ARN
+                </label>
+                <Input
+                  id="profileArn"
+                  placeholder="arn:aws:codewhisperer:us-east-1:...:profile/..."
+                  value={profileArn}
+                  onChange={(e) => setProfileArn(e.target.value)}
+                  disabled={isPending}
+                />
+                <p className="text-xs text-muted-foreground">
+                  可选，留空时首次使用自动从上游获取
+                </p>
+              </div>
+            )}
+
             {/* Endpoint */}
             <div className="space-y-2">
               <label htmlFor="endpoint" className="text-sm font-medium">
@@ -270,6 +292,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 <option value="">默认值</option>
                 <option value="ide">ide</option>
                 <option value="cli">cli</option>
+                <option value="cli3">cli3（CLI 3.x / KAS）</option>
               </select>
               <p className="text-xs text-muted-foreground">
                 留空时回退到全局 defaultEndpoint
