@@ -232,6 +232,7 @@ impl KiroProvider {
     /// 支持多凭据故障转移：
     /// - 400 Bad Request: 直接返回错误，不计入凭据失败
     /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
+    ///   （「客户端版本已不受支持」除外：与凭据无关，直接返回）
     /// - 402 MONTHLY_REQUEST_COUNT: 视为额度用尽，禁用凭据并切换
     /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
     ///
@@ -255,6 +256,7 @@ impl KiroProvider {
     /// 支持多凭据故障转移：
     /// - 400 Bad Request: 直接返回错误，不计入凭据失败
     /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
+    ///   （「客户端版本已不受支持」除外：与凭据无关，直接返回）
     /// - 402 MONTHLY_REQUEST_COUNT: 视为额度用尽，禁用凭据并切换
     /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
     ///
@@ -457,6 +459,19 @@ impl KiroProvider {
 
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
+                if Self::is_client_version_unsupported(&body) {
+                    tracing::error!(
+                        "上游已停止支持当前 Kiro 客户端版本（不计入凭据失败，需更新 endpoint 上报的版本）: {} {}",
+                        status,
+                        body
+                    );
+                    anyhow::bail!(
+                        "MCP 请求失败（上游已停止支持当前 Kiro 客户端版本）: {} {}",
+                        status,
+                        body
+                    );
+                }
+
                 // bearer token 失效：优先触发刷新再重试（避免因 expiresAt 不准导致误判/误禁用）
                 if endpoint.is_bearer_token_invalid(&body) && forced_token_refresh.insert(ctx.id) {
                     tracing::warn!(
@@ -766,6 +781,21 @@ impl KiroProvider {
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
             if matches!(status.as_u16(), 401 | 403) {
+                // 版本拒绝对所有凭据一视同仁，计入失败只会把整个号池禁用
+                if Self::is_client_version_unsupported(&body) {
+                    tracing::error!(
+                        "上游已停止支持当前 Kiro 客户端版本（不计入凭据失败，需更新 endpoint 上报的版本）: {} {}",
+                        status,
+                        body
+                    );
+                    anyhow::bail!(
+                        "{} API 请求失败（上游已停止支持当前 Kiro 客户端版本）: {} {}",
+                        api_type,
+                        status,
+                        body
+                    );
+                }
+
                 // bearer token 失效：优先触发刷新再重试（避免因 expiresAt 不准导致误判/误禁用）
                 if endpoint.is_bearer_token_invalid(&body) && forced_token_refresh.insert(ctx.id) {
                     tracing::warn!(
@@ -1037,6 +1067,14 @@ impl KiroProvider {
                 .is_some_and(reason_matches)
     }
 
+    /// 检测上游是否拒绝了当前客户端版本
+    ///
+    /// 典型返回（403）：
+    /// `{"message":"This version of Kiro is no longer supported. ...","reason":"FEATURE_NOT_SUPPORTED"}`
+    fn is_client_version_unsupported(body: &str) -> bool {
+        body.contains("version of Kiro is no longer supported")
+    }
+
     /// 检测是否为 MODEL_TEMPORARILY_UNAVAILABLE 错误
     fn is_model_temporarily_unavailable(body: &str) -> bool {
         if body.contains("MODEL_TEMPORARILY_UNAVAILABLE") {
@@ -1256,7 +1294,7 @@ mod tests {
 
         assert_eq!(
             built.headers().get("x-amz-target").unwrap(),
-            "AmazonQDeveloperStreamingService.SendMessage"
+            "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
         );
         assert_eq!(
             built.headers().get("x-amzn-codewhisperer-optout").unwrap(),
@@ -1292,6 +1330,70 @@ mod tests {
             parsed["conversationState"]["history"][0]["userInputMessage"]["origin"],
             "KIRO_CLI"
         );
+    }
+
+    #[test]
+    fn test_cli_endpoint_decorate_mcp_headers() {
+        let config = Config::default();
+        let mut credentials = KiroCredentials::default();
+        credentials.profile_arn = Some("arn:own".to_string());
+        let endpoint = CliEndpoint::new();
+        let machine_id = "a".repeat(64);
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "test_token",
+            machine_id: &machine_id,
+            config: &config,
+        };
+        let built = endpoint
+            .decorate_mcp(reqwest::Client::new().post("https://example.com"), &ctx)
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            built.headers().get("x-amz-target").unwrap(),
+            "AmazonCodeWhispererStreamingService.InvokeMCP"
+        );
+        assert_eq!(
+            built.headers().get("x-amzn-kiro-profile-arn").unwrap(),
+            "arn:own"
+        );
+    }
+
+    #[test]
+    fn test_cli_endpoint_transform_api_body_uses_own_profile_arn() {
+        let endpoint = CliEndpoint::new();
+        let machine_id = "a".repeat(64);
+        let config = Config::default();
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_method = Some("idc".to_string());
+        let request_body =
+            r#"{"conversationState":{"currentMessage":{}},"profileArn":"arn:other-credential"}"#;
+
+        // 无 profileArn 的凭据：移除请求体中来自其他凭据的值
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "test_token",
+            machine_id: &machine_id,
+            config: &config,
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&endpoint.transform_api_body(request_body, &ctx).unwrap())
+                .unwrap();
+        assert!(parsed.get("profileArn").is_none());
+
+        // 有 profileArn 的凭据（含 IdC）：写入自己的 profileArn
+        credentials.profile_arn = Some("arn:own".to_string());
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "test_token",
+            machine_id: &machine_id,
+            config: &config,
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&endpoint.transform_api_body(request_body, &ctx).unwrap())
+                .unwrap();
+        assert_eq!(parsed["profileArn"], "arn:own");
     }
 
     #[test]
@@ -1649,6 +1751,15 @@ mod tests {
         assert!(KiroProvider::is_model_temporarily_unavailable(body));
         assert!(!KiroProvider::is_model_temporarily_unavailable(
             r#"{"reason":"THROTTLING"}"#
+        ));
+    }
+
+    #[test]
+    fn test_is_client_version_unsupported_detects_upstream_body() {
+        let body = r#"{"message":"This version of Kiro is no longer supported. Please update to the latest version of Kiro to continue.","reason":"FEATURE_NOT_SUPPORTED"}"#;
+        assert!(KiroProvider::is_client_version_unsupported(body));
+        assert!(!KiroProvider::is_client_version_unsupported(
+            r#"{"message":"The bearer token included in the request is invalid."}"#
         ));
     }
 

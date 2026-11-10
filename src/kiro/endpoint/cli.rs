@@ -4,15 +4,23 @@ use reqwest::RequestBuilder;
 use uuid::Uuid;
 
 use super::{KiroEndpoint, RequestContext, UsageRequestParts};
+use crate::kiro::model::credentials::KiroCredentials;
 
 pub const CLI_ENDPOINT_NAME: &str = "cli";
 const CLI_ORIGIN: &str = "KIRO_CLI";
-const CLI_API_TARGET: &str = "AmazonQDeveloperStreamingService.SendMessage";
+// 2026-11-10 起上游对旧 target `AmazonQDeveloperStreamingService.SendMessage` 一律返回
+// 403 FEATURE_NOT_SUPPORTED（与版本号无关）；官方 CLI 3.x 已改用下面的 target，
+// 该 target 要求请求体带 profileArn（IdC 账号经 ListAvailableProfiles 获取）。
+const CLI_API_TARGET: &str = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse";
+// MCP 同理：须带此 target，profileArn 走请求头 x-amzn-kiro-profile-arn（放请求体无效）
+const CLI_MCP_TARGET: &str = "AmazonCodeWhispererStreamingService.InvokeMCP";
 const CLI_STREAMING_API_VERSION: &str = "0.1.14474";
 const CLI_RUNTIME_API_VERSION: &str = "0.1.14474";
 const CLI_RUST_SDK_VERSION: &str = "1.3.14";
 const CLI_RUST_VERSION: &str = "1.92.0";
-const CLI_APP_VERSION: &str = "1.29.3";
+// 2.x 最新版。appVersion-3.x 会被判为不支持（V3 客户端另有标识，未模拟），
+// 2027-01-15 起上游将拒绝 ≤ 2.5.0。
+const CLI_APP_VERSION: &str = "2.37.1";
 
 pub struct CliEndpoint;
 
@@ -94,6 +102,26 @@ impl CliEndpoint {
         Self::rewrite_origin(&mut request);
         Ok(serde_json::to_string(&request)?)
     }
+
+    /// 写入当前凭据自己的 profileArn（先移除请求体里可能来自其他凭据的值）
+    fn transform_api_request(
+        &self,
+        body: &str,
+        credentials: &KiroCredentials,
+    ) -> anyhow::Result<String> {
+        let mut request: serde_json::Value = serde_json::from_str(body)?;
+        Self::rewrite_origin(&mut request);
+        if let Some(obj) = request.as_object_mut() {
+            obj.remove("profileArn");
+            if let Some(arn) = credentials.profile_arn.as_deref() {
+                obj.insert(
+                    "profileArn".to_string(),
+                    serde_json::Value::String(arn.to_string()),
+                );
+            }
+        }
+        Ok(serde_json::to_string(&request)?)
+    }
 }
 
 impl Default for CliEndpoint {
@@ -142,6 +170,7 @@ impl KiroEndpoint for CliEndpoint {
 
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         let mut req = req
+            .header("X-Amz-Target", CLI_MCP_TARGET)
             .header("x-amz-user-agent", self.streaming_x_amz_user_agent())
             .header("user-agent", self.streaming_user_agent())
             .header("host", self.host(ctx))
@@ -149,14 +178,17 @@ impl KiroEndpoint for CliEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
+        if let Some(arn) = ctx.credentials.profile_arn.as_deref() {
+            req = req.header("x-amzn-kiro-profile-arn", arn);
+        }
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
         }
         req
     }
 
-    fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> anyhow::Result<String> {
-        self.transform_body(body)
+    fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> anyhow::Result<String> {
+        self.transform_api_request(body, ctx.credentials)
     }
 
     fn transform_mcp_body(&self, body: &str, _ctx: &RequestContext<'_>) -> anyhow::Result<String> {

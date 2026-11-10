@@ -172,11 +172,11 @@ fn default_count_tokens_auth_type() -> String {
     "x-api-key".to_string()
 }
 
-/// 默认端点：cli（上报 Kiro CLI 1.29.3）
+/// 默认端点：cli（上报 Kiro CLI 2.37.1，见 `kiro/endpoint/cli.rs`）
 ///
 /// Kiro 宣布 2026-11-09 起拒绝 IDE < 0.11.133 / CLI < 1.28.2；ide 端点上报 0.11.107，
-/// 而新版 IDE 版本号对 IdC 账号要求 profileArn。2026-10-12 实测 cli 端点在流式、工具、
-/// thinking、图片、缓存、WebSearch 等场景与 ide 行为一致，故默认改为 cli。
+/// 已不可用。2026-10-12 实测 cli 端点在流式、工具、thinking、图片、缓存、WebSearch
+/// 等场景与 ide 行为一致，故默认改为 cli。
 fn default_endpoint() -> String {
     "cli".to_string()
 }

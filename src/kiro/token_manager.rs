@@ -428,9 +428,8 @@ async fn refresh_idc_token(
         tracing::info!("IdC Token 刷新成功（无过期时间）");
     }
 
-    // 注意：IDC 凭据（auth_method = "idc" 或 "builder-id"）不需要 profileArn
-    // 参考 CLIProxyAPIPlus：AWS SSO OIDC 用户发送 profileArn 反而会导致 403 错误
-    // 因此这里不再尝试获取 profileArn，保持为 None 即可
+    // OIDC 刷新响应不含 profileArn；cli 端点需要时由 ensure_profile_arn 经
+    // ListAvailableProfiles 补齐（ide 端点对 IdC 凭据会主动剔除 profileArn）
 
     Ok(new_credentials)
 }
@@ -500,6 +499,64 @@ pub(crate) async fn get_usage_limits(
         anyhow::anyhow!("JSON 解析失败: {}", e)
     })?;
     Ok(data)
+}
+
+/// 获取凭据所属的 profileArn（AmazonCodeWhispererService.ListAvailableProfiles，awsJson 1.0）
+///
+/// cli 端点的 GenerateAssistantResponse 要求请求体带 profileArn，而 IdC 刷新响应不含此字段。
+/// 账号下没有 profile 时返回 `Ok(None)`。
+pub(crate) async fn fetch_profile_arn(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<Option<String>> {
+    let machine_id = machine_id::generate_from_credentials(credentials, config)
+        .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
+    let endpoint = endpoint_for_credentials(credentials, config)?;
+    let ctx = RequestContext {
+        credentials,
+        token,
+        machine_id: &machine_id,
+        config,
+    };
+
+    let url = format!(
+        "https://q.{}.amazonaws.com/",
+        credentials.effective_api_region(config)
+    );
+    let usage = endpoint.usage_request_parts(&ctx)?;
+    let client = build_client(proxy, 30, config.tls_backend)?;
+    let mut request = client
+        .post(&url)
+        .header("Content-Type", "application/x-amz-json-1.0")
+        .header(
+            "X-Amz-Target",
+            "AmazonCodeWhispererService.ListAvailableProfiles",
+        )
+        .body("{}");
+    for (name, value) in usage.headers {
+        request = request.header(name, value);
+    }
+
+    let response = request.send().await?;
+    let status = response.status();
+    let body_text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!(
+            "ListAvailableProfiles 失败: {} {}",
+            status,
+            &body_text[..body_text.len().min(200)]
+        );
+    }
+
+    let data: serde_json::Value = serde_json::from_str(&body_text)
+        .map_err(|e| anyhow::anyhow!("ListAvailableProfiles JSON 解析失败: {}", e))?;
+    Ok(data
+        .get("profiles")
+        .and_then(|v| v.as_array())
+        .and_then(|profiles| profiles.iter().find_map(|p| p.get("arn")?.as_str()))
+        .map(str::to_string))
 }
 
 /// 获取凭据可用的模型列表
@@ -2071,11 +2128,68 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("没有可用的 accessToken"))?
         };
 
+        let creds = self.ensure_profile_arn(id, creds, &token, &config).await;
+
         Ok(CallContext {
             id,
             credentials: creds,
             token,
         })
+    }
+
+    /// cli 端点要求请求体带 profileArn：凭据缺失时经 ListAvailableProfiles 补齐并回写文件。
+    ///
+    /// 失败只记 warn 并原样返回（本次请求会收到上游 400 "profileArn is required"），
+    /// 下次请求再试。
+    async fn ensure_profile_arn(
+        &self,
+        id: u64,
+        mut creds: KiroCredentials,
+        token: &str,
+        config: &Config,
+    ) -> KiroCredentials {
+        if creds.profile_arn.is_some()
+            || creds.effective_endpoint_name(Some(&config.default_endpoint)) != CLI_ENDPOINT_NAME
+        {
+            return creds;
+        }
+
+        let _guard = self.refresh_lock.lock().await;
+        // 加锁后重读：并发请求可能已补齐
+        let existing = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .and_then(|e| e.credentials.profile_arn.clone())
+        };
+        if let Some(arn) = existing {
+            creds.profile_arn = Some(arn);
+            return creds;
+        }
+
+        let proxy = self.proxy.read().clone();
+        match fetch_profile_arn(&creds, config, token, proxy.as_ref()).await {
+            Ok(Some(arn)) => {
+                {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                        entry.credentials.profile_arn = Some(arn.clone());
+                    }
+                }
+                if let Err(e) = self.persist_credentials() {
+                    tracing::warn!("profileArn 持久化失败（不影响本次请求）: {}", e);
+                }
+                tracing::info!(credential_id = id, "已获取凭据 profileArn");
+                creds.profile_arn = Some(arn);
+            }
+            Ok(None) => tracing::warn!(
+                credential_id = id,
+                "ListAvailableProfiles 未返回任何 profile"
+            ),
+            Err(e) => tracing::warn!(credential_id = id, "获取 profileArn 失败: {}", e),
+        }
+        creds
     }
 
     /// 标记指定凭据的 accessToken 失效（强制触发后续刷新）
