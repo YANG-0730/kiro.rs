@@ -16,9 +16,11 @@ pub struct CacheControl {
 
 // === 错误响应 ===
 
-/// API 错误响应
+/// API 错误响应（与官方一致：`{"type":"error","error":{"type":...,"message":...}}`）
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
+    #[serde(rename = "type")]
+    pub response_type: &'static str,
     pub error: ErrorDetail,
 }
 
@@ -32,10 +34,17 @@ pub struct ErrorDetail {
 
 impl ErrorResponse {
     /// 创建新的错误响应
+    ///
+    /// 非官方的错误类型会归一到官方取值（客户端按 type 决定重试 / 提示策略）。
     pub fn new(error_type: impl Into<String>, message: impl Into<String>) -> Self {
+        let error_type = match error_type.into().as_str() {
+            "internal_error" | "service_unavailable" => "api_error".to_string(),
+            other => other.to_string(),
+        };
         Self {
+            response_type: "error",
             error: ErrorDetail {
-                error_type: error_type.into(),
+                error_type,
                 message: message.into(),
             },
         }

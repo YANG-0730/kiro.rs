@@ -10,7 +10,7 @@ use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
-    extract::{OriginalUri, State},
+    extract::{OriginalUri, State, rejection::JsonRejection},
     http::{StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
@@ -537,7 +537,8 @@ fn map_kiro_provider_error_to_response(request_body: &str, err: Error) -> Respon
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
                 "invalid_request_error",
-                "Input is too long (CONTENT_LENGTH_EXCEEDS_THRESHOLD). Reduce conversation history/system/tools; retrying the same request will not help.",
+                // 以官方措辞 "prompt is too long" 开头，客户端（如 Claude Code）据此触发压缩上下文
+                "prompt is too long: the request exceeds the model's context window (CONTENT_LENGTH_EXCEEDS_THRESHOLD). Reduce conversation history/system/tools; retrying the same request will not help.",
             )),
         )
             .into_response();
@@ -568,6 +569,30 @@ fn map_kiro_provider_error_to_response(request_body: &str, err: Error) -> Respon
             Json(ErrorResponse::new(
                 "invalid_request_error",
                 upstream_message,
+            )),
+        )
+            .into_response();
+    }
+
+    if err.to_string().contains("CONVERSATION_LIMIT_EXCEEDED") {
+        tracing::warn!(error = %err, "上游拒绝：会话超出限制");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "Conversation exceeds the upstream conversation limit (CONVERSATION_LIMIT_EXCEEDED). Start a new conversation or compact the history.",
+            )),
+        )
+            .into_response();
+    }
+
+    if err.to_string().contains("所有凭据认证/权限失败") {
+        tracing::error!(error = %err, "所有凭据认证/权限失败");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::new(
+                "api_error",
+                "All upstream credentials failed authentication or permission checks. Check credentials in the admin panel.",
             )),
         )
             .into_response();
@@ -609,8 +634,10 @@ fn map_kiro_provider_error_to_response(request_body: &str, err: Error) -> Respon
 
     if is_quota_exhausted_error(&err) {
         tracing::warn!(error = %err, "所有凭据配额已耗尽");
+        // 额度耗尽短时间内不会恢复：告知 SDK 不要自动重试
         return (
             StatusCode::TOO_MANY_REQUESTS,
+            [("x-should-retry", "false")],
             Json(ErrorResponse::new(
                 "rate_limit_error",
                 "All credentials quota exhausted. Please wait for quota reset or add new credentials.",
@@ -626,7 +653,7 @@ fn map_kiro_provider_error_to_response(request_body: &str, err: Error) -> Respon
             StatusCode::from_u16(529).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
             Json(ErrorResponse::new(
                 "overloaded_error",
-                "Upstream model is temporarily overloaded (MODEL_TEMPORARILY_UNAVAILABLE). Please retry shortly.",
+                "Upstream model is temporarily overloaded. Please retry shortly.",
             )),
         )
             .into_response();
@@ -645,10 +672,20 @@ fn map_kiro_provider_error_to_response(request_body: &str, err: Error) -> Respon
             )
                 .into_response();
         }
-        tracing::warn!(error = %err, "上游瞬态错误（429/5xx），不输出请求体");
+        // 429 → rate_limit_error；5xx / 408 / 容量不足等上游过载 → 529 overloaded_error
+        // （此前一律 429，会让客户端误以为是自身限流）
+        if err.to_string().contains("429 Too Many Requests") {
+            tracing::warn!(error = %err, "上游限流（429），不输出请求体");
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ErrorResponse::new("rate_limit_error", err.to_string())),
+            )
+                .into_response();
+        }
+        tracing::warn!(error = %err, "上游瞬态错误（5xx），不输出请求体");
         return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(ErrorResponse::new("rate_limit_error", err.to_string())),
+            StatusCode::from_u16(529).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+            Json(ErrorResponse::new("overloaded_error", err.to_string())),
         )
             .into_response();
     }
@@ -666,6 +703,24 @@ fn map_kiro_provider_error_to_response(request_body: &str, err: Error) -> Respon
             "api_error",
             format!("上游 API 调用失败: {}", err),
         )),
+    )
+        .into_response()
+}
+
+/// 请求体解析失败（JSON 不合法 / 字段类型不符 / 超过请求体上限）→ 官方错误格式
+///
+/// axum 默认返回纯文本 4xx，客户端无法按 Anthropic 错误格式解析。
+fn json_rejection_response(rejection: JsonRejection) -> Response {
+    let status = rejection.status();
+    let (status, error_type) = if status == StatusCode::PAYLOAD_TOO_LARGE {
+        (status, "request_too_large")
+    } else {
+        (StatusCode::BAD_REQUEST, "invalid_request_error")
+    };
+    tracing::warn!(status = %status, error = %rejection.body_text(), "请求体解析失败");
+    (
+        status,
+        Json(ErrorResponse::new(error_type, rejection.body_text())),
     )
         .into_response()
 }
@@ -813,8 +868,12 @@ fn build_models_from_registry(registry: &crate::kiro::model_registry::ModelRegis
 pub async fn post_messages(
     OriginalUri(uri): OriginalUri,
     State(state): State<AppState>,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    payload: Result<JsonExtractor<MessagesRequest>, JsonRejection>,
 ) -> Response {
+    let mut payload = match payload {
+        Ok(JsonExtractor(payload)) => payload,
+        Err(rejection) => return json_rejection_response(rejection),
+    };
     // 读取压缩配置快照（读锁 + clone，避免持锁跨 await）
     let compression_config = state.compression_config.read().clone();
     let prompt_cache = state.prompt_cache_snapshot();
@@ -946,23 +1005,26 @@ pub async fn post_messages(
     let conversion_result = match convert_request(&payload, &compression_config, registry_ref) {
         Ok(result) => result,
         Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-                ConversionError::EmptyMessageContent => {
-                    ("invalid_request_error", "消息内容为空".to_string())
-                }
+            // 与官方一致：未知模型 404 not_found_error（message 形如 "model: xxx"）
+            let (status, error_type, message) = match &e {
+                ConversionError::UnsupportedModel(model) => (
+                    StatusCode::NOT_FOUND,
+                    "not_found_error",
+                    format!("model: {}", model),
+                ),
+                ConversionError::EmptyMessages => (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "messages: at least one message is required".to_string(),
+                ),
+                ConversionError::EmptyMessageContent => (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "messages: text content blocks must be non-empty".to_string(),
+                ),
             };
             tracing::warn!("请求转换失败: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
+            return (status, Json(ErrorResponse::new(error_type, message))).into_response();
         }
     };
 
@@ -1277,7 +1339,12 @@ fn create_sse_stream(
                                         tracing::warn!("解码事件失败: {}", e);
                                     }
                                 }
+                                // 上游流内报错：error 事件已生成，后续一律不再输出
+                                if ctx.is_aborted() {
+                                    break;
+                                }
                             }
+                            let finished = ctx.is_aborted();
 
                             // 转换为 SSE 字节流
                             let bytes: Vec<Result<Bytes, Infallible>> = events
@@ -1285,15 +1352,28 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, finished, ping_interval)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            // 流不完整：签名可能缺帧，不能当作完整签名下发
-                            ctx.discard_pending_reasoning_signature();
-                            // 发送最终事件并结束
-                            let final_events = ctx.generate_final_events();
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
+                            // 流不完整：不能当作正常结束（客户端会把截断的回答当成完整结果），
+                            // 发 Anthropic error 事件让客户端重试
+                            let error_events = ctx.abort_stream_interrupted(&e.to_string());
+                            let bytes: Vec<Result<Bytes, Infallible>> = error_events
+                                .into_iter()
+                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                .collect();
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                        }
+                        None if decoder.is_stopped() || decoder.buffer_len() > 0 => {
+                            // 连接正常关闭但最后的帧不完整 / 解码器已因错误停止：同样是截断
+                            let detail = format!(
+                                "event stream ended with an incomplete frame (buffered {} bytes, decoder stopped: {})",
+                                decoder.buffer_len(),
+                                decoder.is_stopped()
+                            );
+                            let error_events = ctx.abort_stream_interrupted(&detail);
+                            let bytes: Vec<Result<Bytes, Infallible>> = error_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
@@ -1382,6 +1462,8 @@ async fn handle_non_stream_request(
     }
 
     let mut text_content = String::new();
+    // 上游在响应体内报错（error 帧 / 异常 / 建模错误事件）：(Anthropic 错误类型, 说明)
+    let mut upstream_error: Option<(&'static str, String)> = None;
     // 结构化推理（新模型 reasoningContentEvent），分段语义与流式路径一致
     let mut reasoning = super::stream::ReasoningAccumulator::default();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
@@ -1517,11 +1599,17 @@ async fn handle_non_stream_request(
                             exception_type,
                             message,
                         } => {
-                            if exception_type == "ContentLengthExceededException" {
-                                stop_reason = "max_tokens".to_string();
-                            }
                             tracing::warn!("收到异常事件: {} - {}", exception_type, message);
                             unusual_events.push(format!("exception:{exception_type}"));
+                            if exception_type == "ContentLengthExceededException" {
+                                stop_reason = "max_tokens".to_string();
+                            } else if upstream_error.is_none() {
+                                upstream_error =
+                                    Some(super::stream::classify_upstream_stream_error(
+                                        &exception_type,
+                                        &message,
+                                    ));
+                            }
                         }
                         Event::Error {
                             error_code,
@@ -1529,6 +1617,13 @@ async fn handle_non_stream_request(
                         } => {
                             tracing::error!("收到错误事件: {} - {}", error_code, error_message);
                             unusual_events.push(format!("error:{error_code}"));
+                            if upstream_error.is_none() {
+                                upstream_error =
+                                    Some(super::stream::classify_upstream_stream_error(
+                                        &error_code,
+                                        &error_message,
+                                    ));
+                            }
                         }
                         Event::Metadata(metadata) => {
                             if let Some(details) = metadata.anthropic_stop_details() {
@@ -1577,10 +1672,35 @@ async fn handle_non_stream_request(
         }
     }
 
+    // 上游在响应体内报错 / 事件流不完整：返回错误而不是把残缺内容当成功结果
+    if upstream_error.is_none() && (decoder.is_stopped() || decoder.buffer_len() > 0) {
+        upstream_error = Some((
+            "api_error",
+            format!(
+                "Upstream response stream was interrupted: event stream ended with an incomplete frame (buffered {} bytes, decoder stopped: {})",
+                decoder.buffer_len(),
+                decoder.is_stopped()
+            ),
+        ));
+    }
+    if let Some((error_type, message)) = upstream_error {
+        tracing::warn!(error_type, %message, "上游响应体内报错，返回错误");
+        let status = StatusCode::from_u16(super::stream::error_type_status(error_type))
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        return (status, Json(ErrorResponse::new(error_type, message))).into_response();
+    }
+
     // 确定 stop_reason（拒答优先级最高）
     if stop_details.is_some() {
         stop_reason = "refusal".to_string();
-    } else if has_tool_use && stop_reason == "end_turn" {
+    } else if !tool_json_buffers.is_empty() {
+        // 工具调用参数没收完（无 stop 帧）流就结束了：输出被截断，不能声称 tool_use
+        tracing::warn!(
+            unfinished_tools = tool_json_buffers.len(),
+            "工具调用未完整结束，按 max_tokens 处理"
+        );
+        stop_reason = "max_tokens".to_string();
+    } else if has_tool_use && !tool_uses.is_empty() && stop_reason == "end_turn" {
         stop_reason = "tool_use".to_string();
     }
 
@@ -1708,8 +1828,12 @@ async fn handle_non_stream_request(
 /// 计算消息的 token 数量。
 pub async fn count_tokens(
     OriginalUri(uri): OriginalUri,
-    JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
-) -> impl IntoResponse {
+    payload: Result<JsonExtractor<CountTokensRequest>, JsonRejection>,
+) -> Response {
+    let payload = match payload {
+        Ok(JsonExtractor(payload)) => payload,
+        Err(rejection) => return json_rejection_response(rejection),
+    };
     tracing::info!(
         path = %uri.path(),
         model = %payload.model,
@@ -1727,6 +1851,7 @@ pub async fn count_tokens(
     Json(CountTokensResponse {
         input_tokens: total_tokens.max(1) as i32,
     })
+    .into_response()
 }
 
 /// 截断字符串中间部分，保留头尾各 `keep` 个字符
@@ -2177,5 +2302,61 @@ mod tests {
             ),
         );
         assert_eq!(response.status().as_u16(), 529);
+    }
+
+    async fn error_body(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_error_mapping_matches_official_types() {
+        // 5xx 瞬态错误 → 529 overloaded_error（以前误报为 429）
+        let r = map_kiro_provider_error_to_response(
+            "{}",
+            anyhow::anyhow!("流式 API 请求失败: 503 Service Unavailable busy"),
+        );
+        assert_eq!(r.status().as_u16(), 529);
+        let body = error_body(r).await;
+        assert_eq!(body["type"], "error", "官方错误信封需要顶层 type=error");
+        assert_eq!(body["error"]["type"], "overloaded_error");
+
+        // 上游 429 仍是 rate_limit_error
+        let r = map_kiro_provider_error_to_response(
+            "{}",
+            anyhow::anyhow!("流式 API 请求失败: 429 Too Many Requests slow down"),
+        );
+        assert_eq!(r.status().as_u16(), 429);
+
+        // 全池认证失败不再伪装成额度耗尽
+        let r = map_kiro_provider_error_to_response(
+            "{}",
+            anyhow::anyhow!("流式 API 请求失败（所有凭据认证/权限失败）: 403 Forbidden x"),
+        );
+        assert_eq!(r.status().as_u16(), 500);
+        assert_eq!(error_body(r).await["error"]["type"], "api_error");
+
+        // 额度耗尽：429 + x-should-retry: false
+        let r = map_kiro_provider_error_to_response(
+            "{}",
+            anyhow::anyhow!("流式 API 请求失败（所有凭据已用尽）: 402 Payment Required"),
+        );
+        assert_eq!(r.status().as_u16(), 429);
+        assert_eq!(r.headers().get("x-should-retry").unwrap(), "false");
+
+        // 会话超限 → 400
+        let r = map_kiro_provider_error_to_response(
+            "{}",
+            anyhow::anyhow!(
+                "流式 API 请求失败（会话超出上游限制 CONVERSATION_LIMIT_EXCEEDED）: 402 Payment Required {{}}"
+            ),
+        );
+        assert_eq!(r.status().as_u16(), 400);
+
+        // 非官方错误类型被归一
+        let v = serde_json::to_value(ErrorResponse::new("internal_error", "x")).unwrap();
+        assert_eq!(v["error"]["type"], "api_error");
     }
 }

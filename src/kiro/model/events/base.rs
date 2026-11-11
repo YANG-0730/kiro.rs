@@ -5,6 +5,21 @@
 use crate::kiro::parser::error::{ParseError, ParseResult};
 use crate::kiro::parser::frame::Frame;
 
+/// 是否为流内的建模错误事件类型
+fn is_error_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "error"
+            | "throttlingError"
+            | "validationError"
+            | "serviceUnavailableError"
+            | "internalServerException"
+            | "throttlingException"
+            | "validationException"
+            | "serviceUnavailableException"
+    )
+}
+
 /// 未知事件保留的 payload 预览长度（字符数）
 pub const UNKNOWN_PAYLOAD_PREVIEW_CHARS: usize = 300;
 
@@ -131,6 +146,15 @@ impl Event {
     /// 解析事件类型消息
     fn parse_event(frame: Frame) -> ParseResult<Self> {
         let event_type_str = frame.event_type().unwrap_or("unknown");
+
+        // 流内的建模错误成员（KiroRuntimeService ChatResponseStream 的 error /
+        // throttlingError / validationError / serviceUnavailableError），官方客户端遇到即抛错
+        if is_error_event_type(event_type_str) {
+            return Ok(Self::Exception {
+                exception_type: event_type_str.to_string(),
+                message: frame.payload_as_str(),
+            });
+        }
         let event_type = EventType::from_str(event_type_str);
 
         match event_type {
@@ -170,14 +194,18 @@ impl Event {
         }
     }
 
-    /// 解析错误类型消息
+    /// 解析错误类型消息（错误说明在 `:error-message` 头里，缺失时回退 payload）
     fn parse_error(frame: Frame) -> ParseResult<Self> {
         let error_code = frame
             .headers
             .error_code()
             .unwrap_or("UnknownError")
             .to_string();
-        let error_message = frame.payload_as_str();
+        let error_message = frame
+            .headers
+            .get_string(":error-message")
+            .map(str::to_string)
+            .unwrap_or_else(|| frame.payload_as_str());
 
         Ok(Self::Error {
             error_code,
@@ -227,6 +255,66 @@ mod tests {
             "assistantResponseEvent"
         );
         assert_eq!(EventType::ToolUse.as_str(), "toolUseEvent");
+    }
+
+    #[test]
+    fn test_modeled_error_events_become_exceptions() {
+        use crate::kiro::parser::header::{HeaderValue, Headers};
+        let mut headers = Headers::new();
+        headers.insert(
+            ":message-type".to_string(),
+            HeaderValue::String("event".to_string()),
+        );
+        headers.insert(
+            ":event-type".to_string(),
+            HeaderValue::String("throttlingError".to_string()),
+        );
+        let frame = Frame {
+            headers,
+            payload: br#"{"message":"slow","reason":"USER_REQUEST_RATE_EXCEEDED"}"#.to_vec(),
+        };
+        match Event::from_frame(frame).unwrap() {
+            Event::Exception {
+                exception_type,
+                message,
+            } => {
+                assert_eq!(exception_type, "throttlingError");
+                assert!(message.contains("USER_REQUEST_RATE_EXCEEDED"));
+            }
+            other => panic!("expected exception, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_error_frame_reads_error_message_header() {
+        use crate::kiro::parser::header::{HeaderValue, Headers};
+        let mut headers = Headers::new();
+        headers.insert(
+            ":message-type".to_string(),
+            HeaderValue::String("error".to_string()),
+        );
+        headers.insert(
+            ":error-code".to_string(),
+            HeaderValue::String("InternalFailure".to_string()),
+        );
+        headers.insert(
+            ":error-message".to_string(),
+            HeaderValue::String("boom".to_string()),
+        );
+        let frame = Frame {
+            headers,
+            payload: Vec::new(),
+        };
+        match Event::from_frame(frame).unwrap() {
+            Event::Error {
+                error_code,
+                error_message,
+            } => {
+                assert_eq!(error_code, "InternalFailure");
+                assert_eq!(error_message, "boom");
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
     }
 
     #[test]

@@ -50,6 +50,8 @@ const DEFAULT_RATE_LIMIT_COOLDOWN_SECS: u64 = 60;
 
 /// 429 冷却最大时长上限（避免异常 Retry-After 把单号挂死太久）
 const MAX_RATE_LIMIT_COOLDOWN_SECS: u64 = 300;
+/// 账户被临时停用时的冷却时长（到期后自动复查）
+const ACCOUNT_SUSPENDED_COOLDOWN: Duration = Duration::from_secs(3600);
 
 /// 余额不足判定阈值（基础剩余额度低于此值且无可用超额时禁用凭据）
 const BALANCE_INSUFFICIENT_THRESHOLD: f64 = 1.0;
@@ -531,7 +533,7 @@ impl KiroProvider {
 
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
-                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    anyhow::bail!("MCP 请求失败（所有凭据认证/权限失败）: {} {}", status, body);
                 }
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 continue;
@@ -740,7 +742,15 @@ impl KiroProvider {
             let body = response.text().await.unwrap_or_default();
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
-            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+            let reason = Self::upstream_reason(&body);
+            let retry_after = retry_after.or_else(|| Self::body_retry_after(&body));
+            // 额度耗尽：402 MONTHLY_REQUEST_COUNT / OVERAGE_REQUEST_LIMIT_EXCEEDED，
+            // 以及以 429 形式返回的 MONTHLY_REQUEST_COUNT（ThrottlingException reason）
+            let quota_exhausted = (status.as_u16() == 402
+                && (endpoint.is_monthly_request_limit(&body)
+                    || reason.as_deref() == Some("OVERAGE_REQUEST_LIMIT_EXCEEDED")))
+                || (status.as_u16() == 429 && reason.as_deref() == Some("MONTHLY_REQUEST_COUNT"));
+            if quota_exhausted {
                 tracing::warn!(
                     "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -767,6 +777,16 @@ impl KiroProvider {
                     body
                 ));
                 continue;
+            }
+
+            // 402 CONVERSATION_LIMIT_EXCEEDED：会话本身超限（与凭据无关），换凭据也无用
+            if status.as_u16() == 402 && reason.as_deref() == Some("CONVERSATION_LIMIT_EXCEEDED") {
+                anyhow::bail!(
+                    "{} API 请求失败（会话超出上游限制 CONVERSATION_LIMIT_EXCEEDED）: {} {}",
+                    api_type,
+                    status,
+                    body
+                );
             }
 
             // 400 THINKING_SIGNATURE_INVALID：历史推理签名验不过（签名被客户端改动 / 截断等）。
@@ -862,6 +882,29 @@ impl KiroProvider {
                     );
                 }
 
+                // 账户临时停用 / 新用户暂停：账户级，长冷却后自动复查（官方客户端不重试），切换凭据
+                if Self::is_account_temporarily_unavailable(&body) {
+                    let cooldown = self.token_manager.set_credential_cooldown_with_duration(
+                        ctx.id,
+                        crate::kiro::cooldown::CooldownReason::AccountSuspended,
+                        Some(ACCOUNT_SUSPENDED_COOLDOWN),
+                    );
+                    tracing::error!(
+                        credential_id = %ctx.id,
+                        cooldown_secs = cooldown.as_secs(),
+                        "凭据账户被上游临时停用，冷却后复查并切换其他凭据: {} {}",
+                        status,
+                        body
+                    );
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败（账户被临时停用）: {} {}",
+                        api_type,
+                        status,
+                        body
+                    ));
+                    continue;
+                }
+
                 // bearer token 失效：优先触发刷新再重试（避免因 expiresAt 不准导致误判/误禁用）
                 if endpoint.is_bearer_token_invalid(&body) && forced_token_refresh.insert(ctx.id) {
                     tracing::warn!(
@@ -892,7 +935,7 @@ impl KiroProvider {
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
                     anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
+                        "{} API 请求失败（所有凭据认证/权限失败）: {} {}",
                         api_type,
                         status,
                         body
@@ -936,10 +979,32 @@ impl KiroProvider {
                 continue;
             }
 
+            // 429 DAILY_REQUEST_COUNT：当日请求额度用尽，冷却到下一个 UTC 日
+            if status.as_u16() == 429 && reason.as_deref() == Some("DAILY_REQUEST_COUNT") {
+                let cooldown = self.token_manager.set_credential_cooldown_with_duration(
+                    ctx.id,
+                    crate::kiro::cooldown::CooldownReason::QuotaExhausted,
+                    Some(Self::until_next_utc_day()),
+                );
+                tracing::warn!(
+                    credential_id = %ctx.id,
+                    cooldown_secs = %cooldown.as_secs(),
+                    "凭据当日请求额度已用尽（DAILY_REQUEST_COUNT），冷却到下一个 UTC 日并切换"
+                );
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                continue;
+            }
+
             if status.as_u16() == 429 {
                 let cooldown = self.handle_rate_limited_response(ctx.id, &body, retry_after);
                 tracing::warn!(
                     credential_id = %ctx.id,
+                    reason = ?reason,
                     cooldown_secs = %cooldown.as_secs(),
                     "{} API 请求触发 429，当前凭据进入冷却并尝试切换其他凭据",
                     api_type
@@ -1077,6 +1142,14 @@ impl KiroProvider {
     }
 
     fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+        // KiroRuntimeService 的限流提示（毫秒），官方客户端优先使用
+        if let Some(ms) = headers
+            .get("x-amzn-kiro-ratelimit-retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            return Some(Self::clamp_rate_limit_cooldown(Duration::from_millis(ms)));
+        }
         let raw = headers.get("retry-after")?.to_str().ok()?.trim();
         if raw.is_empty() {
             return None;
@@ -1092,6 +1165,39 @@ impl KiroProvider {
         let now = Utc::now();
         let wait = retry_at.signed_duration_since(now).to_std().ok()?;
         Some(Self::clamp_rate_limit_cooldown(wait))
+    }
+
+    /// 上游错误体里的 `reason`（ValidationException / ThrottlingException /
+    /// ServiceQuotaExceededException / AccessDeniedException 等的分类码）
+    fn upstream_reason(body: &str) -> Option<String> {
+        let value: serde_json::Value = serde_json::from_str(body).ok()?;
+        ["/reason", "/error/reason"]
+            .iter()
+            .find_map(|p| value.pointer(p).and_then(|v| v.as_str()))
+            .map(str::to_string)
+    }
+
+    /// 错误体里的 `retryAfterMilliseconds`（KiroRuntimeService 限流提示）
+    fn body_retry_after(body: &str) -> Option<Duration> {
+        let value: serde_json::Value = serde_json::from_str(body).ok()?;
+        let ms = value.get("retryAfterMilliseconds")?.as_u64()?;
+        Some(Self::clamp_rate_limit_cooldown(Duration::from_millis(ms)))
+    }
+
+    /// 距下一个 UTC 自然日 0 点的时长（日请求额度按 UTC 日重置）
+    fn until_next_utc_day() -> Duration {
+        let now = Utc::now();
+        let next = (now.date_naive() + chrono::Days::new(1))
+            .and_hms_opt(0, 0, 0)
+            .map(|dt| dt.and_utc())
+            .unwrap_or(now + chrono::Duration::hours(24));
+        (next - now).to_std().unwrap_or(Duration::from_secs(3600))
+    }
+
+    /// 账户被临时停用 / 新用户暂停（账户级，非请求问题）：长冷却后自动复查
+    fn is_account_temporarily_unavailable(body: &str) -> bool {
+        Self::upstream_reason(body).as_deref() == Some("TEMPORARILY_SUSPENDED")
+            || body.contains("temporarily paused new")
     }
 
     fn clamp_rate_limit_cooldown(duration: Duration) -> Duration {
@@ -1139,19 +1245,23 @@ impl KiroProvider {
     /// `{"message":"This version of Kiro is no longer supported. ...","reason":"FEATURE_NOT_SUPPORTED"}`
     fn is_client_version_unsupported(body: &str) -> bool {
         body.contains("version of Kiro is no longer supported")
+            || body.contains("UnsupportedClientVersion")
     }
 
-    /// 检测是否为模型级过载 / 容量不足（与凭据无关）
+    /// 检测是否为模型级过载 / 容量不足 / 服务级限流（与凭据无关）
     ///
-    /// 与官方客户端一致（KAS 把两者都归为 ModelThrottleError）：
+    /// 与官方客户端一致（KAS 把这些都归为 ModelThrottleError）：
     /// - `MODEL_TEMPORARILY_UNAVAILABLE`（ServiceUnavailableException 等）
     /// - `INSUFFICIENT_MODEL_CAPACITY`（ThrottlingException reason）
+    /// - `SERVICE_REQUEST_RATE_EXCEEDED`（服务级限流）、"unexpectedly high load"（500）
     fn is_model_temporarily_unavailable(body: &str) -> bool {
-        const REASONS: [&str; 2] = [
+        const REASONS: [&str; 3] = [
             "MODEL_TEMPORARILY_UNAVAILABLE",
             "INSUFFICIENT_MODEL_CAPACITY",
+            // 服务级限流：与单个凭据无关，冷却凭据无济于事
+            "SERVICE_REQUEST_RATE_EXCEEDED",
         ];
-        if REASONS.iter().any(|r| body.contains(r)) {
+        if REASONS.iter().any(|r| body.contains(r)) || body.contains("unexpectedly high load") {
             return true;
         }
 
@@ -1320,6 +1430,57 @@ mod tests {
     use crate::kiro::model::credentials::KiroCredentials;
     use crate::model::config::Config;
     use reqwest::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HeaderValue};
+
+    #[test]
+    fn test_upstream_error_classification_helpers() {
+        assert_eq!(
+            KiroProvider::upstream_reason(r#"{"message":"x","reason":"DAILY_REQUEST_COUNT"}"#)
+                .as_deref(),
+            Some("DAILY_REQUEST_COUNT")
+        );
+        assert_eq!(
+            KiroProvider::upstream_reason(r#"{"error":{"reason":"TEMPORARILY_SUSPENDED"}}"#)
+                .as_deref(),
+            Some("TEMPORARILY_SUSPENDED")
+        );
+        assert!(KiroProvider::upstream_reason("not json").is_none());
+        assert!(KiroProvider::is_account_temporarily_unavailable(
+            r#"{"reason":"TEMPORARILY_SUSPENDED"}"#
+        ));
+        assert!(KiroProvider::is_account_temporarily_unavailable(
+            "Kiro temporarily paused new free users"
+        ));
+        assert!(KiroProvider::is_model_temporarily_unavailable(
+            r#"{"reason":"SERVICE_REQUEST_RATE_EXCEEDED"}"#
+        ));
+        assert!(KiroProvider::is_model_temporarily_unavailable(
+            "Encountered unexpectedly high load when processing the request"
+        ));
+        assert!(KiroProvider::is_client_version_unsupported(
+            r#"{"__type":"com.amazon#UnsupportedClientVersionException"}"#
+        ));
+        // 毫秒提示被夹在冷却下限之上
+        assert_eq!(
+            KiroProvider::body_retry_after(r#"{"retryAfterMilliseconds":1500}"#),
+            Some(Duration::from_secs(DEFAULT_RATE_LIMIT_COOLDOWN_SECS))
+        );
+        let next_day = KiroProvider::until_next_utc_day();
+        assert!(next_day > Duration::ZERO && next_day <= Duration::from_secs(86_400));
+    }
+
+    #[test]
+    fn test_kiro_ratelimit_header_preferred() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amzn-kiro-ratelimit-retry-after",
+            HeaderValue::from_static("120000"),
+        );
+        headers.insert("retry-after", HeaderValue::from_static("5"));
+        assert_eq!(
+            KiroProvider::parse_retry_after(&headers),
+            Some(Duration::from_secs(120))
+        );
+    }
 
     #[test]
     fn test_strip_history_reasoning() {

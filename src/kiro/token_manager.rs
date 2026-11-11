@@ -2518,7 +2518,7 @@ impl MultiTokenManager {
             entry.quota_recover_at = Some(recover_at);
 
             tracing::error!(
-                "凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用，将于 {} 额度重置后自动复查",
+                "凭据 #{} 额度已用尽（月度请求额度 / 超额上限），已被禁用，将于 {} 额度重置后自动复查",
                 id,
                 recover_at.to_rfc3339()
             );

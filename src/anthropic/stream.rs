@@ -346,6 +346,13 @@ impl SseStateManager {
             .any(|b| b.block_type != "thinking")
     }
 
+    /// 是否还有未结束的 tool_use 块（工具参数没收完流就结束了）
+    pub fn has_open_tool_use_block(&self) -> bool {
+        self.active_blocks
+            .values()
+            .any(|b| b.block_type == "tool_use" && b.started && !b.stopped)
+    }
+
     /// 是否产生过任何内容块（thinking / text / tool_use）
     pub fn has_any_content_block(&self) -> bool {
         !self.active_blocks.is_empty()
@@ -534,6 +541,70 @@ impl SseStateManager {
     }
 }
 
+/// Anthropic 流式 `error` 事件
+pub(crate) fn create_error_sse_event(error_type: &str, message: &str) -> SseEvent {
+    SseEvent::new(
+        "error",
+        json!({
+            "type": "error",
+            "error": { "type": error_type, "message": message }
+        }),
+    )
+}
+
+/// 把上游流内错误（异常类型 / 错误码 + 说明）归类为 Anthropic 错误类型
+///
+/// 与官方客户端的归类一致：模型过载 / 容量不足 / 服务不可用 → overloaded_error；
+/// 限流 → rate_limit_error；请求校验错误 → invalid_request_error（上下文超长用官方措辞
+/// "prompt is too long"）；其余 → api_error。
+pub(crate) fn classify_upstream_stream_error(kind: &str, message: &str) -> (&'static str, String) {
+    let k = kind.to_ascii_lowercase();
+    let overloaded = [
+        "MODEL_TEMPORARILY_UNAVAILABLE",
+        "INSUFFICIENT_MODEL_CAPACITY",
+        "SERVICE_REQUEST_RATE_EXCEEDED",
+        "unexpectedly high load",
+    ]
+    .iter()
+    .any(|m| message.contains(m))
+        || k.contains("serviceunavailable");
+    let detail = format!("{kind}: {message}");
+    if overloaded {
+        (
+            "overloaded_error",
+            format!("Upstream model is temporarily overloaded. {detail}"),
+        )
+    } else if k.contains("throttl") {
+        ("rate_limit_error", detail)
+    } else if k.contains("validation") {
+        if message.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+            || message.contains("PROMPT_TOO_LONG")
+            || message.contains("Input is too long")
+        {
+            (
+                "invalid_request_error",
+                format!(
+                    "prompt is too long: the request exceeds the model's context window ({detail})"
+                ),
+            )
+        } else {
+            ("invalid_request_error", detail)
+        }
+    } else {
+        ("api_error", detail)
+    }
+}
+
+/// Anthropic 错误类型对应的 HTTP 状态码（非流式响应用）
+pub(crate) fn error_type_status(error_type: &str) -> u16 {
+    match error_type {
+        "overloaded_error" => 529,
+        "rate_limit_error" => 429,
+        "invalid_request_error" => 400,
+        _ => 500,
+    }
+}
+
 /// 非流式路径的结构化推理累积
 ///
 /// 分段语义与流式路径（`StreamContext::process_reasoning_content`）一致：
@@ -644,6 +715,8 @@ pub struct StreamContext {
     /// 本次响应中收到的非常规事件（未知事件类型 / error / exception），
     /// 空响应时随告警一并输出，便于判断上游到底回了什么
     pub unusual_events: Vec<String>,
+    /// 上游在流中途报错：已向客户端发出 `error` 事件，之后不再输出任何事件
+    aborted: bool,
 }
 
 impl StreamContext {
@@ -680,6 +753,7 @@ impl StreamContext {
             metering: None,
             strip_thinking_leading_newline: false,
             unusual_events: Vec::new(),
+            aborted: false,
         }
     }
 
@@ -786,19 +860,20 @@ impl StreamContext {
             } => {
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
                 self.record_unusual_event(format!("error:{error_code}"));
-                Vec::new()
+                self.abort_with_upstream_error(error_code, error_message)
             }
             Event::Exception {
                 exception_type,
                 message,
             } => {
-                // 处理 ContentLengthExceededException
-                if exception_type == "ContentLengthExceededException" {
-                    self.state_manager.set_stop_reason("max_tokens");
-                }
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
                 self.record_unusual_event(format!("exception:{exception_type}"));
-                Vec::new()
+                // 输出长度超限：按 max_tokens 正常结束（不是错误）
+                if exception_type == "ContentLengthExceededException" {
+                    self.state_manager.set_stop_reason("max_tokens");
+                    return Vec::new();
+                }
+                self.abort_with_upstream_error(exception_type, message)
             }
             Event::Metadata(metadata) => {
                 if let Some(stop_details) = metadata.anthropic_stop_details() {
@@ -834,6 +909,39 @@ impl StreamContext {
                 Vec::new()
             }
         }
+    }
+
+    /// 上游在流中途报错：生成 Anthropic `error` 事件并终止输出
+    ///
+    /// 以前只打日志、照常 message_stop，客户端会把被截断的回答当作完整结果。
+    /// 官方客户端遇到流内错误即抛错；Anthropic 规范用 `event: error` 表示，
+    /// 客户端（如 Claude Code）据此重试。
+    fn abort_with_upstream_error(&mut self, kind: &str, message: &str) -> Vec<SseEvent> {
+        if self.aborted {
+            return Vec::new();
+        }
+        self.aborted = true;
+        let (error_type, client_message) = classify_upstream_stream_error(kind, message);
+        vec![create_error_sse_event(error_type, &client_message)]
+    }
+
+    /// 是否已因上游错误终止（之后不应再输出任何事件，包括 message_stop）
+    pub fn is_aborted(&self) -> bool {
+        self.aborted
+    }
+
+    /// 上游流在中途断开 / 帧不完整：生成 `error` 事件并终止输出
+    pub fn abort_stream_interrupted(&mut self, detail: &str) -> Vec<SseEvent> {
+        if self.aborted {
+            return Vec::new();
+        }
+        self.discard_pending_reasoning_signature();
+        self.aborted = true;
+        tracing::warn!(detail = %detail, "上游响应流不完整，向客户端返回 error 事件");
+        vec![create_error_sse_event(
+            "api_error",
+            &format!("Upstream response stream was interrupted: {detail}"),
+        )]
     }
 
     /// 记录非常规事件（去重、限量，只用于诊断日志）
@@ -1382,6 +1490,12 @@ impl StreamContext {
 
         // 结构化推理块仍打开（只有推理、或推理后流即结束）：先下发缓存的签名再关闭
         events.extend(self.close_reasoning_block_if_open());
+
+        // 工具调用参数没收完（无 stop 帧）流就结束了：输出被截断，按 max_tokens
+        if self.state_manager.has_open_tool_use_block() {
+            tracing::warn!("工具调用未完整结束，按 max_tokens 处理");
+            self.state_manager.set_stop_reason("max_tokens");
+        }
 
         // Flush thinking_buffer 中的剩余内容
         if self.thinking_enabled && !self.thinking_buffer.is_empty() {
@@ -2944,6 +3058,109 @@ mod tests {
                 .any(|e| e.data["delta"]["type"] == "signature_delta")
         );
         assert!(events.iter().any(|e| e.event == "content_block_stop"));
+    }
+
+    /// 流内上游异常：输出 Anthropic error 事件，之后不再有 message_delta / message_stop
+    #[test]
+    fn test_upstream_exception_mid_stream_emits_error_event() {
+        let mut ctx = reasoning_ctx();
+        let text: crate::kiro::model::events::AssistantResponseEvent =
+            serde_json::from_value(serde_json::json!({"content": "partial"})).unwrap();
+        let mut events = ctx.process_kiro_event(&Event::AssistantResponse(text));
+        events.extend(ctx.process_kiro_event(&Event::Exception {
+            exception_type: "serviceUnavailableError".to_string(),
+            message: r#"{"message":"busy","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#.to_string(),
+        }));
+        assert!(ctx.is_aborted());
+        let err = events
+            .iter()
+            .find(|e| e.event == "error")
+            .expect("error 事件");
+        assert_eq!(err.data["type"], "error");
+        assert_eq!(err.data["error"]["type"], "overloaded_error");
+        // 中止后不再追加其他错误
+        assert!(
+            ctx.process_kiro_event(&Event::Error {
+                error_code: "x".into(),
+                error_message: "y".into()
+            })
+            .is_empty()
+        );
+    }
+
+    /// ContentLengthExceededException 是输出超长，按 max_tokens 正常结束而非报错
+    #[test]
+    fn test_content_length_exceeded_is_not_an_error() {
+        let mut ctx = reasoning_ctx();
+        let events = ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "too long".to_string(),
+        });
+        assert!(events.is_empty());
+        assert!(!ctx.is_aborted());
+        let finals = ctx.generate_final_events();
+        let delta = finals.iter().find(|e| e.event == "message_delta").unwrap();
+        assert_eq!(delta.data["delta"]["stop_reason"], "max_tokens");
+    }
+
+    #[test]
+    fn test_classify_upstream_stream_error() {
+        let c = |k: &str, m: &str| classify_upstream_stream_error(k, m).0;
+        assert_eq!(
+            c(
+                "throttlingError",
+                r#"{"reason":"INSUFFICIENT_MODEL_CAPACITY"}"#
+            ),
+            "overloaded_error"
+        );
+        assert_eq!(
+            c(
+                "throttlingError",
+                r#"{"reason":"USER_REQUEST_RATE_EXCEEDED"}"#
+            ),
+            "rate_limit_error"
+        );
+        assert_eq!(
+            c("validationError", r#"{"reason":"INVALID_INPUT"}"#),
+            "invalid_request_error"
+        );
+        assert!(
+            classify_upstream_stream_error("validationError", "CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+                .1
+                .starts_with("prompt is too long")
+        );
+        assert_eq!(c("error", "internal"), "api_error");
+        assert_eq!(error_type_status("overloaded_error"), 529);
+    }
+
+    /// 流被截断时：discard 签名 + error 事件
+    #[test]
+    fn test_stream_interrupted_emits_error_event() {
+        let mut ctx = reasoning_ctx();
+        let mut events = feed_reasoning(&mut ctx, Some("think"), None);
+        events.extend(feed_reasoning(&mut ctx, None, Some("PART")));
+        events.extend(ctx.abort_stream_interrupted("connection reset"));
+        assert!(ctx.is_aborted());
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event == "error" && e.data["error"]["type"] == "api_error")
+        );
+        assert!(!events.iter().any(|e| e.event == "message_stop"));
+    }
+
+    /// 工具参数没收完（无 stop 帧）流就结束 → max_tokens，而不是 tool_use
+    #[test]
+    fn test_unfinished_tool_use_reports_max_tokens() {
+        let mut ctx = reasoning_ctx();
+        let partial: crate::kiro::model::events::ToolUseEvent = serde_json::from_value(
+            serde_json::json!({"name": "Write", "toolUseId": "t1", "input": "{\"file_path\": \"/a", "stop": false}),
+        )
+        .unwrap();
+        let mut events = ctx.process_kiro_event(&Event::ToolUse(partial));
+        events.extend(ctx.generate_final_events());
+        let delta = events.iter().find(|e| e.event == "message_delta").unwrap();
+        assert_eq!(delta.data["delta"]["stop_reason"], "max_tokens");
     }
 
     /// 只有推理、流即结束：结束时也要下发签名

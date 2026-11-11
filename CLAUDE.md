@@ -88,7 +88,10 @@ AppState {
 - 同优先级内先用仍有基础额度的凭据，全部进入超额后才用超额（超额另行计费，基础额度月底作废）；亲和绑定在超额凭据上的会话，若同优先级（或更高）还有基础额度凭据会改绑。跨月后对超额中凭据补查一次余额，避免整月误判
 - 请求失败时 `report_failure()` 触发故障转移到下一个可用凭据
 - 冷却分类管理：`FailureLimit` / `InsufficientBalance` / `ModelUnavailable` / `QuotaExceeded`
-- `MODEL_TEMPORARILY_UNAVAILABLE` / `INSUFFICIENT_MODEL_CAPACITY`（上游模型级过载 / 容量不足）与凭据无关：不禁用/不冷却凭据，单请求最多 4 次、1s→2s→4s 退避重试，仍失败返回 529 `overloaded_error` 交给客户端重试
+- `MODEL_TEMPORARILY_UNAVAILABLE` / `INSUFFICIENT_MODEL_CAPACITY` / `SERVICE_REQUEST_RATE_EXCEEDED` / "unexpectedly high load"（上游模型级过载 / 容量不足 / 服务级限流）与凭据无关：不禁用/不冷却凭据，单请求最多 4 次、1s→2s→4s 退避重试，仍失败返回 529 `overloaded_error` 交给客户端重试
+- 按上游错误 `reason` 分类（对齐官方客户端）：402 `MONTHLY_REQUEST_COUNT` / `OVERAGE_REQUEST_LIMIT_EXCEEDED` 与 429 `MONTHLY_REQUEST_COUNT` → 额度耗尽禁用到重置；429 `DAILY_REQUEST_COUNT` → 冷却到下一个 UTC 日；其余 429 → 凭据冷却（优先用 `x-amzn-kiro-ratelimit-retry-after` / `retryAfterMilliseconds` 提示）；403 `TEMPORARILY_SUSPENDED` / "temporarily paused new users" → 1 小时冷却后复查；402 `CONVERSATION_LIMIT_EXCEEDED` → 400 不换凭据
+- 返回客户端的错误一律用官方信封 `{"type":"error","error":{...}}` 与官方类型：上游 5xx/过载 → 529 `overloaded_error`，上游 429 → 429，额度耗尽 → 429 + `x-should-retry: false`，全池认证失败 → 500 `api_error`，未知模型 → 404 `not_found_error`，上下文超长以 "prompt is too long" 开头，请求体 JSON 错误 → 400、超限 → 413
+- 流中途上游报错（error 帧 / 异常 / 建模错误事件）、连接中断或末尾帧不完整：流式发 Anthropic `error` 事件并停止（不再 message_stop 冒充正常结束），非流式返回对应状态码；`ContentLengthExceededException` 与未收完的工具调用按 `max_tokens` 结束
 
 ## API 端点
 
