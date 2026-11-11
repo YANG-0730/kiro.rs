@@ -221,6 +221,31 @@ pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::R
 }
 
 /// 刷新 Token
+/// 刷新响应缺少 expiresIn 时采用的有效期（与官方客户端一致）
+const DEFAULT_TOKEN_TTL_SECS: i64 = 3600;
+
+/// 账户被临时停用（TEMPORARILY_SUSPENDED）后的复查间隔
+const ACCOUNT_SUSPENDED_RECHECK: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// 后台刷新拿到锁后，若 token 剩余时间超过该值，说明已被其他路径刷新过，跳过
+/// （与后台刷新器的默认提前量 15 分钟一致，不推迟正常的提前刷新）
+const BACKGROUND_REFRESH_SKIP_MINS: i64 = 15;
+
+/// 把刷新得到的 token 字段合并回当前凭据（只写 token 相关字段）
+///
+/// 刷新是网络调用，期间凭据可能被 Admin 修改（优先级 / 区域 / 端点 / 备注）或被
+/// 预取 profileArn；整条覆盖会把这些改动冲掉。
+fn merge_refreshed_tokens(target: &mut KiroCredentials, refreshed: &KiroCredentials) {
+    target.access_token = refreshed.access_token.clone();
+    if refreshed.refresh_token.is_some() {
+        target.refresh_token = refreshed.refresh_token.clone();
+    }
+    target.expires_at = refreshed.expires_at.clone();
+    if refreshed.profile_arn.is_some() {
+        target.profile_arn = refreshed.profile_arn.clone();
+    }
+}
+
 pub(crate) async fn refresh_token(
     credentials: &KiroCredentials,
     config: &Config,
@@ -333,7 +358,14 @@ async fn refresh_social_token(
         new_credentials.expires_at = Some(expires_at.to_rfc3339());
         tracing::info!(expires_in = %expires_in, "Social Token 刷新成功");
     } else {
-        tracing::info!("Social Token 刷新成功（无过期时间）");
+        // 响应没给 expiresIn：按官方客户端默认 3600s 处理。否则 expires_at 仍是旧的
+        // 过期时间，新 token（及可能已轮换的 refreshToken）会被判为无效而丢弃
+        let expires_at = Utc::now() + Duration::seconds(DEFAULT_TOKEN_TTL_SECS);
+        new_credentials.expires_at = Some(expires_at.to_rfc3339());
+        tracing::info!(
+            "Social Token 刷新成功（响应无过期时间，按 {}s 处理）",
+            DEFAULT_TOKEN_TTL_SECS
+        );
     }
 
     Ok(new_credentials)
@@ -426,7 +458,14 @@ async fn refresh_idc_token(
         new_credentials.expires_at = Some(expires_at.to_rfc3339());
         tracing::info!(expires_in = %expires_in, "IdC Token 刷新成功");
     } else {
-        tracing::info!("IdC Token 刷新成功（无过期时间）");
+        // 响应没给 expiresIn：按官方客户端默认 3600s 处理。否则 expires_at 仍是旧的
+        // 过期时间，新 token（及可能已轮换的 refreshToken）会被判为无效而丢弃
+        let expires_at = Utc::now() + Duration::seconds(DEFAULT_TOKEN_TTL_SECS);
+        new_credentials.expires_at = Some(expires_at.to_rfc3339());
+        tracing::info!(
+            "IdC Token 刷新成功（响应无过期时间，按 {}s 处理）",
+            DEFAULT_TOKEN_TTL_SECS
+        );
     }
 
     // OIDC 刷新响应不含 profileArn；cli 端点需要时由 ensure_profile_arn 经
@@ -683,7 +722,8 @@ pub enum DisableReason {
     RefreshFailureLimit,
     /// 认证失败（如 invalid_grant）
     AuthenticationFailed,
-    /// 账户被暂停
+    /// 账户被暂停（旧值：临时停用现改为冷却复查，不再写入；保留以兼容已持久化的数据）
+    #[allow(dead_code)]
     AccountSuspended,
     /// 余额不足
     #[allow(dead_code)]
@@ -2083,10 +2123,14 @@ impl MultiTokenManager {
                                     }
                                     entries.iter().any(|e| !e.disabled && e.id != id)
                                 };
+                                // 短冷却：让后续请求先用其他凭据，避免认证服务短暂抖动时
+                                // 连续几个请求都在同一凭据上刷新失败而把它禁用
+                                self.cooldown_manager
+                                    .set_cooldown(id, CooldownReason::TokenRefreshFailed);
                                 tracing::warn!(
                                     credential_id = id,
                                     has_available,
-                                    "凭据 Token 刷新失败: {}",
+                                    "凭据 Token 刷新失败（已短暂冷却）: {}",
                                     err
                                 );
                                 return Err(err);
@@ -2101,7 +2145,7 @@ impl MultiTokenManager {
                     {
                         let mut entries = self.entries.lock();
                         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.credentials = new_creds.clone();
+                            merge_refreshed_tokens(&mut entry.credentials, &new_creds);
                             // 更新哈希缓存
                             entry.refresh_token_hash = credential_secret_hash(&new_creds);
                         }
@@ -2542,17 +2586,20 @@ impl MultiTokenManager {
         self.affinity.remove_by_credential(id);
     }
 
-    /// 标记凭据为账户暂停（不会被自动恢复）
-    pub fn mark_account_suspended(&self, id: u64) {
-        let mut entries = self.entries.lock();
-        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-            entry.disabled = true;
-            entry.auto_heal_reason = None;
-            entry.disable_reason = Some(DisableReason::AccountSuspended);
-            tracing::warn!("凭据 #{} 已标记为账户暂停", id);
-        }
-        drop(entries);
+    /// 上游因"拒答过多"临时限制该账号（kirodotdev/Kiro #12310，按账号 + 模型生效）：
+    /// 冷却 1 小时并解除亲和绑定，避免后续请求继续被分到受限账号（不重试当前请求）
+    pub fn report_refusal_restriction(&self, id: u64) {
+        self.cooldown_manager.set_cooldown_with_duration(
+            id,
+            CooldownReason::AccountSuspended,
+            Some(ACCOUNT_SUSPENDED_RECHECK),
+        );
         self.affinity.remove_by_credential(id);
+        tracing::error!(
+            credential_id = id,
+            "凭据因拒答过多被上游临时限制，冷却 {} 分钟并解除亲和绑定",
+            ACCOUNT_SUSPENDED_RECHECK.as_secs() / 60
+        );
     }
 
     /// 标记凭据为余额不足（不会被自动恢复）
@@ -3224,6 +3271,10 @@ impl MultiTokenManager {
     /// 强制刷新指定凭据的 Token（Admin API）
     pub async fn force_refresh_token_for(&self, id: u64) -> anyhow::Result<()> {
         let config = self.config.read().clone();
+
+        // 持有刷新锁，避免与业务请求自动刷新并发；拿锁后再读凭据，
+        // 否则可能用到别人刚轮换掉的旧 refreshToken
+        let _guard = self.refresh_lock.lock().await;
         let credentials = {
             let entries = self.entries.lock();
             entries
@@ -3232,9 +3283,6 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
-
-        // 持有刷新锁，避免与业务请求自动刷新并发
-        let _guard = self.refresh_lock.lock().await;
 
         if credentials.is_api_key_credential() {
             anyhow::bail!("API Key 凭据无需刷新 Token");
@@ -3246,7 +3294,7 @@ impl MultiTokenManager {
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                entry.credentials = new_creds.clone();
+                merge_refreshed_tokens(&mut entry.credentials, &new_creds);
                 entry.refresh_failure_count = 0;
                 entry.refresh_token_hash = credential_secret_hash(&new_creds);
 
@@ -3313,7 +3361,7 @@ impl MultiTokenManager {
                     {
                         let mut entries = self.entries.lock();
                         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.credentials = new_creds.clone();
+                            merge_refreshed_tokens(&mut entry.credentials, &new_creds);
                             // 更新哈希缓存
                             entry.refresh_token_hash = credential_secret_hash(&new_creds);
                         }
@@ -3371,7 +3419,19 @@ impl MultiTokenManager {
                 if is_invalid_grant_error(&err) {
                     self.mark_authentication_failed(id);
                 } else if is_temporarily_suspended_error(&err) {
-                    self.mark_account_suspended(id);
+                    // "临时"停用：长冷却后自动复查（与官方客户端一致按临时状态处理），
+                    // 不再永久禁用到重启
+                    self.cooldown_manager.set_cooldown_with_duration(
+                        id,
+                        CooldownReason::AccountSuspended,
+                        Some(ACCOUNT_SUSPENDED_RECHECK),
+                    );
+                    self.affinity.remove_by_credential(id);
+                    tracing::warn!(
+                        credential_id = id,
+                        "凭据账户被上游临时停用，{} 分钟后复查",
+                        ACCOUNT_SUSPENDED_RECHECK.as_secs() / 60
+                    );
                 }
                 Err(err)
             }
@@ -3705,6 +3765,10 @@ impl MultiTokenManager {
     #[allow(dead_code)]
     pub async fn refresh_token_for_credential(&self, id: u64) -> anyhow::Result<RefreshResult> {
         let config = self.config.read().clone();
+
+        // 与业务请求路径共用刷新锁：Social 的 refreshToken 会轮换，并发刷新时后到的一方
+        // 会用已作废的旧 refreshToken 而 invalid_grant（随后凭据被永久禁用）
+        let _guard = self.refresh_lock.lock().await;
         let credentials = {
             let entries = self.entries.lock();
             entries
@@ -3714,6 +3778,15 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
+        // 拿到锁时别的路径可能已经刷新过了（新 token 剩余时间远超后台刷新窗口）
+        if !is_token_expired(&credentials)
+            && is_token_expiring_within(&credentials, BACKGROUND_REFRESH_SKIP_MINS) == Some(false)
+        {
+            let expires_at = credentials.expires_at.unwrap_or_default();
+            tracing::debug!("凭据 #{} Token 已被其他路径刷新，跳过", id);
+            return Ok(RefreshResult::success(id, expires_at));
+        }
+
         // 尝试刷新
         let proxy = self.proxy.read().clone();
         match refresh_token_with_id(&credentials, &config, proxy.as_ref(), id).await {
@@ -3722,7 +3795,7 @@ impl MultiTokenManager {
                 {
                     let mut entries = self.entries.lock();
                     if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                        entry.credentials = new_creds.clone();
+                        merge_refreshed_tokens(&mut entry.credentials, &new_creds);
                         // 更新哈希缓存
                         entry.refresh_token_hash =
                             new_creds.refresh_token.as_deref().map(sha256_hex);
@@ -3795,6 +3868,36 @@ impl Drop for MultiTokenManager {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_merge_refreshed_tokens_keeps_admin_edits() {
+        let mut current = KiroCredentials {
+            access_token: Some("old".into()),
+            refresh_token: Some("rt-old".into()),
+            expires_at: Some("2026-01-01T00:00:00Z".into()),
+            priority: 7,
+            endpoint: Some("cli3".into()),
+            profile_arn: Some("arn:current".into()),
+            ..Default::default()
+        };
+        // 刷新是基于刷新前快照做的：快照里的 priority/endpoint 是旧值
+        let refreshed = KiroCredentials {
+            access_token: Some("new".into()),
+            refresh_token: Some("rt-new".into()),
+            expires_at: Some("2026-12-01T00:00:00Z".into()),
+            priority: 0,
+            endpoint: None,
+            profile_arn: None,
+            ..Default::default()
+        };
+        merge_refreshed_tokens(&mut current, &refreshed);
+        assert_eq!(current.access_token.as_deref(), Some("new"));
+        assert_eq!(current.refresh_token.as_deref(), Some("rt-new"));
+        assert_eq!(current.expires_at.as_deref(), Some("2026-12-01T00:00:00Z"));
+        assert_eq!(current.priority, 7, "管理员改过的字段不能被刷新覆盖");
+        assert_eq!(current.endpoint.as_deref(), Some("cli3"));
+        assert_eq!(current.profile_arn.as_deref(), Some("arn:current"));
+    }
 
     #[test]
     fn test_token_manager_new() {

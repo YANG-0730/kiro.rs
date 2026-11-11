@@ -41,10 +41,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route("/credentials/balances/cached", get(get_cached_balances))
         .route("/credentials/import-token-json", post(import_token_json))
-        .route(
-            "/credentials/reset-rate-limit",
-            post(reset_rate_limit_all),
-        )
+        .route("/credentials/reset-rate-limit", post(reset_rate_limit_all))
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))

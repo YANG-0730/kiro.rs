@@ -96,8 +96,7 @@ pub async fn set_credential_label(
     Json(payload): Json<SetLabelRequest>,
 ) -> impl IntoResponse {
     match state.service.set_label(id, payload.label) {
-        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 备注已更新", id)))
-            .into_response(),
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 备注已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

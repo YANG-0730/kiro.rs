@@ -164,7 +164,9 @@ pub fn map_model(
 ) -> Option<String> {
     let normalized = normalize_model_name(model);
 
-    if let Some(reg) = registry {
+    // registry 为空（启动时模型列表拉取全部失败，后台每分钟重试中）时不拒绝所有请求，
+    // 退回 best effort 映射；上游若不认该模型会返回明确错误
+    if let Some(reg) = registry.filter(|r| !r.is_empty()) {
         return reg.resolve_client_model(&normalized);
     }
 
@@ -2251,6 +2253,16 @@ mod tests {
         assert_eq!(
             map_model("claude-opus-4.8", Some(&reg)).unwrap(),
             KIRO_MODEL_OPUS_4_8
+        );
+    }
+
+    #[test]
+    fn test_map_model_empty_registry_falls_back_to_best_effort() {
+        let empty = crate::kiro::model_registry::ModelRegistry::new();
+        assert!(empty.is_empty());
+        assert_eq!(
+            map_model("claude-opus-5-5", Some(&empty)).as_deref(),
+            Some("claude-opus-5.5")
         );
     }
 

@@ -183,22 +183,35 @@ async fn main() {
         .initialize_model_registry(&model_registry)
         .await;
     if model_init_count == 0 {
-        tracing::warn!("所有凭据模型列表拉取失败，/v1/models 将返回空列表，请求将无法通过模型校验");
+        tracing::warn!(
+            "所有凭据模型列表拉取失败：后台每分钟重试；在此之前 /v1/models 为空、模型按 best effort 映射"
+        );
     }
     // 将 registry 注入 token_manager，用于模型级凭据过滤（Phase 7）
     token_manager.set_model_registry(model_registry.clone());
 
-    // 启动模型列表后台刷新（每小时）
+    // 启动模型列表后台刷新：正常每小时一次；列表为空（启动时全部拉取失败）时每分钟重试，
+    // 避免一次网络抖动让模型列表空一个小时
     {
         let tm = token_manager.clone();
         let reg = model_registry.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-            interval.tick().await; // 跳过首次立即触发
+            const REFRESH_SECS: u64 = 3600;
+            const EMPTY_RETRY_SECS: u64 = 60;
+            let mut last_refresh = tokio::time::Instant::now();
             loop {
-                interval.tick().await;
-                tracing::info!("后台刷新模型列表...");
+                tokio::time::sleep(std::time::Duration::from_secs(EMPTY_RETRY_SECS)).await;
+                let due = last_refresh.elapsed().as_secs() >= REFRESH_SECS;
+                if !reg.is_empty() && !due {
+                    continue;
+                }
+                if reg.is_empty() {
+                    tracing::warn!("模型列表为空，重试拉取...");
+                } else {
+                    tracing::info!("后台刷新模型列表...");
+                }
                 tm.initialize_model_registry(&reg).await;
+                last_refresh = tokio::time::Instant::now();
             }
         });
     }

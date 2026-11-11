@@ -224,6 +224,11 @@ impl UsageLimitsResponse {
     /// 基础剩余额度低于 `threshold`，**且**没有可用的超额额度时，才视为耗尽。
     /// 开启超额且未达上限的账号即使基础余额为 0，也不算耗尽。
     pub fn is_exhausted(&self, threshold: f64) -> bool {
+        // 没有任何用量明细（组织 / 企业托管账号等）时无法判断额度，不能当作耗尽而禁用；
+        // 真正耗尽时上游会在对话请求上返回明确的额度错误
+        if self.usage_breakdown_list.is_empty() {
+            return false;
+        }
         let remaining = (self.usage_limit() - self.current_usage()).max(0.0);
         remaining < threshold && !self.has_available_overage()
     }
@@ -292,6 +297,13 @@ impl UsageLimitsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_empty_breakdown_is_not_exhausted() {
+        let resp: UsageLimitsResponse =
+            serde_json::from_str(r#"{"usageBreakdownList":[]}"#).unwrap();
+        assert!(!resp.is_exhausted(1.0));
+    }
 
     /// 构造一个模拟 getUsageLimits 响应的 JSON
     fn resp(json: serde_json::Value) -> UsageLimitsResponse {

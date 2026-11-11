@@ -87,6 +87,10 @@ AppState {
 - 凭据按 `priority` 字段排序，优先使用高优先级凭据
 - 同优先级内先用仍有基础额度的凭据，全部进入超额后才用超额（超额另行计费，基础额度月底作废）；亲和绑定在超额凭据上的会话，若同优先级（或更高）还有基础额度凭据会改绑。跨月后对超额中凭据补查一次余额，避免整月误判
 - 请求失败时 `report_failure()` 触发故障转移到下一个可用凭据
+- 冷却递增只针对"连续"触发：上次冷却结束超过 10 分钟再触发则从头计时（以前计数终身不清零，偶发 429 会让冷却永久停在 300s 上限）
+- 账户临时停用（TEMPORARILY_SUSPENDED，对话或余额接口返回）与"拒答过多被限制"（kirodotdev/Kiro #12310，200 + refusal 说明含 "excessive content refusals"）：凭据冷却 1 小时并解除亲和绑定，到期自动复查；不重试被拒的请求、不跨凭据重放拒答
+- Token 刷新：所有刷新路径（业务请求 / 后台 / 强制 / 余额）共用 `refresh_lock`，拿锁后重读凭据，写回时只合并 token 字段（避免冲掉 Admin 修改或并发轮换 refreshToken 导致 invalid_grant）；刷新失败短冷却；响应缺 `expiresIn` 按 3600s
+- 模型列表为空（启动时拉取全部失败）时后台每分钟重试，期间模型按 best effort 映射而不是拒绝所有请求；余额后台查询失败 5 分钟内不再重复发起；`usageBreakdownList` 为空不视为额度耗尽
 - 冷却分类管理：`FailureLimit` / `InsufficientBalance` / `ModelUnavailable` / `QuotaExceeded`
 - `MODEL_TEMPORARILY_UNAVAILABLE` / `INSUFFICIENT_MODEL_CAPACITY` / `SERVICE_REQUEST_RATE_EXCEEDED` / "unexpectedly high load"（上游模型级过载 / 容量不足 / 服务级限流）与凭据无关：不禁用/不冷却凭据，单请求最多 4 次、1s→2s→4s 退避重试，仍失败返回 529 `overloaded_error` 交给客户端重试
 - 按上游错误 `reason` 分类（对齐官方客户端）：402 `MONTHLY_REQUEST_COUNT` / `OVERAGE_REQUEST_LIMIT_EXCEEDED` 与 429 `MONTHLY_REQUEST_COUNT` → 额度耗尽禁用到重置；429 `DAILY_REQUEST_COUNT` → 冷却到下一个 UTC 日；其余 429 → 凭据冷却（优先用 `x-amzn-kiro-ratelimit-retry-after` / `retryAfterMilliseconds` 提示）；403 `TEMPORARILY_SUSPENDED` / "temporarily paused new users" → 1 小时冷却后复查；402 `CONVERSATION_LIMIT_EXCEEDED` → 400 不换凭据

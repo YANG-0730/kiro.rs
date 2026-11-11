@@ -50,6 +50,8 @@ const DEFAULT_RATE_LIMIT_COOLDOWN_SECS: u64 = 60;
 
 /// 429 冷却最大时长上限（避免异常 Retry-After 把单号挂死太久）
 const MAX_RATE_LIMIT_COOLDOWN_SECS: u64 = 300;
+/// 后台余额查询的最小重试间隔（失败后不会每个请求都再查一次）
+const BALANCE_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(300);
 /// 账户被临时停用时的冷却时长（到期后自动复查）
 const ACCOUNT_SUSPENDED_COOLDOWN: Duration = Duration::from_secs(3600);
 
@@ -72,6 +74,14 @@ pub struct KiroProvider {
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
     /// 默认端点名称
     default_endpoint: RwLock<String>,
+    /// 各凭据最近一次后台余额查询的发起时间（失败负缓存 + 并发去重）
+    balance_refresh_attempts: Mutex<HashMap<u64, std::time::Instant>>,
+}
+
+/// 是否为"拒答过多导致账号被临时限制"的上游说明（kirodotdev/Kiro #12310）
+pub fn is_refusal_restriction_text(text: &str) -> bool {
+    text.to_ascii_lowercase()
+        .contains("excessive content refusals")
 }
 
 /// 去掉 Kiro 请求体中所有历史 assistant 消息的 `reasoningContent`
@@ -161,6 +171,7 @@ impl KiroProvider {
             client_cache: Mutex::new(HashMap::new()),
             endpoints,
             default_endpoint: RwLock::new(default_endpoint),
+            balance_refresh_attempts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -233,7 +244,6 @@ impl KiroProvider {
     }
 
     /// 获取 token_manager 的引用
-    #[allow(dead_code)]
     pub fn token_manager(&self) -> &MultiTokenManager {
         &self.token_manager
     }
@@ -243,6 +253,19 @@ impl KiroProvider {
         // 检查缓存是否需要刷新
         if !self.token_manager.should_refresh_balance(id) {
             return;
+        }
+        // 失败负缓存 + 并发去重：查询失败不会更新缓存时间，没有这层限制时
+        // 之后每个成功请求都会再触发一次余额查询
+        {
+            let mut attempts = self.balance_refresh_attempts.lock();
+            let now = std::time::Instant::now();
+            if attempts
+                .get(&id)
+                .is_some_and(|last| now.duration_since(*last) < BALANCE_REFRESH_RETRY_INTERVAL)
+            {
+                return;
+            }
+            attempts.insert(id, now);
         }
         let tm = Arc::clone(&self.token_manager);
         tokio::spawn(async move {
@@ -1198,6 +1221,7 @@ impl KiroProvider {
     fn is_account_temporarily_unavailable(body: &str) -> bool {
         Self::upstream_reason(body).as_deref() == Some("TEMPORARILY_SUSPENDED")
             || body.contains("temporarily paused new")
+            || is_refusal_restriction_text(body)
     }
 
     fn clamp_rate_limit_cooldown(duration: Duration) -> Duration {

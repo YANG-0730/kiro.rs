@@ -1254,6 +1254,8 @@ async fn handle_stream_request(
     });
 
     // 创建流处理上下文
+    let restricted_credential = api_result.credential_id;
+    let restriction_provider = provider.clone();
     let mut ctx = StreamContext::new_with_thinking(
         context.model,
         context.input_tokens,
@@ -1261,7 +1263,12 @@ async fn handle_stream_request(
         context.thinking_enabled,
         context.tool_name_map,
     )
-    .with_context_window(context.context_window);
+    .with_context_window(context.context_window)
+    .with_restriction_reporter(Box::new(move || {
+        restriction_provider
+            .token_manager()
+            .report_refusal_restriction(restricted_credential)
+    }));
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1628,6 +1635,14 @@ async fn handle_non_stream_request(
                         Event::Metadata(metadata) => {
                             if let Some(details) = metadata.anthropic_stop_details() {
                                 let refusal = metadata.refusal();
+                                if refusal
+                                    .and_then(|r| r.explanation.as_deref())
+                                    .is_some_and(crate::kiro::provider::is_refusal_restriction_text)
+                                {
+                                    provider
+                                        .token_manager()
+                                        .report_refusal_restriction(credential_id);
+                                }
                                 tracing::warn!(
                                     model = %context.model,
                                     upstream_stop_reason = ?metadata.stop_reason,

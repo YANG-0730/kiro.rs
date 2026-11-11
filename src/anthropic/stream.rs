@@ -717,6 +717,8 @@ pub struct StreamContext {
     pub unusual_events: Vec<String>,
     /// 上游在流中途报错：已向客户端发出 `error` 事件，之后不再输出任何事件
     aborted: bool,
+    /// 发现账号因拒答过多被限制时的回调（冷却该凭据），最多调用一次
+    restriction_reporter: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl StreamContext {
@@ -754,7 +756,14 @@ impl StreamContext {
             strip_thinking_leading_newline: false,
             unusual_events: Vec::new(),
             aborted: false,
+            restriction_reporter: None,
         }
+    }
+
+    /// 设置"账号因拒答过多被限制"的回调（由调用方绑定凭据 ID）
+    pub fn with_restriction_reporter(mut self, reporter: Box<dyn FnOnce() + Send + Sync>) -> Self {
+        self.restriction_reporter = Some(reporter);
+        self
     }
 
     /// 设置上游模型上下文窗口大小（来自 registry 的 maxInputTokens）
@@ -886,6 +895,13 @@ impl StreamContext {
                         "上游拒答（refusal）"
                     );
                     self.record_unusual_event("refusal".to_string());
+                    if refusal
+                        .and_then(|r| r.explanation.as_deref())
+                        .is_some_and(crate::kiro::provider::is_refusal_restriction_text)
+                        && let Some(report) = self.restriction_reporter.take()
+                    {
+                        report();
+                    }
                     self.state_manager.set_refusal(stop_details);
                 } else {
                     tracing::debug!(upstream_stop_reason = ?metadata.stop_reason, "收到 metadataEvent");
@@ -3161,6 +3177,38 @@ mod tests {
         events.extend(ctx.generate_final_events());
         let delta = events.iter().find(|e| e.event == "message_delta").unwrap();
         assert_eq!(delta.data["delta"]["stop_reason"], "max_tokens");
+    }
+
+    /// 账号因拒答过多被限制：回调恰好触发一次；普通拒答不触发
+    #[test]
+    fn test_refusal_restriction_reporter() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let run = |explanation: &str| {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let c = calls.clone();
+            let mut ctx = reasoning_ctx().with_restriction_reporter(Box::new(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            }));
+            let metadata: crate::kiro::model::events::MetadataEvent = serde_json::from_value(
+                serde_json::json!({"stopReason": "CONTENT_FILTERED",
+                    "stopDetails": {"refusal": {"category": "REASONING_EXTRACTION", "explanation": explanation}}}),
+            )
+            .unwrap();
+            ctx.process_kiro_event(&Event::Metadata(metadata.clone()));
+            ctx.process_kiro_event(&Event::Metadata(metadata));
+            calls.load(Ordering::SeqCst)
+        };
+        assert_eq!(
+            run(
+                "Your access to this model has been temporarily restricted due to excessive content refusals."
+            ),
+            1
+        );
+        assert_eq!(
+            run("The selected model cannot continue this conversation."),
+            0
+        );
     }
 
     /// 只有推理、流即结束：结束时也要下发签名

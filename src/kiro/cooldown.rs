@@ -93,6 +93,9 @@ struct CooldownEntry {
     trigger_count: u32,
 }
 
+/// 上次冷却结束超过该时长后再次触发，冷却时长从头计算
+const TRIGGER_RESET_WINDOW: Duration = Duration::from_secs(600);
+
 /// 冷却管理器
 ///
 /// 管理所有凭据的冷却状态
@@ -160,8 +163,10 @@ impl CooldownManager {
                 trigger_count: 0,
             });
 
-        // 更新触发次数
-        if entry.reason == reason {
+        // 更新触发次数：只有"连续"触发才递增——上次冷却结束已超过重置窗口则从 1 重新计
+        // （以前计数终身不清零，偶发的 429 会让冷却逐步升到上限并一直停在上限）
+        let consecutive = now.saturating_duration_since(entry.expires_at) < TRIGGER_RESET_WINDOW;
+        if entry.reason == reason && consecutive {
             entry.trigger_count += 1;
         } else {
             entry.reason = reason;
@@ -288,6 +293,27 @@ pub struct CooldownInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_trigger_count_resets_after_quiet_period() {
+        let manager = CooldownManager::new();
+        manager.set_cooldown(1, CooldownReason::RateLimitExceeded);
+        manager.set_cooldown(1, CooldownReason::RateLimitExceeded);
+        assert_eq!(manager.entries.lock()[&1].trigger_count, 2);
+
+        // 模拟上次冷却早已结束（超过重置窗口）
+        {
+            let mut entries = manager.entries.lock();
+            let entry = entries.get_mut(&1).unwrap();
+            entry.expires_at = Instant::now() - TRIGGER_RESET_WINDOW - Duration::from_secs(1);
+        }
+        manager.set_cooldown(1, CooldownReason::RateLimitExceeded);
+        assert_eq!(
+            manager.entries.lock()[&1].trigger_count,
+            1,
+            "久未触发后应从头计数，而不是继续递增"
+        );
+    }
 
     #[test]
     fn test_cooldown_manager_new() {
