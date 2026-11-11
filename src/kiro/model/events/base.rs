@@ -5,6 +5,9 @@
 use crate::kiro::parser::error::{ParseError, ParseResult};
 use crate::kiro::parser::frame::Frame;
 
+/// 未知事件保留的 payload 预览长度（字符数）
+pub const UNKNOWN_PAYLOAD_PREVIEW_CHARS: usize = 300;
+
 /// 事件类型枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventType {
@@ -18,6 +21,8 @@ pub enum EventType {
     Metering,
     /// 上下文使用率事件
     ContextUsage,
+    /// 元数据事件（停止原因 / 拒答详情）
+    Metadata,
     /// 未知事件类型
     Unknown,
 }
@@ -31,6 +36,7 @@ impl EventType {
             "reasoningContentEvent" => Self::ReasoningContent,
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
+            "metadataEvent" => Self::Metadata,
             _ => Self::Unknown,
         }
     }
@@ -43,6 +49,7 @@ impl EventType {
             Self::ReasoningContent => "reasoningContentEvent",
             Self::Metering => "meteringEvent",
             Self::ContextUsage => "contextUsageEvent",
+            Self::Metadata => "metadataEvent",
             Self::Unknown => "unknown",
         }
     }
@@ -77,8 +84,15 @@ pub enum Event {
     Metering(super::MeteringEvent),
     /// 上下文使用率
     ContextUsage(super::ContextUsageEvent),
-    /// 未知事件 (保留原始帧数据)
-    Unknown {},
+    /// 元数据（停止原因 / 拒答详情）
+    Metadata(super::MetadataEvent),
+    /// 未知事件（保留事件类型与 payload 预览，便于排查上游新增事件）
+    Unknown {
+        /// 原始 `:event-type` 头
+        event_type: String,
+        /// payload 前 [`UNKNOWN_PAYLOAD_PREVIEW_CHARS`] 个字符
+        payload_preview: String,
+    },
     /// 服务端错误
     Error {
         /// 错误代码
@@ -134,7 +148,18 @@ impl Event {
                 let payload = super::ContextUsageEvent::from_frame(&frame)?;
                 Ok(Self::ContextUsage(payload))
             }
-            EventType::Unknown => Ok(Self::Unknown {}),
+            EventType::Metadata => {
+                let payload = super::MetadataEvent::from_frame(&frame)?;
+                Ok(Self::Metadata(payload))
+            }
+            EventType::Unknown => Ok(Self::Unknown {
+                event_type: event_type_str.to_string(),
+                payload_preview: frame
+                    .payload_as_str()
+                    .chars()
+                    .take(UNKNOWN_PAYLOAD_PREVIEW_CHARS)
+                    .collect(),
+            }),
         }
     }
 

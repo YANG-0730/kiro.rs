@@ -1537,6 +1537,14 @@ fn build_history(
         generate_thinking_prefix(req)
     };
 
+    // 历史 assistant 的 thinking 块是否以 `<thinking>` 标签内联回正文：
+    // - 老模型的思考本来就是正文里的 `<thinking>` 标签（由上面的前缀诱导），内联保持格式一致；
+    // - 结构化思考的新模型（reasoningContentEvent）不能内联：上游只认正文，模型会看到"自己"
+    //   把原始推理写进了可见回复，几轮之后触发安全分类器以 REASONING_EXTRACTION 拒答
+    //   （2026-11-11 实测 opus-5.5：内联 2 轮即拒，去掉后同场景 5 轮正常）。
+    //   上游历史消息没有承载推理的字段，只能省略（官方 API 也会丢弃读不了的 thinking 块）。
+    let inline_thinking = !structured_thinking;
+
     // 仅在开启分块写入策略且请求包含 Write/Edit 工具时注入
     let should_inject_chunked_policy =
         compression_config.chunked_write_policy && has_write_or_edit_tool(req);
@@ -1615,7 +1623,8 @@ fn build_history(
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
-                let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
+                let merged =
+                    merge_assistant_messages(&assistant_buffer, tool_name_map, inline_thinking)?;
                 history.push(Message::Assistant(merged));
                 assistant_buffer.clear();
             }
@@ -1641,7 +1650,7 @@ fn build_history(
 
     // 处理末尾累积的 assistant 消息
     if !assistant_buffer.is_empty() {
-        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
+        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map, inline_thinking)?;
         history.push(Message::Assistant(merged));
     }
 
@@ -1815,9 +1824,13 @@ fn merge_user_messages(
 }
 
 /// 转换 assistant 消息
+///
+/// `inline_thinking`：是否把 thinking 块以 `<thinking>` 标签内联进正文（仅老模型），
+/// 否则省略 thinking 块，见 `build_history` 中的说明。
 fn convert_assistant_message(
     msg: &super::types::Message,
     tool_name_map: &mut HashMap<String, String>,
+    inline_thinking: bool,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
     let mut thinking_content = String::new();
     let mut text_content = String::new();
@@ -1922,7 +1935,7 @@ fn convert_assistant_message(
 
     // 组合 thinking 和 text 内容
     // 格式: <thinking>思考内容</thinking>\n\ntext内容
-    let final_content = if !thinking_content.is_empty() {
+    let final_content = if !thinking_content.is_empty() && inline_thinking {
         if !text_content.is_empty() {
             format!(
                 "<thinking>{}</thinking>\n\n{}",
@@ -1931,6 +1944,9 @@ fn convert_assistant_message(
         } else {
             format!("<thinking>{}</thinking>", thinking_content)
         }
+    } else if !thinking_content.is_empty() && text_content.is_empty() && tool_uses.is_empty() {
+        // 只有 thinking 的回复省略思考后不留完全空的 assistant 消息
+        ".".to_string()
     } else {
         text_content
     };
@@ -1950,17 +1966,18 @@ fn convert_assistant_message(
 fn merge_assistant_messages(
     messages: &[&super::types::Message],
     tool_name_map: &mut HashMap<String, String>,
+    inline_thinking: bool,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
     assert!(!messages.is_empty());
     if messages.len() == 1 {
-        return convert_assistant_message(messages[0], tool_name_map);
+        return convert_assistant_message(messages[0], tool_name_map, inline_thinking);
     }
 
     let mut all_tool_uses: Vec<ToolUseEntry> = Vec::new();
     let mut content_parts: Vec<String> = Vec::new();
 
     for msg in messages {
-        let converted = convert_assistant_message(msg, tool_name_map)?;
+        let converted = convert_assistant_message(msg, tool_name_map, inline_thinking)?;
         let am = converted.assistant_response_message;
         if !am.content.trim().is_empty() {
             content_parts.push(am.content);
@@ -2233,6 +2250,97 @@ mod tests {
         assert!(!first_history_text("claude-opus-5-5").contains("<thinking_mode>"));
         // 老模型（无 schema）：仍需靠标签触发思考
         assert!(first_history_text("claude-sonnet-4-5").contains("<thinking_mode>adaptive"));
+    }
+
+    #[test]
+    fn test_history_thinking_inlined_only_for_models_without_structured_thinking() {
+        use crate::kiro::model::available_models::AvailableModelEntry;
+        let entry = |id: &str, schema: Option<serde_json::Value>| AvailableModelEntry {
+            model_id: id.to_string(),
+            model_name: None,
+            description: None,
+            rate_multiplier: None,
+            rate_unit: None,
+            token_limits: None,
+            supported_input_types: None,
+            prompt_caching: None,
+            model_provider: None,
+            status: None,
+            available_origins: None,
+            additional_model_request_fields_schema: schema,
+        };
+        let reg = crate::kiro::model_registry::ModelRegistry::new();
+        reg.update_credential(
+            1,
+            vec![
+                entry("claude-opus-5.5", Some(claude_schema())),
+                entry("claude-sonnet-4.5", None),
+            ],
+        );
+        // 返回 history 中各 assistant 消息的正文
+        let assistant_texts = |model: &str| {
+            let mut req = req_with_thinking(Some("adaptive"), Some("high"));
+            req.model = model.to_string();
+            req.messages = vec![
+                super::super::types::Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("look at docs.py"),
+                },
+                super::super::types::Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "thinking", "thinking": "I should grep it.", "signature": "sig"},
+                        {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "grep x"}}
+                    ]),
+                },
+                super::super::types::Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "no matches", "is_error": true}
+                    ]),
+                },
+                super::super::types::Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "thinking", "thinking": "Nothing found.", "signature": "sig"}
+                    ]),
+                },
+                super::super::types::Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("go on"),
+                },
+            ];
+            // 与生产一致关闭压缩（压缩层的 thinking 策略会另行处理历史思考）
+            let compression = CompressionConfig {
+                enabled: false,
+                ..CompressionConfig::default()
+            };
+            let r = convert_request(&req, &compression, Some(&reg)).unwrap();
+            r.conversation_state
+                .history
+                .iter()
+                .filter_map(|m| match m {
+                    Message::Assistant(a) => Some(a.assistant_response_message.content.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // 结构化思考的新模型：思考不进正文（否则触发 REASONING_EXTRACTION 拒答）；
+        // 只有 thinking 的回复留 "." 而不是空消息
+        let texts = assistant_texts("claude-opus-5-5");
+        assert!(texts.iter().all(|t| !t.contains("<thinking>")), "{texts:?}");
+        assert_eq!(texts, vec!["".to_string(), ".".to_string()]);
+
+        // 老模型：保持内联标签（history[0] 是注入思考前缀后的系统消息配对）
+        let texts = assistant_texts("claude-sonnet-4-5");
+        assert_eq!(
+            texts[1..],
+            [
+                "<thinking>I should grep it.</thinking>".to_string(),
+                "<thinking>Nothing found.</thinking>".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -2776,7 +2884,8 @@ mod tests {
             ]),
         };
 
-        let result = convert_assistant_message(&msg, &mut HashMap::new()).expect("应该成功转换");
+        let result =
+            convert_assistant_message(&msg, &mut HashMap::new(), true).expect("应该成功转换");
 
         assert!(
             result.assistant_response_message.content.is_empty(),
@@ -2806,7 +2915,8 @@ mod tests {
             ]),
         };
 
-        let result = convert_assistant_message(&msg, &mut HashMap::new()).expect("应该成功转换");
+        let result =
+            convert_assistant_message(&msg, &mut HashMap::new(), true).expect("应该成功转换");
 
         // 验证 content 使用原始文本（不是占位符）
         assert_eq!(
@@ -2849,7 +2959,8 @@ mod tests {
             ]),
         };
 
-        let result = convert_assistant_message(&msg, &mut HashMap::new()).expect("应该成功转换");
+        let result =
+            convert_assistant_message(&msg, &mut HashMap::new(), true).expect("应该成功转换");
         let content = &result.assistant_response_message.content;
 
         assert!(
@@ -2888,7 +2999,8 @@ mod tests {
             ]),
         };
 
-        let result = convert_assistant_message(&msg, &mut HashMap::new()).expect("应该成功转换");
+        let result =
+            convert_assistant_message(&msg, &mut HashMap::new(), true).expect("应该成功转换");
         let content = &result.assistant_response_message.content;
 
         // 控制字符被过滤，不应出现换行和 tab
@@ -4149,7 +4261,8 @@ mod tests {
         };
 
         let messages: Vec<&AnthropicMessage> = vec![&msg1, &msg2];
-        let result = merge_assistant_messages(&messages, &mut HashMap::new()).expect("合并应成功");
+        let result =
+            merge_assistant_messages(&messages, &mut HashMap::new(), true).expect("合并应成功");
 
         // 验证 thinking 和 text 内容被合并
         let content = &result.assistant_response_message.content;
@@ -4274,7 +4387,8 @@ mod tests {
         };
 
         let messages: Vec<&AnthropicMessage> = vec![&msg1, &msg2];
-        let result = merge_assistant_messages(&messages, &mut HashMap::new()).expect("合并应成功");
+        let result =
+            merge_assistant_messages(&messages, &mut HashMap::new(), true).expect("合并应成功");
 
         let tool_uses = result
             .assistant_response_message
@@ -4306,7 +4420,8 @@ mod tests {
         };
 
         let messages: Vec<&AnthropicMessage> = vec![&msg1, &msg2];
-        let result = merge_assistant_messages(&messages, &mut HashMap::new()).expect("合并应成功");
+        let result =
+            merge_assistant_messages(&messages, &mut HashMap::new(), true).expect("合并应成功");
 
         assert!(
             result.assistant_response_message.content.is_empty(),

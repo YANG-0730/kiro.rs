@@ -251,6 +251,8 @@ pub struct SseStateManager {
     next_block_index: i32,
     /// 当前 stop_reason
     stop_reason: Option<String>,
+    /// Anthropic `stop_details`（仅拒答时有值，随 message_delta 下发）
+    stop_details: Option<serde_json::Value>,
     /// 是否有工具调用
     has_tool_use: bool,
 }
@@ -270,6 +272,7 @@ impl SseStateManager {
             message_ended: false,
             next_block_index: 0,
             stop_reason: None,
+            stop_details: None,
             has_tool_use: false,
         }
     }
@@ -295,6 +298,7 @@ impl SseStateManager {
 
     /// stop_reason 优先级（索引越小优先级越高）
     const STOP_REASON_PRIORITY: &'static [&'static str] = &[
+        "refusal",
         "model_context_window_exceeded",
         "max_tokens",
         "tool_use",
@@ -311,7 +315,7 @@ impl SseStateManager {
 
     /// 设置 stop_reason（高优先级原因可覆盖低优先级原因）
     ///
-    /// 优先级从高到低：model_context_window_exceeded > max_tokens > tool_use > end_turn
+    /// 优先级从高到低：refusal > model_context_window_exceeded > max_tokens > tool_use > end_turn
     pub fn set_stop_reason(&mut self, reason: impl Into<String>) {
         let reason = reason.into();
         let new_priority = Self::stop_reason_priority(&reason);
@@ -324,11 +328,27 @@ impl SseStateManager {
         }
     }
 
+    /// 标记本次回复被拒答：stop_reason 置为 `refusal` 并记录 `stop_details`
+    pub fn set_refusal(&mut self, stop_details: serde_json::Value) {
+        self.set_stop_reason("refusal");
+        self.stop_details = Some(stop_details);
+    }
+
+    /// 是否已被拒答
+    pub fn is_refusal(&self) -> bool {
+        self.stop_reason.as_deref() == Some("refusal")
+    }
+
     /// 检查是否存在非 thinking 类型的内容块（如 text 或 tool_use）
     fn has_non_thinking_blocks(&self) -> bool {
         self.active_blocks
             .values()
             .any(|b| b.block_type != "thinking")
+    }
+
+    /// 是否产生过任何内容块（thinking / text / tool_use）
+    pub fn has_any_content_block(&self) -> bool {
+        !self.active_blocks.is_empty()
     }
 
     /// 获取最终的 stop_reason
@@ -480,14 +500,18 @@ impl SseStateManager {
                 usage_json["credit_unit"] = json!(metering.unit);
                 usage_json["credit_unit_plural"] = json!(metering.unit_plural);
             }
+            let mut delta = json!({
+                "stop_reason": self.get_stop_reason(),
+                "stop_sequence": null
+            });
+            if let Some(stop_details) = &self.stop_details {
+                delta["stop_details"] = stop_details.clone();
+            }
             events.push(SseEvent::new(
                 "message_delta",
                 json!({
                     "type": "message_delta",
-                    "delta": {
-                        "stop_reason": self.get_stop_reason(),
-                        "stop_sequence": null
-                    },
+                    "delta": delta,
                     "usage": usage_json
                 }),
             ));
@@ -548,6 +572,9 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// 本次响应中收到的非常规事件（未知事件类型 / error / exception），
+    /// 空响应时随告警一并输出，便于判断上游到底回了什么
+    pub unusual_events: Vec<String>,
 }
 
 impl StreamContext {
@@ -579,6 +606,7 @@ impl StreamContext {
             text_block_index: None,
             metering: None,
             strip_thinking_leading_newline: false,
+            unusual_events: Vec::new(),
         }
     }
 
@@ -684,6 +712,7 @@ impl StreamContext {
                 error_message,
             } => {
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                self.record_unusual_event(format!("error:{error_code}"));
                 Vec::new()
             }
             Event::Exception {
@@ -695,9 +724,46 @@ impl StreamContext {
                     self.state_manager.set_stop_reason("max_tokens");
                 }
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                self.record_unusual_event(format!("exception:{exception_type}"));
                 Vec::new()
             }
-            _ => Vec::new(),
+            Event::Metadata(metadata) => {
+                if let Some(stop_details) = metadata.anthropic_stop_details() {
+                    let refusal = metadata.refusal();
+                    tracing::warn!(
+                        model = %self.model,
+                        upstream_stop_reason = ?metadata.stop_reason,
+                        category = ?refusal.and_then(|r| r.category.as_deref()),
+                        explanation = ?refusal.and_then(|r| r.explanation.as_deref()),
+                        "上游拒答（refusal）"
+                    );
+                    self.record_unusual_event("refusal".to_string());
+                    self.state_manager.set_refusal(stop_details);
+                } else {
+                    tracing::debug!(upstream_stop_reason = ?metadata.stop_reason, "收到 metadataEvent");
+                }
+                Vec::new()
+            }
+            Event::Unknown {
+                event_type,
+                payload_preview,
+            } => {
+                tracing::debug!(
+                    event_type = %event_type,
+                    payload_preview = %payload_preview,
+                    "收到未识别的上游事件，已忽略"
+                );
+                self.record_unusual_event(event_type.clone());
+                Vec::new()
+            }
+        }
+    }
+
+    /// 记录非常规事件（去重、限量，只用于诊断日志）
+    fn record_unusual_event(&mut self, name: String) {
+        const MAX_UNUSUAL_EVENTS: usize = 16;
+        if self.unusual_events.len() < MAX_UNUSUAL_EVENTS && !self.unusual_events.contains(&name) {
+            self.unusual_events.push(name);
         }
     }
 
@@ -1236,6 +1302,7 @@ impl StreamContext {
         if self.thinking_enabled
             && self.thinking_block_index.is_some()
             && !self.state_manager.has_non_thinking_blocks()
+            && !self.state_manager.is_refusal()
         {
             self.state_manager.set_stop_reason("max_tokens");
             events.extend(self.create_text_delta_events(" "));
@@ -1273,6 +1340,18 @@ impl StreamContext {
             stream = true,
             "请求完成 credit 消耗"
         );
+
+        // 上游流正常结束却没有任何内容块：客户端（如 Claude Code）会把它当成"模型无话可说"
+        // 直接结束本轮。记录告警以便区分"模型主动空回复"与"上游静默失败"
+        if !self.state_manager.has_any_content_block() && !self.state_manager.is_refusal() {
+            tracing::warn!(
+                model = %self.model,
+                has_metering = self.metering.is_some(),
+                has_context_usage = self.context_input_tokens.is_some(),
+                unusual_events = ?self.unusual_events,
+                "上游返回空响应（无任何内容块）"
+            );
+        }
 
         // 生成最终事件
         events.extend(self.state_manager.generate_final_events(FinalUsage {
@@ -2365,6 +2444,64 @@ mod tests {
 
         let text = collect_text_content(&all);
         assert_eq!(text, "world", "text should be 'world', got: {:?}", text);
+    }
+
+    #[test]
+    fn test_upstream_refusal_maps_to_refusal_stop_reason() {
+        // 上游在流末尾用 metadataEvent 告知拒答（无任何内容块）：
+        // 必须下发 stop_reason=refusal + stop_details，否则客户端只看到空回复、静默结束
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5-5",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
+        let _initial_events = ctx.generate_initial_events();
+
+        let metadata: crate::kiro::model::events::MetadataEvent = serde_json::from_str(
+            r#"{"stopDetails":{"refusal":{"category":"REASONING_EXTRACTION","explanation":"cannot continue"}},"stopReason":"CONTENT_FILTERED"}"#,
+        )
+        .unwrap();
+        let mut all_events = ctx.process_kiro_event(&Event::Metadata(metadata));
+        all_events.extend(ctx.generate_final_events());
+
+        let message_delta = all_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta event");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "refusal");
+        assert_eq!(
+            message_delta.data["delta"]["stop_details"],
+            json!({"type": "refusal", "category": "reasoning_extraction", "explanation": "cannot continue"})
+        );
+        assert!(
+            !all_events.iter().any(|e| e.event == "content_block_start"),
+            "refusal should not fabricate content blocks"
+        );
+    }
+
+    #[test]
+    fn test_plain_metadata_keeps_normal_stop_reason() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5-5",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
+        let _initial_events = ctx.generate_initial_events();
+        let metadata: crate::kiro::model::events::MetadataEvent =
+            serde_json::from_str(r#"{"stopReason":"END_TURN"}"#).unwrap();
+        let mut all_events = ctx.process_assistant_response("hello");
+        all_events.extend(ctx.process_kiro_event(&Event::Metadata(metadata)));
+        all_events.extend(ctx.generate_final_events());
+        let message_delta = all_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta event");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "end_turn");
+        assert!(message_delta.data["delta"].get("stop_details").is_none());
     }
 
     #[test]

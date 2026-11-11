@@ -1263,12 +1263,15 @@ fn create_sse_stream(
                             let mut events = Vec::new();
                             for result in decoder.decode_iter() {
                                 match result {
-                                    Ok(frame) => {
-                                        if let Ok(event) = Event::from_frame(frame) {
+                                    Ok(frame) => match Event::from_frame(frame) {
+                                        Ok(event) => {
                                             let sse_events = ctx.process_kiro_event(&event);
                                             events.extend(sse_events);
                                         }
-                                    }
+                                        Err(e) => {
+                                            tracing::warn!("解析上游事件失败，已忽略: {}", e);
+                                        }
+                                    },
                                     Err(e) => {
                                         tracing::warn!("解码事件失败: {}", e);
                                     }
@@ -1386,6 +1389,10 @@ async fn handle_non_stream_request(
     let mut context_input_tokens: Option<i32> = None;
     // 从 meteringEvent 透传的 credit usage，仅用于最终 usage 字段
     let mut metering: Option<MeteringEvent> = None;
+    // 非常规事件（未知事件类型 / error / exception），空响应时随告警输出
+    let mut unusual_events: Vec<String> = Vec::new();
+    // 上游拒答时的 Anthropic stop_details（metadataEvent.stopDetails.refusal）
+    let mut stop_details: Option<serde_json::Value> = None;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -1394,8 +1401,8 @@ async fn handle_non_stream_request(
     for result in decoder.decode_iter() {
         match result {
             Ok(frame) => {
-                if let Ok(event) = Event::from_frame(frame) {
-                    match event {
+                match Event::from_frame(frame) {
+                    Ok(event) => match event {
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
                         }
@@ -1509,12 +1516,57 @@ async fn handle_non_stream_request(
                             );
                             metering = Some(event_metering);
                         }
-                        Event::Exception { exception_type, .. } => {
+                        Event::Exception {
+                            exception_type,
+                            message,
+                        } => {
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
                             }
+                            tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                            unusual_events.push(format!("exception:{exception_type}"));
                         }
-                        _ => {}
+                        Event::Error {
+                            error_code,
+                            error_message,
+                        } => {
+                            tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                            unusual_events.push(format!("error:{error_code}"));
+                        }
+                        Event::Metadata(metadata) => {
+                            if let Some(details) = metadata.anthropic_stop_details() {
+                                let refusal = metadata.refusal();
+                                tracing::warn!(
+                                    model = %context.model,
+                                    upstream_stop_reason = ?metadata.stop_reason,
+                                    category = ?refusal.and_then(|r| r.category.as_deref()),
+                                    explanation = ?refusal.and_then(|r| r.explanation.as_deref()),
+                                    "上游拒答（refusal）"
+                                );
+                                stop_details = Some(details);
+                            } else {
+                                tracing::debug!(
+                                    upstream_stop_reason = ?metadata.stop_reason,
+                                    "收到 metadataEvent"
+                                );
+                            }
+                        }
+                        Event::Unknown {
+                            event_type,
+                            payload_preview,
+                        } => {
+                            tracing::debug!(
+                                event_type = %event_type,
+                                payload_preview = %payload_preview,
+                                "收到未识别的上游事件，已忽略"
+                            );
+                            if !unusual_events.contains(&event_type) {
+                                unusual_events.push(event_type);
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("解析上游事件失败，已忽略: {}", e);
                     }
                 }
             }
@@ -1524,8 +1576,10 @@ async fn handle_non_stream_request(
         }
     }
 
-    // 确定 stop_reason
-    if has_tool_use && stop_reason == "end_turn" {
+    // 确定 stop_reason（拒答优先级最高）
+    if stop_details.is_some() {
+        stop_reason = "refusal".to_string();
+    } else if has_tool_use && stop_reason == "end_turn" {
         stop_reason = "tool_use".to_string();
     }
 
@@ -1559,6 +1613,16 @@ async fn handle_non_stream_request(
     }
 
     content.extend(tool_uses);
+
+    if content.is_empty() && stop_details.is_none() {
+        tracing::warn!(
+            model = %context.model,
+            has_metering = metering.is_some(),
+            has_context_usage = context_input_tokens.is_some(),
+            unusual_events = ?unusual_events,
+            "上游返回空响应（无任何内容块）"
+        );
+    }
 
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
@@ -1619,7 +1683,7 @@ async fn handle_non_stream_request(
             inject_cache_usage_fields(&mut usage, cache_context);
         }
 
-        json!({
+        let mut body = json!({
             "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             "type": "message",
             "role": "assistant",
@@ -1628,7 +1692,11 @@ async fn handle_non_stream_request(
             "stop_reason": stop_reason,
             "stop_sequence": null,
             "usage": usage
-        })
+        });
+        if let Some(stop_details) = stop_details {
+            body["stop_details"] = stop_details;
+        }
+        body
     };
 
     (StatusCode::OK, Json(response_body)).into_response()
