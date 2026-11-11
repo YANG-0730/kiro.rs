@@ -34,7 +34,6 @@ use crate::kiro::endpoint::{
     CLI_ENDPOINT_NAME, CLI3_ENDPOINT_NAME, Cli3Endpoint, CliEndpoint, IDE_ENDPOINT_NAME,
     IdeEndpoint, KiroEndpoint, RequestContext,
 };
-use crate::kiro::fingerprint::Fingerprint;
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
@@ -776,8 +775,6 @@ struct CredentialEntry {
     auto_heal_reason: Option<AutoHealReason>,
     /// 禁用原因（公共 API 展示用）
     disable_reason: Option<DisableReason>,
-    /// 设备指纹（每个凭据独立）
-    fingerprint: Fingerprint,
     /// API 调用成功次数
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -1121,16 +1118,6 @@ impl MultiTokenManager {
                         has_new_machine_ids = true;
                     }
                 }
-                // 为每个凭据生成独立的设备指纹
-                let fingerprint_seed = cred
-                    .refresh_token
-                    .as_deref()
-                    .or(cred.kiro_api_key.as_deref())
-                    .or(cred.machine_id.as_deref())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("credential-{}", id));
-                let fingerprint = Fingerprint::generate_from_seed(&fingerprint_seed);
-
                 let refresh_token_hash = credential_secret_hash(&cred);
                 CredentialEntry {
                     id,
@@ -1148,7 +1135,6 @@ impl MultiTokenManager {
                     } else {
                         None
                     },
-                    fingerprint,
                     success_count: 0,
                     last_used_at: None,
                     refresh_token_hash,
@@ -3537,16 +3523,6 @@ impl MultiTokenManager {
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
 
-        // 为新凭据生成设备指纹
-        let fingerprint_seed = validated_cred
-            .refresh_token
-            .as_deref()
-            .or(validated_cred.kiro_api_key.as_deref())
-            .or(validated_cred.machine_id.as_deref())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("credential-{}", new_id));
-        let fingerprint = Fingerprint::generate_from_seed(&fingerprint_seed);
-
         let entry_secret_hash = credential_secret_hash(&validated_cred);
 
         {
@@ -3559,7 +3535,6 @@ impl MultiTokenManager {
                 disabled: false,
                 auto_heal_reason: None,
                 disable_reason: None,
-                fingerprint,
                 success_count: 0,
                 last_used_at: None,
                 refresh_token_hash: entry_secret_hash,
@@ -3647,16 +3622,6 @@ impl MultiTokenManager {
     // ========================================================================
     // 增强特性：设备指纹、速率限制、冷却管理、后台刷新
     // ========================================================================
-
-    #[allow(dead_code)]
-    /// 获取凭据的设备指纹
-    pub fn get_fingerprint(&self, id: u64) -> Option<Fingerprint> {
-        let entries = self.entries.lock();
-        entries
-            .iter()
-            .find(|e| e.id == id)
-            .map(|e| e.fingerprint.clone())
-    }
 
     #[allow(dead_code)]
     /// 获取速率限制器引用

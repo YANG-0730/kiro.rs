@@ -1,7 +1,7 @@
 //! 输入压缩管道
 //!
 //! 在协议转换完成后、发送到上游前，对 `ConversationState` 执行多层压缩，
-//! 以规避 Kiro 上游请求体大小限制（实测约 5MiB 左右会触发 400）。
+//! 以规避 Kiro 上游请求体大小限制（2026-10-12 实测约 29~30MiB；总开关默认关闭）。
 //!
 //! 压缩顺序（低风险 → 高风险）：
 //! 1. 空白压缩
@@ -770,6 +770,14 @@ mod tests {
     use crate::kiro::model::requests::tool::{ToolResult, ToolUseEntry};
     use crate::model::config::CompressionConfig;
 
+    /// 压缩逻辑测试用：显式开启总开关（默认关闭）
+    fn enabled_config() -> CompressionConfig {
+        CompressionConfig {
+            enabled: true,
+            ..CompressionConfig::default()
+        }
+    }
+
     fn make_simple_state(history_content: Vec<(&str, &str)>, current: &str) -> ConversationState {
         let mut history = Vec::new();
         for (user, assistant) in history_content {
@@ -845,7 +853,7 @@ mod tests {
         );
         let config = CompressionConfig {
             thinking_strategy: "discard".to_string(),
-            ..Default::default()
+            ..enabled_config()
         };
         let stats = compress(&mut state, &config);
         assert!(stats.thinking_saved > 0);
@@ -867,7 +875,7 @@ mod tests {
         let mut state = make_simple_state(vec![("hi", &content)], "next");
         let config = CompressionConfig {
             thinking_strategy: "truncate".to_string(),
-            ..Default::default()
+            ..enabled_config()
         };
         let stats = compress(&mut state, &config);
         assert!(stats.thinking_saved > 0);
@@ -883,7 +891,7 @@ mod tests {
         let mut state = make_simple_state(vec![("hi", content)], "next");
         let config = CompressionConfig {
             thinking_strategy: "keep".to_string(),
-            ..Default::default()
+            ..enabled_config()
         };
         let stats = compress(&mut state, &config);
         assert_eq!(stats.thinking_saved, 0);
@@ -901,7 +909,7 @@ mod tests {
         let mut state = make_simple_state(vec![("   \n\n", "assistant")], "current");
         let config = CompressionConfig {
             whitespace_compression: true,
-            ..Default::default()
+            ..enabled_config()
         };
 
         let _stats = compress(&mut state, &config);
@@ -918,7 +926,7 @@ mod tests {
         let mut state = make_simple_state(vec![("user", "assistant")], "   ");
         let config = CompressionConfig {
             whitespace_compression: true,
-            ..Default::default()
+            ..enabled_config()
         };
 
         let _stats = compress(&mut state, &config);
@@ -933,7 +941,7 @@ mod tests {
         );
         let config = CompressionConfig {
             thinking_strategy: "discard".to_string(),
-            ..Default::default()
+            ..enabled_config()
         };
 
         let _stats = compress(&mut state, &config);
@@ -968,7 +976,7 @@ mod tests {
         let config = CompressionConfig {
             max_history_turns: 0,
             max_history_chars: 0,
-            ..Default::default()
+            ..enabled_config()
         };
 
         let _stats = compress(&mut state, &config);
@@ -997,7 +1005,7 @@ mod tests {
         let mut state = make_simple_state(vec![("user", "assistant")], "current");
         let config = CompressionConfig {
             whitespace_compression: true,
-            ..Default::default()
+            ..enabled_config()
         };
 
         let _stats = compress(&mut state, &config);
@@ -1016,7 +1024,7 @@ mod tests {
         let mut state = make_simple_state(vec![(".", ".")], ".");
         let config = CompressionConfig {
             whitespace_compression: true,
-            ..Default::default()
+            ..enabled_config()
         };
 
         let _stats = compress(&mut state, &config);
@@ -1035,7 +1043,7 @@ mod tests {
         let mut state = make_simple_state(vec![("user", "\n\n   \n")], "current");
         let config = CompressionConfig {
             whitespace_compression: true,
-            ..Default::default()
+            ..enabled_config()
         };
 
         let _stats = compress(&mut state, &config);
@@ -1110,7 +1118,7 @@ mod tests {
             tool_result_max_chars: 100,
             tool_result_head_lines: 3,
             tool_result_tail_lines: 2,
-            ..Default::default()
+            ..enabled_config()
         };
         let stats = compress(&mut state, &config);
         assert!(stats.tool_result_saved > 0);
@@ -1141,7 +1149,7 @@ mod tests {
 
         let config = CompressionConfig {
             tool_use_input_max_chars: 100,
-            ..Default::default()
+            ..enabled_config()
         };
         let stats = compress(&mut state, &config);
         assert!(stats.tool_use_input_saved > 0);
@@ -1171,7 +1179,7 @@ mod tests {
 
         let config = CompressionConfig {
             tool_use_input_max_chars: 100,
-            ..Default::default()
+            ..enabled_config()
         };
         let stats = compress(&mut state, &config);
         assert!(stats.tool_use_input_saved > 0);
@@ -1213,7 +1221,7 @@ mod tests {
 
         let config = CompressionConfig {
             tool_use_input_max_chars: 100,
-            ..Default::default()
+            ..enabled_config()
         };
         let stats = compress(&mut state, &config);
         assert_eq!(stats.tool_use_input_saved, 0);
@@ -1239,7 +1247,7 @@ mod tests {
 
         let config = CompressionConfig {
             max_history_turns: 2,
-            ..Default::default()
+            ..enabled_config()
         };
         let stats = compress(&mut state, &config);
         assert!(stats.history_turns_removed > 0);
@@ -1299,7 +1307,7 @@ mod tests {
         let config = CompressionConfig {
             max_history_turns: 1,
             max_history_chars: 0,
-            ..Default::default()
+            ..enabled_config()
         };
 
         let _stats = compress(&mut state, &config);
@@ -1326,7 +1334,7 @@ mod tests {
 
         let config = CompressionConfig {
             enabled: false,
-            ..Default::default()
+            ..enabled_config()
         };
         let stats = compress(&mut state, &config);
         assert_eq!(stats.total_saved(), 0);
@@ -1412,7 +1420,6 @@ mod tests {
             tool_use_id: "t1".to_string(),
             content: vec![map],
             status: Some("success".to_string()),
-            is_error: false,
         };
 
         // 需要对应的 tool_use，否则会被 repair_tool_pairing_pass 移除
@@ -1433,7 +1440,7 @@ mod tests {
             )))
             .with_history(vec![assistant_msg, user_msg]);
 
-        let config = CompressionConfig::default();
+        let config = enabled_config();
         let _stats = compress(&mut state, &config);
 
         if let Message::User(u) = &state.history[1] {
@@ -1460,7 +1467,6 @@ mod tests {
             tool_use_id: "t2".to_string(),
             content: vec![map],
             status: Some("success".to_string()),
-            is_error: false,
         };
 
         let tool_use = ToolUseEntry::new("t2", "write");
@@ -1475,7 +1481,7 @@ mod tests {
             .with_current_message(CurrentMessage::new(current))
             .with_history(vec![assistant_msg]);
 
-        let config = CompressionConfig::default();
+        let config = enabled_config();
         let _stats = compress(&mut state, &config);
 
         let text = state
@@ -1502,7 +1508,6 @@ mod tests {
             tool_use_id: "t3".to_string(),
             content: vec![map],
             status: Some("success".to_string()),
-            is_error: false,
         };
 
         let tool_use = ToolUseEntry::new("t3", "search");
@@ -1523,7 +1528,7 @@ mod tests {
             )))
             .with_history(vec![assistant_msg, user_msg]);
 
-        let config = CompressionConfig::default();
+        let config = enabled_config();
         let _stats = compress(&mut state, &config);
 
         if let Message::User(u) = &state.history[1] {
@@ -1555,7 +1560,6 @@ mod tests {
             tool_use_id: "t5".to_string(),
             content: vec![empty_map, nonempty_map],
             status: Some("success".to_string()),
-            is_error: false,
         };
 
         let tool_use = ToolUseEntry::new("t5", "echo");
@@ -1570,7 +1574,7 @@ mod tests {
             .with_current_message(CurrentMessage::new(current))
             .with_history(vec![assistant_msg]);
 
-        let config = CompressionConfig::default();
+        let config = enabled_config();
         let _stats = compress(&mut state, &config);
 
         let content = &state
@@ -1596,7 +1600,6 @@ mod tests {
             tool_use_id: "t4".to_string(),
             content: vec![map],
             status: Some("success".to_string()),
-            is_error: false,
         };
 
         let tool_use = ToolUseEntry::new("t4", "echo");
@@ -1617,7 +1620,7 @@ mod tests {
             )))
             .with_history(vec![assistant_msg, user_msg]);
 
-        let config = CompressionConfig::default();
+        let config = enabled_config();
         let _stats = compress(&mut state, &config);
 
         if let Message::User(u) = &state.history[1] {

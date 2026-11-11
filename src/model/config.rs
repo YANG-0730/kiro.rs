@@ -255,12 +255,13 @@ fn default_max_request_body_bytes() -> usize {
 /// 输入压缩配置
 ///
 /// 控制请求体在协议转换后、发送到上游前的多层压缩策略。
-/// 所有阈值均可通过配置文件调整，默认开启。
+/// 所有阈值均可通过配置文件调整。总开关默认关闭：压缩是有损的（截断工具结果 /
+/// 历史等），实测上游请求体上限约 29MiB，绝大多数请求无需压缩。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompressionConfig {
-    /// 总开关，默认 true
-    #[serde(default = "default_true")]
+    /// 总开关，默认 false（开启后每个请求都会按各阈值压缩）
+    #[serde(default)]
     pub enabled: bool,
     /// 空白压缩（连续空行、行尾空格），默认 true
     #[serde(default = "default_true")]
@@ -321,7 +322,7 @@ pub struct CompressionConfig {
 impl Default for CompressionConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             whitespace_compression: true,
             thinking_strategy: default_thinking_strategy(),
             tool_result_max_chars: default_8000(),

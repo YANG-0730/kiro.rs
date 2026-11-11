@@ -55,9 +55,7 @@ impl InputSchema {
     }
 }
 
-/// 工具执行结果
-///
-/// 用于返回工具执行的结果
+/// 工具执行结果（上游 schema：toolUseId / content / status，错误由 `status: "error"` 表达）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolResult {
@@ -68,13 +66,6 @@ pub struct ToolResult {
     /// 执行状态（"success" 或 "error"）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
-    /// 是否为错误
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub is_error: bool,
-}
-
-fn is_false(b: &bool) -> bool {
-    !*b
 }
 
 impl ToolResult {
@@ -90,7 +81,6 @@ impl ToolResult {
             tool_use_id: tool_use_id.into(),
             content: vec![map],
             status: Some("success".to_string()),
-            is_error: false,
         }
     }
 
@@ -106,7 +96,6 @@ impl ToolResult {
             tool_use_id: tool_use_id.into(),
             content: vec![map],
             status: Some("error".to_string()),
-            is_error: true,
         }
     }
 }
@@ -150,7 +139,6 @@ mod tests {
     fn test_tool_result_success() {
         let result = ToolResult::success("tool-123", "Operation completed");
 
-        assert!(!result.is_error);
         assert_eq!(result.status, Some("success".to_string()));
     }
 
@@ -158,7 +146,6 @@ mod tests {
     fn test_tool_result_error() {
         let result = ToolResult::error("tool-456", "File not found");
 
-        assert!(result.is_error);
         assert_eq!(result.status, Some("error".to_string()));
     }
 
@@ -169,8 +156,10 @@ mod tests {
 
         assert!(json.contains("\"toolUseId\":\"tool-789\""));
         assert!(json.contains("\"status\":\"success\""));
-        // is_error = false 应该被跳过
+        // 上游 schema 只有 toolUseId / content / status，错误由 status 表达
         assert!(!json.contains("isError"));
+        let err = serde_json::to_string(&ToolResult::error("t", "x")).unwrap();
+        assert!(err.contains("\"status\":\"error\"") && !err.contains("isError"));
     }
 
     #[test]

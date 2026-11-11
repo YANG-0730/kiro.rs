@@ -1856,7 +1856,7 @@ pub async fn count_tokens(
         "Received request"
     );
 
-    let total_tokens = token::count_all_tokens(
+    let total_tokens = token::count_all_tokens_for_endpoint(
         payload.model.clone(),
         payload.system.clone(),
         payload.messages.clone(),

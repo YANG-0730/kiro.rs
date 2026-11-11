@@ -111,10 +111,23 @@ pub fn count_tokens(text: &str) -> u64 {
     tokens.round() as u64
 }
 
-/// 估算请求的输入 tokens
+/// 估算请求的输入 tokens（本地计算）
 ///
-/// 优先调用远程 API，失败时回退到本地计算
+/// `/v1/messages` 用它做本地估算（最终 usage 以上游 contextUsage 为准），不调用远程 API，
+/// 避免每个对话请求都同步阻塞在外部服务上。
 pub(crate) fn count_all_tokens(
+    model: String,
+    system: Option<Vec<SystemMessage>>,
+    messages: Vec<Message>,
+    tools: Option<Vec<Tool>>,
+) -> u64 {
+    let _ = model;
+    count_all_tokens_local(system, messages, tools)
+}
+
+/// `/v1/messages/count_tokens` 端点用：配置了 `countTokensApiUrl` 时优先调用远程 API，
+/// 失败时回退本地计算
+pub(crate) fn count_all_tokens_for_endpoint(
     model: String,
     system: Option<Vec<SystemMessage>>,
     messages: Vec<Message>,
@@ -156,7 +169,8 @@ async fn call_remote_count_tokens(
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     let api_url = config.api_url.as_ref().unwrap();
     let current_proxy = get_current_proxy();
-    let client = build_client(current_proxy.as_ref(), 300, config.tls_backend)?;
+    // count_tokens 应很快返回；超时过长会拖住 /count_tokens 请求
+    let client = build_client(current_proxy.as_ref(), 10, config.tls_backend)?;
 
     // 构建请求体
     let request = CountTokensRequest {
@@ -178,9 +192,10 @@ async fn call_remote_count_tokens(
         }
     }
 
-    // 发送请求
+    // 发送请求（官方 API 要求 anthropic-version 头，缺失会被拒绝）
     let response = req_builder
         .header("Content-Type", "application/json")
+        .header("anthropic-version", "2023-06-01")
         .json(&request)
         .send()
         .await?;

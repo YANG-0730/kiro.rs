@@ -18,7 +18,7 @@ const CLI_STREAMING_API_VERSION: &str = "0.1.14474";
 const CLI_RUNTIME_API_VERSION: &str = "0.1.14474";
 const CLI_RUST_SDK_VERSION: &str = "1.3.14";
 const CLI_RUST_VERSION: &str = "1.92.0";
-// 2.x 最新版。appVersion-3.x 会被判为不支持（V3 客户端另有标识，未模拟），
+// 2.x 最新版。appVersion-3.x 套在 Rust CLI 的 UA 上会被判为不支持（3.x 见 cli3 端点），
 // 2027-01-15 起上游将拒绝 ≤ 2.5.0。
 const CLI_APP_VERSION: &str = "2.37.1";
 

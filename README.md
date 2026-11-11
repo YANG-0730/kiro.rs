@@ -143,7 +143,7 @@ curl http://127.0.0.1:8990/v1/messages \
   -H "Content-Type: application/json" \
   -H "x-api-key: sk-kiro-rs-qazWSXedcRFV123456" \
   -d '{
-    "model": "claude-sonnet-4-20250514",
+    "model": "claude-opus-5-5",
     "max_tokens": 1024,
     "stream": true,
     "messages": [
@@ -171,13 +171,13 @@ docker-compose up
 | `host` | string | `127.0.0.1` | 服务监听地址 |
 | `port` | number | `8080` | 服务监听端口 |
 | `apiKey` | string | - | 自定义 API Key（用于客户端认证，必配） |
-| `region` | string | `us-east-1` | AWS 区域 |
-| `authRegion` | string | - | Auth Region（用于 Token 刷新），未配置时回退到 region |
+| `region` | string | `us-east-1` | AWS 区域（Token 刷新与 API 请求的默认区域） |
 | `apiRegion` | string | - | API Region（用于 API 请求），未配置时回退到 region |
-| `kiroVersion` | string | `0.10.0` | Kiro 版本号 |
+| `defaultEndpoint` | string | `cli` | 默认上游端点：`cli`（Kiro CLI 2.x 协议）或 `cli3`（Kiro CLI 3.x / KiroRuntimeService），可被凭据级 `endpoint` 覆盖；`ide` 已下线，旧配置会自动改为 `cli` |
+| `kiroVersion` | string | `0.11.107` | 仅用于 Social 凭据刷新 Token 时的 UA |
 | `machineId` | string | - | 自定义机器码（64位十六进制），不定义则自动生成 |
-| `systemVersion` | string | 随机 | 系统版本标识 |
-| `nodeVersion` | string | `22.21.1` | Node.js 版本标识 |
+| `systemVersion` | string | 随机 | 系统版本标识（cli3 端点固定上报 linux，不使用该值） |
+| `nodeVersion` | string | `22.22.0` | Node.js 版本标识（cli3 端点 UA 使用） |
 | `tlsBackend` | string | `rustls` | TLS 后端：`rustls` 或 `native-tls` |
 | `countTokensApiUrl` | string | - | 外部 count_tokens API 地址 |
 | `countTokensApiKey` | string | - | 外部 count_tokens API 密钥 |
@@ -186,7 +186,12 @@ docker-compose up
 | `proxyUsername` | string | - | 代理用户名 |
 | `proxyPassword` | string | - | 代理密码 |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
-| `credentialRpm` | number | - | 单凭据目标 RPM（每分钟请求数），用于凭据级节流/分流；`0` 或未配置表示使用内置默认策略 |
+| `credentialRpm` | number | - | 单凭据请求频率：留空 = 内置默认节流（同一凭据两次请求间隔 1~2 秒，期间优先分流到其他凭据）；`0` = 不限；`n` = 间隔固定为 `60000/n` 毫秒 |
+| `credentialDailyMax` | number | - | 单凭据每日请求上限：**留空 = 默认 500 次/天**；`0` = 不限；`n` = 上限 n |
+| `credentialDailyWindowSeconds` | number | `86400` | 每日计数窗口（秒） |
+| `rateLimitCooldownSecs` | number | - | 上游 429 时凭据冷却时长：留空 = 默认策略（60s 起递增，上限 300s，优先采用上游提示）；`0` = 不冷却仅切换；`n` = 固定 n 秒 |
+| `compression.enabled` | boolean | `false` | 输入压缩总开关（有损：截断工具结果 / 历史等）；上游请求体上限约 29MiB，一般无需开启 |
+| `compression.maxRequestBodyBytes` | number | `30408704` 附近（29MiB） | 发往上游的请求体上限，超出本地直接返回 413 `request_too_large` |
 | `promptCacheTtlSeconds` | number | `300` | 本地 Prompt Cache TTL（秒） |
 | `promptCacheAccountingEnabled` | boolean | `true` | 是否启用本地 Prompt Cache usage 记账；关闭后不再输出或扣减 cache token |
 
@@ -199,11 +204,8 @@ docker-compose up
    "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
    "region": "us-east-1",
    "tlsBackend": "rustls",
-   "kiroVersion": "0.10.0",
+   "defaultEndpoint": "cli3",
    "machineId": "64位十六进制机器码",
-   "systemVersion": "darwin#24.6.0",
-   "nodeVersion": "22.21.1",
-   "authRegion": "us-east-1",
    "apiRegion": "us-east-1",
    "countTokensApiUrl": "https://api.example.com/v1/messages/count_tokens",
    "countTokensApiKey": "sk-your-count-tokens-api-key",
@@ -212,7 +214,7 @@ docker-compose up
    "proxyUsername": "user",
    "proxyPassword": "pass",
    "adminApiKey": "sk-admin-your-secret-key",
-   "credentialRpm": 5,
+   "credentialDailyMax": 0,
    "promptCacheTtlSeconds": 300,
    "promptCacheAccountingEnabled": true
 }
@@ -235,9 +237,9 @@ docker-compose up
 | `clientId`     | string | IdC 登录的客户端 ID（IdC 认证必填）                     |
 | `clientSecret` | string | IdC 登录的客户端密钥（IdC 认证必填）                      |
 | `priority`     | number | 凭据优先级，数字越小越优先，默认为 0                         |
-| `region`       | string | 凭据级 Auth Region, 兼容字段                       |
-| `authRegion`   | string | 凭据级 Auth Region，用于 Token 刷新, 未配置时回退到 region |
+| `region`       | string | 凭据级区域：Token 刷新所用区域，也是 API 区域的回退值        |
 | `apiRegion`    | string | 凭据级 API Region，用于 API 请求                    |
+| `endpoint`     | string | 凭据级上游端点（`cli` / `cli3`），覆盖 `defaultEndpoint`     |
 | `machineId`    | string | 凭据级机器码（64位十六进制）                             |
 | `email`        | string | 用户邮箱（可选，从 API 获取）                           |
 | `proxyUrl`     | string | 凭据级代理 URL（可选，特殊值 `direct` 表示不使用代理）       |
@@ -296,7 +298,7 @@ docker-compose up
 
 多凭据特性：
 - 按 `priority` 字段排序，数字越小优先级越高（默认为 0）
-- 单凭据最多重试 3 次，单请求最多重试 9 次
+- 单凭据最多重试 2 次，单请求最多重试 3 次（上游模型过载时单请求最多 4 次退避重试）
 - 自动故障转移到下一个可用凭据
 - 多凭据格式下 Token 刷新后自动回写到源文件
 
@@ -305,10 +307,10 @@ docker-compose up
 支持多级 Region 配置，分别控制 Token 刷新和 API 请求使用的区域。
 
 **Auth Region**（Token 刷新）优先级：
-`凭据.authRegion` > `凭据.region` > `config.authRegion` > `config.region`
+`凭据.region` > `config.region`
 
 **API Region**（API 请求）优先级：
-`凭据.apiRegion` > `config.apiRegion` > `config.region`
+`凭据.apiRegion` > `profileArn 中的区域` > `凭据.region` > `config.apiRegion` > `config.region`
 
 ### 代理配置
 
@@ -379,16 +381,14 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 ### Thinking 模式
 
-支持 Claude 的 extended thinking 功能：
+支持 Claude 的 adaptive thinking 与 effort（经上游 `additionalModelRequestFields` 生效；新模型的思考以结构化 thinking 块返回，签名原样回传）：
 
 ```json
 {
-  "model": "claude-sonnet-4-20250514",
-  "max_tokens": 16000,
-  "thinking": {
-    "type": "enabled",
-    "budget_tokens": 10000
-  },
+  "model": "claude-opus-5-5",
+  "max_tokens": 32000,
+  "thinking": { "type": "adaptive", "display": "summarized" },
+  "output_config": { "effort": "high" },
   "messages": [...]
 }
 ```
@@ -399,7 +399,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 ```json
 {
-  "model": "claude-sonnet-4-20250514",
+  "model": "claude-opus-5-5",
   "max_tokens": 1024,
   "tools": [
     {
@@ -420,13 +420,8 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 ## 模型映射
 
-| Anthropic 模型 | Kiro 模型 |
-|----------------|-----------|
-| `*sonnet*`（含 4-6/4.6） | `claude-sonnet-4.6` |
-| `*sonnet*`（其他） | `claude-sonnet-4.5` |
-| `*opus*`（含 4-5/4.5） | `claude-opus-4.5` |
-| `*opus*`（其他） | `claude-opus-4.6` |
-| `*haiku*` | `claude-haiku-4.5` |
+模型列表由上游 `ListAvailableModels` 动态拉取（启动时 + 每小时；拉取失败时每分钟重试），`GET /v1/models` 返回的即为当前可用模型。
+客户端使用 Anthropic 风格的模型名（如 `claude-opus-5-5`），代理映射为上游 ID（如 `claude-opus-5.5`）；不在列表中的模型返回 404 `not_found_error`。
 
 ## Admin（可选）
 
@@ -449,7 +444,8 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 1. **凭证安全**: 请妥善保管 `credentials.json` 文件，不要提交到版本控制
 2. **Token 刷新**: 服务会自动刷新过期的 Token，无需手动干预
-3. **WebSearch 工具**: 只要 `tools` 中包含 `web_search`（按 name 或 type 判断），就走内置 WebSearch 处理逻辑
+3. **WebSearch 工具**: 仅当请求明确触发 WebSearch（`tool_choice` 强制 / 只提供 `web_search` 一个工具 / 消息前缀匹配）时走内置 WebSearch；否则从 `tools` 中剔除 `web_search` 后转发上游
+4. **默认限流**: 未配置 `credentialDailyMax` 时每个凭据每天最多 500 次请求，用量大时请设为 `0`（不限）或更大值
 
 ## 项目结构
 
@@ -459,8 +455,6 @@ kiro-rs/
 │   ├── main.rs                 # 程序入口
 │   ├── http_client.rs          # HTTP 客户端构建
 │   ├── token.rs                # Token 计算模块
-│   ├── debug.rs                # 调试工具
-│   ├── test.rs                 # 测试
 │   ├── model/                  # 配置和参数模型
 │   │   ├── config.rs           # 应用配置
 │   │   └── arg.rs              # 命令行参数

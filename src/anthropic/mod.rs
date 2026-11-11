@@ -12,7 +12,7 @@
 //! ```rust,ignore
 //! use kiro_rs::anthropic;
 //!
-//! let app = anthropic::create_router("your-api-key");
+//! let app = anthropic::create_router_with_provider(/* AppState 所需参数，见 main.rs */);
 //! let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
 //! axum::serve(listener, app).await?;
 //! ```

@@ -116,15 +116,6 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
-fn non_empty_content_or_space(content: String, has_non_text_payload: bool) -> String {
-    // 尽量保留真实结构，不在早期转换阶段为非文本载荷主动补 "."。
-    // 含非文本载荷时保留原始文本，最终是否需要兜底由调用方决定。
-    if has_non_text_payload {
-        return content;
-    }
-    content
-}
-
 /// 统计单个消息内容中的图片数量
 fn count_images_in_content(content: &serde_json::Value) -> usize {
     match content {
@@ -632,10 +623,7 @@ pub fn convert_request(
 
     // 12. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
-    let content = non_empty_content_or_space(
-        text_content,
-        !images.is_empty() || has_tool_results || !kiro_documents.is_empty(),
-    );
+    let content = text_content;
     // current_message 是请求主体，必须保留；若文本为空且无非文本载荷，最终兜底
     let content = if content.trim().is_empty() && images.is_empty() && !has_tool_results {
         tracing::warn!("currentMessage content 为空，已使用占位符修复");
@@ -817,13 +805,11 @@ fn process_message_content(
                                 }
                                 let is_error = block.is_error.unwrap_or(false);
 
-                                let mut result = if is_error {
+                                let result = if is_error {
                                     ToolResult::error(&tool_use_id, result_content)
                                 } else {
                                     ToolResult::success(&tool_use_id, result_content)
                                 };
-                                result.status =
-                                    Some(if is_error { "error" } else { "success" }.to_string());
 
                                 tool_results.push(result);
                             }
@@ -2001,10 +1987,7 @@ fn merge_user_messages(
     // 文本文档内联、超额或不支持的来源留占位说明
     let mut joined = content_parts.join("\n");
     let history_documents = attach_documents(all_documents, &mut joined, used_document_names);
-    let content = non_empty_content_or_space(
-        joined,
-        !all_images.is_empty() || !all_tool_results.is_empty() || !history_documents.is_empty(),
-    );
+    let content = joined;
     // 历史 user 消息尽量避免主动补 "."：
     // 若只有非文本载荷，则保留空字符串让真实结构(images/tool_results)表达语义；
     // 仅纯文本且被压成空白时才做最终兜底，避免空 content 直发下游。
