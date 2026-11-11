@@ -474,13 +474,24 @@ fn strip_cache_control(value: &mut serde_json::Value) {
     }
 }
 
+/// 各模型的最小可缓存前缀长度（官方 prompt caching 文档）
+///
+/// - 512：Opus 5.5 / Opus 5、Sonnet 5.5、Haiku 5.5、Fable / Mythos 系
+/// - 1024：Opus 4.8、Sonnet 5、Sonnet 4.6（及其余 Sonnet）
+/// - 2048：Opus 4.7、Haiku 3.x
+/// - 4096：Opus 4.6 / 4.5 及更早 Opus、Haiku 4.5
 fn minimum_cacheable_tokens_for_model(model: &str) -> i32 {
-    let model_lower = model.to_lowercase();
+    let m = model.to_lowercase().replace('.', "-");
+    let has = |needle: &str| m.contains(needle);
 
-    if model_lower.contains("opus") {
-        4096
-    } else if model_lower.contains("haiku-3") || model_lower.contains("haiku_3") {
+    if has("fable") || has("mythos") || has("opus-5") || has("sonnet-5-5") || has("haiku-5") {
+        512
+    } else if has("opus-4-8") || has("sonnet") {
+        1024
+    } else if has("opus-4-7") || has("haiku-3") || has("haiku_3") {
         2048
+    } else if has("opus") || has("haiku-4") {
+        4096
     } else {
         1024
     }
@@ -517,6 +528,30 @@ fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_minimum_cacheable_tokens_matches_official_table() {
+        for (model, expected) in [
+            ("claude-opus-5-5", 512),
+            ("claude-opus-5", 512),
+            ("claude-sonnet-5-5", 512),
+            ("claude-haiku-5-5", 512),
+            ("claude-fable-5-2", 512),
+            ("claude-opus-4-8", 1024),
+            ("claude-sonnet-5", 1024),
+            ("claude-sonnet-4.6", 1024),
+            ("claude-opus-4-7", 2048),
+            ("claude-opus-4-6", 4096),
+            ("claude-opus-4-5", 4096),
+            ("claude-haiku-4-5", 4096),
+        ] {
+            assert_eq!(
+                minimum_cacheable_tokens_for_model(model),
+                expected,
+                "{model}"
+            );
+        }
+    }
     use crate::anthropic::types::{SystemMessage, Tool};
     use crate::token;
 

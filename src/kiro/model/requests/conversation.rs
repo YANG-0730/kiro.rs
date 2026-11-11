@@ -116,7 +116,8 @@ pub struct UserInputMessage {
     pub images: Vec<KiroImage>,
     /// 文档列表（PDF / 文本等，对应 Anthropic 的 `document` 块）
     ///
-    /// 2026-10-12 实测：仅 currentMessage 层生效（history 中的会被上游忽略）；
+    /// 当前消息与历史消息都可携带（2026-11-11 在 cli / cli3 实测历史文档可被读取；
+    /// 2026-10-12 "仅当前消息生效"的结论来自已下线的 SendMessage 接口）；
     /// 单请求最多 5 个，`name` 须唯一且只含字母数字、空白、`-_()[]`。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub documents: Vec<KiroDocument>,
@@ -296,6 +297,9 @@ pub struct UserMessage {
     /// 图片列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<KiroImage>,
+    /// 文档列表（与官方客户端一致，历史消息同样携带）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documents: Vec<KiroDocument>,
     /// 用户输入消息上下文
     #[serde(default, skip_serializing_if = "is_default_context")]
     pub user_input_message_context: UserInputMessageContext,
@@ -313,6 +317,7 @@ impl UserMessage {
             model_id: model_id.into(),
             origin: Some("AI_EDITOR".to_string()),
             images: Vec::new(),
+            documents: Vec::new(),
             user_input_message_context: UserInputMessageContext::default(),
         }
     }

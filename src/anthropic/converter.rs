@@ -464,17 +464,21 @@ pub fn convert_request(
     let last_message = messages.last().unwrap();
     let has_valid_content = match &last_message.content {
         serde_json::Value::String(s) => !s.trim().is_empty(),
-        serde_json::Value::Array(arr) => arr.iter().any(|item| {
-            if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
-                match block.block_type.as_str() {
-                    "text" => block.text.as_ref().is_some_and(|t| !t.trim().is_empty()),
-                    "image" | "document" | "tool_use" | "tool_result" => true,
+        // 按原始 type 判断：URL 图片 / content 文档 / search_result 无法反序列化为 ContentBlock，
+        // 但转换时会变成占位说明或内联文本，同样是有效内容
+        serde_json::Value::Array(arr) => {
+            arr.iter()
+                .any(|item| match item.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => item
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .is_some_and(|t| !t.trim().is_empty()),
+                    Some("image" | "document" | "search_result" | "tool_use" | "tool_result") => {
+                        true
+                    }
                     _ => false,
-                }
-            } else {
-                false
-            }
-        }),
+                })
+        }
         _ => false,
     };
     if !has_valid_content {
@@ -518,7 +522,9 @@ pub fn convert_request(
         total_image_count,
         &mut remaining_image_budget,
     )?;
-    let kiro_documents = attach_current_documents(documents, &mut text_content);
+    // 文档名在整个请求内唯一（当前消息先占名，历史中的同名文档会加后缀）
+    let mut used_document_names = std::collections::HashSet::new();
+    let kiro_documents = attach_documents(documents, &mut text_content, &mut used_document_names);
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
@@ -539,6 +545,7 @@ pub fn convert_request(
         req,
         messages,
         BuildHistoryContext {
+            used_document_names: &mut used_document_names,
             model_id: &model_id,
             structured_thinking,
             compression_config,
@@ -740,6 +747,24 @@ fn process_message_content(
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
+                // 这几类块的 source 形状与 ContentBlock 不兼容（URL / 文件来源的图片、
+                // content / url 来源的文档、source 为字符串的 search_result），按原始 JSON 处理；
+                // 以前会因反序列化失败被整块静默丢弃
+                match item.get("type").and_then(|t| t.as_str()) {
+                    Some("document") => {
+                        documents.push(parse_document_block(item));
+                        continue;
+                    }
+                    Some("search_result") => {
+                        text_parts.push(search_result_text(item));
+                        continue;
+                    }
+                    Some("image") if !is_base64_image(item) => {
+                        text_parts.push(unsupported_image_placeholder(item));
+                        continue;
+                    }
+                    _ => {}
+                }
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
                     match block.block_type.as_str() {
                         "text" => {
@@ -806,7 +831,6 @@ fn process_message_content(
                         "tool_use" => {
                             // tool_use 在 assistant 消息中处理，这里忽略
                         }
-                        "document" => documents.push(parse_document_block(item)),
                         _ => {}
                     }
                 }
@@ -1018,11 +1042,78 @@ fn parse_document_block(item: &serde_json::Value) -> DocumentPayload {
             title,
             text: text.to_string(),
         },
+        // 自定义内容文档：content 为 text / image 块数组，取文本内联
+        ("content", _) => {
+            let text = source
+                .and_then(|s| s.get("content"))
+                .map(|c| match c {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Array(blocks) => blocks
+                        .iter()
+                        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    _ => String::new(),
+                })
+                .unwrap_or_default();
+            DocumentPayload::Text { title, text }
+        }
+        ("url", _) => DocumentPayload::Unsupported {
+            title,
+            kind: format!(
+                "url {}",
+                source
+                    .and_then(|s| s.get("url"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+            ),
+        },
         (other, _) => DocumentPayload::Unsupported {
             title,
             kind: other.to_string(),
         },
     }
+}
+
+/// image 块是否为 base64 来源（代理只能转发内联图片）
+fn is_base64_image(item: &serde_json::Value) -> bool {
+    item.pointer("/source/type").and_then(|v| v.as_str()) == Some("base64")
+        && item.pointer("/source/data").is_some_and(|v| v.is_string())
+}
+
+/// URL / Files API 来源的图片：上游只接受内联图片，留占位说明而不是静默丢弃
+fn unsupported_image_placeholder(item: &serde_json::Value) -> String {
+    let source_type = item
+        .pointer("/source/type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    match source_type {
+        "url" => format!(
+            "[Image omitted: URL images are not supported by this proxy ({})]",
+            item.pointer("/source/url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+        ),
+        other => format!("[Image omitted: source type '{other}' is not supported by this proxy]"),
+    }
+}
+
+/// search_result 块 → 文本（来源、标题与正文）
+fn search_result_text(item: &serde_json::Value) -> String {
+    let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let source = item.get("source").and_then(|v| v.as_str()).unwrap_or("");
+    let body = item
+        .get("content")
+        .and_then(|c| c.as_array())
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    format!("[Search result: {title} ({source})]\n{body}")
 }
 
 /// media_type → Kiro 文档 format；未知类型返回 None（上游对未知 format 返回 400）
@@ -1111,16 +1202,17 @@ fn document_placeholder_text(doc: &DocumentPayload, reason: &str) -> String {
     }
 }
 
-/// 把当前消息的文档转为 Kiro `documents[]`
+/// 把一条消息的文档转为 Kiro `documents[]`（当前消息与历史消息共用）
 ///
-/// base64 文档最多附加 `MAX_DOCUMENTS` 个（名称清洗并去重）；文本文档内联进消息文本；
+/// base64 文档每条消息最多附加 `MAX_DOCUMENTS` 个，名称清洗并在整个请求内去重
+/// （`used_names` 跨消息共享，与官方客户端一致）；文本文档内联进消息文本；
 /// 超额或不支持的来源在消息文本中留占位说明，不静默丢弃。
-fn attach_current_documents(
+fn attach_documents(
     documents: Vec<DocumentPayload>,
     text_content: &mut String,
+    used_names: &mut std::collections::HashSet<String>,
 ) -> Vec<KiroDocument> {
     let mut out: Vec<KiroDocument> = Vec::new();
-    let mut used_names = std::collections::HashSet::new();
     let mut notes = Vec::new();
     for doc in documents {
         match doc {
@@ -1353,17 +1445,30 @@ fn convert_tools(
     tools
         .iter()
         .filter(|t| {
-            // 过滤掉 web_search 类型的工具（Kiro API 当前不支持）
-            // 工具类型格式: "web_search_20250305"
-            let dominated = t
+            // 过滤由 Anthropic 服务端执行的工具（Kiro 上游无法执行，原样转发只会变成一个
+            // 空 schema 的普通工具误导模型）。web_search 另由本地 WebSearch 处理。
+            // bash / text_editor / memory / computer 等由客户端执行的类型化工具保留。
+            const SERVER_TOOL_PREFIXES: [&str; 6] = [
+                "web_search",
+                "web_fetch",
+                "code_execution",
+                "tool_search_tool",
+                "mcp_toolset",
+                "advisor",
+            ];
+            let server_tool = t
                 .tool_type
-                .as_ref()
-                .is_some_and(|ty| ty.starts_with("web_search"));
-            if dominated {
-                tracing::debug!("过滤不支持的工具: name={}, type={:?}", t.name, t.tool_type);
+                .as_deref()
+                .is_some_and(|ty| SERVER_TOOL_PREFIXES.iter().any(|p| ty.starts_with(p)));
+            if server_tool {
+                tracing::debug!(
+                    "过滤上游无法执行的服务端工具: name={}, type={:?}",
+                    t.name,
+                    t.tool_type
+                );
             }
 
-            !dominated
+            !server_tool
         })
         .map(|t| {
             let mut description = if t.description.trim().is_empty() {
@@ -1547,12 +1652,16 @@ fn build_additional_model_request_fields(
             );
         }
 
-        // output_config.effort：仅当 schema 支持且客户端提供了 effort 时透传
-        if want_thinking
-            && schema_has_property(schema, "output_config")
+        // output_config.effort：schema 支持且客户端提供了 effort 就透传，与是否开启 thinking 无关
+        // （官方 API 中 effort 独立于 thinking；官方客户端同样总是下发）。显式关闭 thinking 时
+        // 与官方客户端一致把 xhigh / max 降为 high（部分模型不允许 disabled 搭配这两档）
+        if schema_has_property(schema, "output_config")
             && let Some(effort) = client_effort
         {
-            let effort = normalize_effort(effort);
+            let mut effort = normalize_effort(effort);
+            if thinking_type == Some("disabled") && matches!(effort, "xhigh" | "max") {
+                effort = "high";
+            }
             fields.insert(
                 "output_config".to_string(),
                 serde_json::json!({ "effort": effort }),
@@ -1587,6 +1696,8 @@ fn has_write_or_edit_tool(req: &MessagesRequest) -> bool {
 }
 
 struct BuildHistoryContext<'a> {
+    /// 整个请求内已使用的文档名（历史与当前消息共享，保证唯一）
+    used_document_names: &'a mut std::collections::HashSet<String>,
     model_id: &'a str,
     /// 模型是否通过结构化字段（additionalModelRequestFields.thinking）控制思考；
     /// 是则不再注入 `<thinking_mode>` 系统提示标签，避免重复
@@ -1605,6 +1716,7 @@ fn build_history(
     ctx: BuildHistoryContext<'_>,
 ) -> Result<Vec<Message>, ConversionError> {
     let BuildHistoryContext {
+        used_document_names,
         model_id,
         structured_thinking,
         compression_config,
@@ -1726,6 +1838,7 @@ fn build_history(
                     total_image_count,
                     remaining_image_budget,
                     &mut skip_oldest,
+                    used_document_names,
                 )?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
@@ -1750,6 +1863,7 @@ fn build_history(
             total_image_count,
             remaining_image_budget,
             &mut skip_oldest,
+            used_document_names,
         )?;
         history.push(Message::User(merged_user));
 
@@ -1846,6 +1960,7 @@ fn skip_leading_images(content: &serde_json::Value, skip: &mut usize) -> Option<
     Some(serde_json::Value::Array(out))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn merge_user_messages(
     messages: &[&super::types::Message],
     model_id: &str,
@@ -1853,10 +1968,12 @@ fn merge_user_messages(
     total_image_count: usize,
     remaining_image_budget: &mut usize,
     skip_oldest_images: &mut usize,
+    used_document_names: &mut std::collections::HashSet<String>,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut all_images = Vec::new();
     let mut all_tool_results = Vec::new();
+    let mut all_documents = Vec::new();
 
     for msg in messages {
         // 超出总配额时，最旧的历史图片直接跳过（为更新的图片腾出配额）
@@ -1875,20 +1992,18 @@ fn merge_user_messages(
         if !text.is_empty() {
             content_parts.push(text);
         }
-        // Kiro 只认 currentMessage 的 documents[]；历史中的文档无法再附加，留占位说明
-        for doc in &documents {
-            content_parts.push(document_placeholder_text(
-                doc,
-                "attached earlier in the conversation; re-read the file if its content is needed",
-            ));
-        }
+        all_documents.extend(documents);
         all_images.extend(images);
         all_tool_results.extend(tool_results);
     }
 
+    // 历史中的文档与官方客户端一致随该条消息附加（documents[]），模型后续轮次仍能看到；
+    // 文本文档内联、超额或不支持的来源留占位说明
+    let mut joined = content_parts.join("\n");
+    let history_documents = attach_documents(all_documents, &mut joined, used_document_names);
     let content = non_empty_content_or_space(
-        content_parts.join("\n"),
-        !all_images.is_empty() || !all_tool_results.is_empty(),
+        joined,
+        !all_images.is_empty() || !all_tool_results.is_empty() || !history_documents.is_empty(),
     );
     // 历史 user 消息尽量避免主动补 "."：
     // 若只有非文本载荷，则保留空字符串让真实结构(images/tool_results)表达语义；
@@ -1901,6 +2016,7 @@ fn merge_user_messages(
         };
     // 保留文本内容，即使有工具结果也不丢弃用户文本
     let mut user_msg = UserMessage::new(&content, model_id);
+    user_msg.documents = history_documents;
 
     if !all_images.is_empty() {
         user_msg = user_msg.with_images(all_images);
@@ -2381,8 +2497,17 @@ mod tests {
         let req = req_with_thinking(Some("disabled"), Some("high"));
         let fields = build_additional_model_request_fields(&req, Some(&schema)).unwrap();
         assert_eq!(fields["thinking"]["type"], "disabled");
-        // disabled 时不应带 output_config（effort 只在开启思考时有意义）
-        assert!(fields.get("output_config").is_none());
+        // effort 独立于 thinking：disabled 时照样下发（与官方 API / 官方客户端一致）
+        assert_eq!(fields["output_config"]["effort"], "high");
+        // disabled 搭配 xhigh / max 降为 high
+        let req = req_with_thinking(Some("disabled"), Some("max"));
+        let fields = build_additional_model_request_fields(&req, Some(&schema)).unwrap();
+        assert_eq!(fields["output_config"]["effort"], "high");
+        // 未设 thinking 但给了 effort：只下发 effort
+        let req = req_with_thinking(None, Some("medium"));
+        let fields = build_additional_model_request_fields(&req, Some(&schema)).unwrap();
+        assert!(fields.get("thinking").is_none());
+        assert_eq!(fields["output_config"]["effort"], "medium");
         // 完全未设 thinking → 不写 thinking 字段，交由上游默认（官方 5.x 默认开启思考）
         let req2 = req_with_thinking(None, None);
         assert!(build_additional_model_request_fields(&req2, Some(&schema)).is_none());
@@ -2557,6 +2682,45 @@ mod tests {
             role: role.to_string(),
             content,
         }
+    }
+
+    #[test]
+    fn test_non_base64_blocks_are_not_silently_dropped() {
+        let mut req = req_with_thinking(Some("adaptive"), Some("high"));
+        req.messages = vec![msg(
+            "user",
+            serde_json::json!([
+                {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}},
+                {"type": "document", "title": "Notes", "source": {"type": "content",
+                    "content": [{"type": "text", "text": "secret-word: pineapple"}]}},
+                {"type": "document", "source": {"type": "url", "url": "https://example.com/b.pdf"}},
+                {"type": "search_result", "source": "https://example.com/s", "title": "Result",
+                    "content": [{"type": "text", "text": "rust 1.95 released"}]},
+                {"type": "text", "text": "summarize"}
+            ]),
+        )];
+        let r = convert_request(&req, &CompressionConfig::default(), None).unwrap();
+        let content = &r
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+        for needle in [
+            "https://example.com/a.png",
+            "secret-word: pineapple",
+            "https://example.com/b.pdf",
+            "rust 1.95 released",
+            "summarize",
+        ] {
+            assert!(content.contains(needle), "缺少 {needle}: {content}");
+        }
+
+        // 只有 URL 图片的消息不再报"消息内容为空"
+        req.messages = vec![msg(
+            "user",
+            serde_json::json!([{"type": "image", "source": {"type": "url", "url": "https://x/y.png"}}]),
+        )];
+        assert!(convert_request(&req, &CompressionConfig::default(), None).is_ok());
     }
 
     #[test]
@@ -3710,7 +3874,7 @@ mod tests {
     }
 
     #[test]
-    fn test_documents_capped_deduped_and_history_documents_become_placeholders() {
+    fn test_documents_capped_deduped_and_attached_to_history() {
         use super::super::types::Message as AnthropicMessage;
         let pdf = |t: &str| {
             serde_json::json!({"type": "document", "title": t,
@@ -3743,20 +3907,27 @@ mod tests {
             2,
             "超额的 2 个留占位说明"
         );
-        let hist_text = r
+        // 历史中的文档与官方客户端一致随该条历史消息附加（2026-11-11 实测 cli / cli3 均可读）
+        let hist = r
             .conversation_state
             .history
             .iter()
             .find_map(|m| match m {
-                Message::User(h) => Some(h.user_input_message.content.clone()),
+                Message::User(h) => Some(h.user_input_message.clone()),
                 _ => None,
             })
             .unwrap();
+        assert_eq!(hist.documents.len(), 1);
         assert!(
-            hist_text.contains("Document omitted: old"),
-            "历史文档应留占位: {hist_text}"
+            !hist.content.contains("Document omitted"),
+            "{}",
+            hist.content
         );
-        // 历史消息类型（UserMessage）本身没有 documents 字段，结构上保证不会附加到 history
+        // 文档名在整个请求内唯一
+        assert!(
+            !names.contains(&hist.documents[0].name.to_lowercase()),
+            "历史文档名与当前消息文档名冲突"
+        );
     }
 
     #[test]
