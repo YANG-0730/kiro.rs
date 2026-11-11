@@ -32,6 +32,10 @@ pub struct ReasoningContentEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
 
+    /// 被屏蔽的推理（awsJson blob，JSON 中为 base64 字符串），映射为 `redacted_thinking`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redacted_content: Option<String>,
+
     /// 捕获其他未使用的字段，确保反序列化兼容性
     #[serde(flatten)]
     #[serde(skip_serializing)]

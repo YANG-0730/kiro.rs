@@ -49,8 +49,35 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    let builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    finish_client(builder, proxy, tls_backend)
+}
 
+/// 流式 API 请求的连接超时（与官方 Kiro CLI 3.x 的 connectionTimeout 一致）
+const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// 流式 API 请求的读空闲超时（与官方 Kiro CLI 3.x 的 requestTimeout 一致，为 socket 空闲超时）
+const API_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// 构建用于对话 API（流式响应）的 HTTP Client
+///
+/// 不设整体超时：reqwest 的 `timeout` 是含响应体读取的总时限，长回复（大段 Write、
+/// 高 effort 推理）超过时限会被从中间截断。改为连接超时 + 读空闲超时，只要上游
+/// 持续有数据就不会断。
+pub fn build_api_client(
+    proxy: Option<&ProxyConfig>,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    let builder = Client::builder()
+        .connect_timeout(API_CONNECT_TIMEOUT)
+        .read_timeout(API_READ_IDLE_TIMEOUT);
+    finish_client(builder, proxy, tls_backend)
+}
+
+fn finish_client(
+    mut builder: reqwest::ClientBuilder,
+    proxy: Option<&ProxyConfig>,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
     if tls_backend == TlsBackend::Rustls {
         builder = builder.use_rustls_tls();
     }
@@ -94,6 +121,13 @@ mod tests {
     fn test_build_client_without_proxy() {
         let client = build_client(None, 30, TlsBackend::Rustls);
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_build_api_client() {
+        assert!(build_api_client(None, TlsBackend::Rustls).is_ok());
+        let config = ProxyConfig::new("http://127.0.0.1:7890");
+        assert!(build_api_client(Some(&config), TlsBackend::Rustls).is_ok());
     }
 
     #[test]

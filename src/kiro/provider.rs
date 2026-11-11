@@ -15,7 +15,7 @@ use tokio::time::sleep;
 
 #[cfg(not(feature = "sensitive-logs"))]
 use crate::common::utf8::floor_char_boundary;
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, build_api_client};
 use crate::kiro::endpoint::{
     Cli3Endpoint, CliEndpoint, IDE_ENDPOINT_NAME, IdeEndpoint, KiroEndpoint, RequestContext,
 };
@@ -72,6 +72,47 @@ pub struct KiroProvider {
     default_endpoint: RwLock<String>,
 }
 
+/// 去掉 Kiro 请求体中所有历史 assistant 消息的 `reasoningContent`
+///
+/// 对应官方客户端在 `THINKING_SIGNATURE_INVALID` 时的做法。去掉后若某条消息
+/// 正文为空且没有工具调用，补 "." 避免空 assistant 消息。
+/// 没有可去掉的推理（或请求体无法解析）时返回 None。
+fn strip_history_reasoning(body: &str) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let history = value
+        .get_mut("conversationState")?
+        .get_mut("history")?
+        .as_array_mut()?;
+    let mut stripped = 0usize;
+    for item in history.iter_mut() {
+        let Some(assistant) = item
+            .get_mut("assistantResponseMessage")
+            .and_then(|a| a.as_object_mut())
+        else {
+            continue;
+        };
+        if assistant.remove("reasoningContent").is_none() {
+            continue;
+        }
+        stripped += 1;
+        let content_empty = assistant
+            .get("content")
+            .and_then(|c| c.as_str())
+            .is_none_or(|c| c.trim().is_empty());
+        let no_tools = assistant
+            .get("toolUses")
+            .and_then(|t| t.as_array())
+            .is_none_or(|t| t.is_empty());
+        if content_empty && no_tools {
+            assistant.insert("content".to_string(), serde_json::json!("."));
+        }
+    }
+    if stripped == 0 {
+        return None;
+    }
+    serde_json::to_string(&value).ok()
+}
+
 impl KiroProvider {
     fn default_endpoints() -> HashMap<String, Arc<dyn KiroEndpoint>> {
         let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
@@ -108,7 +149,7 @@ impl KiroProvider {
             default_endpoint
         );
 
-        let default_client = build_client(proxy.as_ref(), 720, token_manager.config().tls_backend)
+        let default_client = build_api_client(proxy.as_ref(), token_manager.config().tls_backend)
             .expect("创建 HTTP 客户端失败");
 
         Self {
@@ -126,7 +167,7 @@ impl KiroProvider {
     /// 重建 default_client 并清空 client_cache
     pub fn update_global_proxy(&self, proxy: Option<ProxyConfig>) -> anyhow::Result<()> {
         let config = self.token_manager.config();
-        let new_client = build_client(proxy.as_ref(), 720, config.tls_backend)?;
+        let new_client = build_api_client(proxy.as_ref(), config.tls_backend)?;
 
         *self.global_proxy.write() = proxy;
         *self.default_client.write() = new_client;
@@ -166,8 +207,8 @@ impl KiroProvider {
         }
 
         let config = self.token_manager.config();
-        let client = build_client(effective_proxy.as_ref(), 720, config.tls_backend)
-            .unwrap_or_else(|e| {
+        let client =
+            build_api_client(effective_proxy.as_ref(), config.tls_backend).unwrap_or_else(|e| {
                 tracing::warn!("创建凭据级代理 client 失败，使用默认 client: {}", e);
                 self.default_client.read().clone()
             });
@@ -590,6 +631,8 @@ impl KiroProvider {
         let api_type = if is_stream { "流式" } else { "非流式" };
         // 本请求遇到 MODEL_TEMPORARILY_UNAVAILABLE 的次数（决定退避时长）
         let mut model_unavailable_hits: usize = 0;
+        // THINKING_SIGNATURE_INVALID 时去掉历史推理后的请求体（与官方客户端一致，只重试一次）
+        let mut stripped_body: Option<String> = None;
 
         let mut next_attempt = 0;
         while next_attempt < max_retries {
@@ -626,11 +669,12 @@ impl KiroProvider {
                 config: &config,
             };
             let url = endpoint.api_url(&request_ctx);
-            let final_body = match endpoint.transform_api_body(request_body, &request_ctx) {
+            let base_body = stripped_body.as_deref().unwrap_or(request_body);
+            let final_body = match endpoint.transform_api_body(base_body, &request_ctx) {
                 Ok(body) => body,
                 Err(e) => {
                     tracing::warn!("变换 endpoint 请求体失败，使用原始请求体: {}", e);
-                    request_body.to_string()
+                    base_body.to_string()
                 }
             };
             let final_body_for_log = final_body.clone();
@@ -722,6 +766,26 @@ impl KiroProvider {
                     status,
                     body
                 ));
+                continue;
+            }
+
+            // 400 THINKING_SIGNATURE_INVALID：历史推理签名验不过（签名被客户端改动 / 截断等）。
+            // 与官方客户端一致：去掉全部历史推理后重试一次，不计入凭据失败。
+            // 签名不绑定账号或模型（2026-11-11 实测跨凭据、跨模型回放均被接受），
+            // 重试时亲和性换到其他凭据也无妨
+
+            if status.as_u16() == 400
+                && stripped_body.is_none()
+                && Self::is_thinking_signature_invalid(&body)
+                && let Some(stripped) = strip_history_reasoning(request_body)
+            {
+                tracing::warn!(
+                    credential_id = %ctx.id,
+                    "上游拒绝历史推理签名（THINKING_SIGNATURE_INVALID），去掉历史推理后重试"
+                );
+                stripped_body = Some(stripped);
+                // 专用的一次重试，不占用常规重试次数
+                max_retries += 1;
                 continue;
             }
 
@@ -1077,9 +1141,17 @@ impl KiroProvider {
         body.contains("version of Kiro is no longer supported")
     }
 
-    /// 检测是否为 MODEL_TEMPORARILY_UNAVAILABLE 错误
+    /// 检测是否为模型级过载 / 容量不足（与凭据无关）
+    ///
+    /// 与官方客户端一致（KAS 把两者都归为 ModelThrottleError）：
+    /// - `MODEL_TEMPORARILY_UNAVAILABLE`（ServiceUnavailableException 等）
+    /// - `INSUFFICIENT_MODEL_CAPACITY`（ThrottlingException reason）
     fn is_model_temporarily_unavailable(body: &str) -> bool {
-        if body.contains("MODEL_TEMPORARILY_UNAVAILABLE") {
+        const REASONS: [&str; 2] = [
+            "MODEL_TEMPORARILY_UNAVAILABLE",
+            "INSUFFICIENT_MODEL_CAPACITY",
+        ];
+        if REASONS.iter().any(|r| body.contains(r)) {
             return true;
         }
 
@@ -1087,18 +1159,12 @@ impl KiroProvider {
             return false;
         };
 
-        if value
-            .get("reason")
-            .and_then(|v| v.as_str())
-            .is_some_and(|v| v == "MODEL_TEMPORARILY_UNAVAILABLE")
-        {
-            return true;
-        }
-
-        value
-            .pointer("/error/reason")
-            .and_then(|v| v.as_str())
-            .is_some_and(|v| v == "MODEL_TEMPORARILY_UNAVAILABLE")
+        ["/reason", "/error/reason"].iter().any(|path| {
+            value
+                .pointer(path)
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| REASONS.contains(&v))
+        })
     }
 
     /// 检测是否为「输入过长」类错误
@@ -1107,6 +1173,11 @@ impl KiroProvider {
     /// `{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}`
     fn is_input_too_long(body: &str) -> bool {
         body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") || body.contains("Input is too long")
+    }
+
+    /// 上游拒绝历史推理签名（ValidationException reason=THINKING_SIGNATURE_INVALID）
+    fn is_thinking_signature_invalid(body: &str) -> bool {
+        body.contains("THINKING_SIGNATURE_INVALID")
     }
 
     /// 从上游响应体提取一个适合返回给客户端的错误摘要
@@ -1249,6 +1320,49 @@ mod tests {
     use crate::kiro::model::credentials::KiroCredentials;
     use crate::model::config::Config;
     use reqwest::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HeaderValue};
+
+    #[test]
+    fn test_strip_history_reasoning() {
+        let body = serde_json::json!({
+            "conversationState": {
+                "history": [
+                    {"userInputMessage": {"content": "hi"}},
+                    {"assistantResponseMessage": {
+                        "content": "",
+                        "toolUses": [{"toolUseId": "t1", "name": "Bash", "input": {}}],
+                        "reasoningContent": {"reasoningText": {"text": "x", "signature": "s"}}
+                    }},
+                    {"userInputMessage": {"content": "go"}},
+                    {"assistantResponseMessage": {
+                        "content": "",
+                        "reasoningContent": {"redactedContent": "QUJD"}
+                    }}
+                ],
+                "currentMessage": {"userInputMessage": {"content": "next"}}
+            },
+            "profileArn": "arn"
+        })
+        .to_string();
+        let stripped: serde_json::Value =
+            serde_json::from_str(&strip_history_reasoning(&body).unwrap()).unwrap();
+        let history = stripped["conversationState"]["history"].as_array().unwrap();
+        assert!(history.iter().all(|m| {
+            m.get("assistantResponseMessage")
+                .is_none_or(|a| a.get("reasoningContent").is_none())
+        }));
+        // 有工具调用的保持空正文；只剩空正文的补 "."
+        assert_eq!(history[1]["assistantResponseMessage"]["content"], "");
+        assert_eq!(history[3]["assistantResponseMessage"]["content"], ".");
+        assert_eq!(stripped["profileArn"], "arn");
+
+        // 没有可去掉的推理 → None（不重试）
+        let plain = serde_json::json!({
+            "conversationState": {"history": [{"assistantResponseMessage": {"content": "a"}}]}
+        })
+        .to_string();
+        assert!(strip_history_reasoning(&plain).is_none());
+        assert!(strip_history_reasoning("not json").is_none());
+    }
 
     fn create_test_provider(config: Config, credentials: KiroCredentials) -> KiroProvider {
         let tm = MultiTokenManager::new(config, vec![credentials], None, None, false).unwrap();
@@ -1816,6 +1930,13 @@ mod tests {
         assert!(KiroProvider::is_model_temporarily_unavailable(body));
         assert!(!KiroProvider::is_model_temporarily_unavailable(
             r#"{"reason":"THROTTLING"}"#
+        ));
+        // 容量不足同属模型级问题，不应冷却凭据
+        assert!(KiroProvider::is_model_temporarily_unavailable(
+            r#"{"message":"capacity","reason":"INSUFFICIENT_MODEL_CAPACITY"}"#
+        ));
+        assert!(!KiroProvider::is_model_temporarily_unavailable(
+            r#"{"reason":"USER_REQUEST_RATE_EXCEEDED"}"#
         ));
     }
 

@@ -78,22 +78,24 @@ impl CliEndpoint {
         )
     }
 
+    /// 把消息来源改为 CLI：只改 `userInputMessage.origin`（当前消息与历史）
+    ///
+    /// 不能递归改所有名为 `origin` 的键：工具 schema / 工具调用参数里也可能有
+    /// `origin` 字段（如地图类 MCP 工具的 origin/destination），会被误改坏。
     fn rewrite_origin(value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::Object(map) => {
-                if let Some(origin) = map.get_mut("origin") {
-                    *origin = serde_json::Value::String(CLI_ORIGIN.to_string());
-                }
-                for child in map.values_mut() {
-                    Self::rewrite_origin(child);
+        let Some(state) = value.get_mut("conversationState") else {
+            return;
+        };
+        let cli_origin = || serde_json::Value::String(CLI_ORIGIN.to_string());
+        if let Some(origin) = state.pointer_mut("/currentMessage/userInputMessage/origin") {
+            *origin = cli_origin();
+        }
+        if let Some(history) = state.get_mut("history").and_then(|h| h.as_array_mut()) {
+            for item in history {
+                if let Some(origin) = item.pointer_mut("/userInputMessage/origin") {
+                    *origin = cli_origin();
                 }
             }
-            serde_json::Value::Array(items) => {
-                for item in items {
-                    Self::rewrite_origin(item);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -218,5 +220,47 @@ impl KiroEndpoint for CliEndpoint {
         }
 
         Ok(UsageRequestParts { url, headers })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CliEndpoint;
+
+    #[test]
+    fn test_rewrite_origin_only_touches_message_origin() {
+        let mut v = serde_json::json!({
+            "conversationState": {
+                "currentMessage": {"userInputMessage": {
+                    "origin": "AI_EDITOR",
+                    "userInputMessageContext": {"tools": [{"toolSpecification": {
+                        "name": "directions",
+                        "inputSchema": {"json": {"properties": {"origin": {"type": "string"}}}}
+                    }}]}
+                }},
+                "history": [
+                    {"userInputMessage": {"origin": "AI_EDITOR", "content": "x"}},
+                    {"assistantResponseMessage": {"content": "",
+                        "toolUses": [{"toolUseId": "t", "name": "directions", "input": {"origin": "Paris"}}]}}
+                ]
+            }
+        });
+        CliEndpoint::rewrite_origin(&mut v);
+        let cs = &v["conversationState"];
+        assert_eq!(
+            cs["currentMessage"]["userInputMessage"]["origin"],
+            "KIRO_CLI"
+        );
+        assert_eq!(cs["history"][0]["userInputMessage"]["origin"], "KIRO_CLI");
+        // 工具 schema 与工具调用参数里的 origin 字段不能被改
+        assert_eq!(
+            cs["currentMessage"]["userInputMessage"]["userInputMessageContext"]["tools"][0]["toolSpecification"]
+                ["inputSchema"]["json"]["properties"]["origin"],
+            serde_json::json!({"type": "string"})
+        );
+        assert_eq!(
+            cs["history"][1]["assistantResponseMessage"]["toolUses"][0]["input"]["origin"],
+            "Paris"
+        );
     }
 }

@@ -35,6 +35,14 @@ pub struct KiroRequest {
     /// Profile ARN（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_arn: Option<String>,
+    /// 额外模型请求字段（thinking / output_config.effort / reasoning 等）
+    ///
+    /// 官方 Smithy 模型（KiroRuntimeService 与 CodeWhispererStreaming 的
+    /// `GenerateAssistantResponseRequest`）中它是请求顶层成员，与
+    /// `conversationState` / `profileArn` 并列；`UserInputMessage` 没有这个成员，
+    /// 放在那里会被上游当作未知字段忽略。null-schema 模型会静默忽略，安全。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additional_model_request_fields: Option<serde_json::Value>,
 }
 #[cfg(test)]
 mod tests {

@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::image::{process_gif_frames, process_image, process_image_to_format};
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
-    HistoryUserMessage, KiroDocument, KiroImage, KiroImageSource, Message, UserInputMessage,
-    UserInputMessageContext, UserMessage,
+    HistoryUserMessage, KiroDocument, KiroImage, KiroImageSource, Message, ReasoningContent,
+    ReasoningText, UserInputMessage, UserInputMessageContext, UserMessage,
 };
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool as KiroTool, ToolResult, ToolSpecification, ToolUseEntry,
@@ -215,6 +215,8 @@ pub struct ConversionResult {
     pub tool_name_map: HashMap<String, String>,
     /// 映射后的上游 modelId（点号格式），用于模型级凭据过滤
     pub model_id: String,
+    /// 请求顶层的 additionalModelRequestFields（thinking / effort 等），按模型 schema 构建
+    pub additional_model_request_fields: Option<serde_json::Value>,
 }
 
 /// 转换错误
@@ -341,6 +343,78 @@ fn create_placeholder_tool(name: &str) -> KiroTool {
     }
 }
 
+/// 把 `messages` 里的 `role:"system"`（官方的会话中途系统消息）折叠进相邻的 user 消息
+///
+/// Kiro 历史只有 user / assistant 两种角色。Claude Code 对新模型会把环境信息
+/// （工作目录、平台、Shell 等）和每轮提醒放在 `role:"system"` 消息里，通常紧跟在
+/// 最后一条 user 之后；以前被当作 prefill 截掉，模型因此不知道运行环境。
+/// 这里以 `<system-reminder>` 包裹（Claude Code 在 user 消息里放提醒的惯用格式）：
+/// - 紧跟在 user 之后 → 追加到该 user 消息末尾
+/// - 否则（开头、或在 assistant 之后）→ 前置到下一条 user 消息；
+///   之后再无 user 时追加到最后一条 user
+/// - 无文本的 system 消息（如仅调整 effort 的条目）忽略
+fn fold_system_messages(messages: &[super::types::Message]) -> Vec<super::types::Message> {
+    fn text_of(content: &serde_json::Value) -> String {
+        match content {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(blocks) => blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            _ => String::new(),
+        }
+    }
+    fn to_blocks(content: &serde_json::Value) -> Vec<serde_json::Value> {
+        match content {
+            serde_json::Value::String(s) if s.is_empty() => Vec::new(),
+            serde_json::Value::String(s) => vec![serde_json::json!({"type": "text", "text": s})],
+            serde_json::Value::Array(blocks) => blocks.clone(),
+            _ => Vec::new(),
+        }
+    }
+    fn text_block(text: &str) -> serde_json::Value {
+        serde_json::json!({"type": "text", "text": text})
+    }
+
+    let mut out: Vec<super::types::Message> = Vec::with_capacity(messages.len());
+    let mut pending: Vec<String> = Vec::new();
+    for msg in messages {
+        if msg.role == "system" {
+            let text = text_of(&msg.content);
+            if text.trim().is_empty() {
+                continue;
+            }
+            let wrapped = format!("<system-reminder>\n{}\n</system-reminder>", text.trim());
+            match out.last_mut() {
+                Some(prev) if prev.role == "user" && pending.is_empty() => {
+                    let mut blocks = to_blocks(&prev.content);
+                    blocks.push(text_block(&wrapped));
+                    prev.content = serde_json::Value::Array(blocks);
+                }
+                _ => pending.push(wrapped),
+            }
+            continue;
+        }
+        let mut msg = msg.clone();
+        if msg.role == "user" && !pending.is_empty() {
+            let mut blocks: Vec<serde_json::Value> =
+                pending.drain(..).map(|t| text_block(&t)).collect();
+            blocks.extend(to_blocks(&msg.content));
+            msg.content = serde_json::Value::Array(blocks);
+        }
+        out.push(msg);
+    }
+    if !pending.is_empty()
+        && let Some(last_user) = out.iter_mut().rev().find(|m| m.role == "user")
+    {
+        let mut blocks = to_blocks(&last_user.content);
+        blocks.extend(pending.drain(..).map(|t| text_block(&t)));
+        last_user.content = serde_json::Value::Array(blocks);
+    }
+    out
+}
+
 /// 将 Anthropic 请求转换为 Kiro 请求
 pub fn convert_request(
     req: &MessagesRequest,
@@ -356,23 +430,31 @@ pub fn convert_request(
         return Err(ConversionError::EmptyMessages);
     }
 
+    // 2.4. 会话中途的 role:"system" 消息折叠进相邻 user 消息（Kiro 只有 user / assistant）
+    let folded_messages;
+    let source_messages: &[super::types::Message] =
+        if req.messages.iter().any(|m| m.role == "system") {
+            folded_messages = fold_system_messages(&req.messages);
+            &folded_messages
+        } else {
+            &req.messages
+        };
+
     // 2.5. 预处理 prefill：如果末尾是 assistant，静默丢弃并截断到最后一条 user
     // 原因：Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持
-    let messages: &[_] = if req
-        .messages
+    let messages: &[_] = if source_messages
         .last()
         .map(|m| m.role != "user")
         .unwrap_or(false)
     {
         tracing::debug!("检测到末尾 assistant 消息（prefill），静默丢弃，回退到最后一条 user 消息");
-        let last_user_idx = req
-            .messages
+        let last_user_idx = source_messages
             .iter()
             .rposition(|m| m.role == "user")
             .ok_or(ConversionError::EmptyMessages)?;
-        &req.messages[..=last_user_idx]
+        &source_messages[..=last_user_idx]
     } else {
-        &req.messages
+        source_messages
     };
 
     // 2.6. 验证最后一条消息内容不为空
@@ -566,10 +648,12 @@ pub fn convert_request(
 
     // 12.1. 透传模型扩展字段（thinking / effort / reasoning）
     // 依据上游模型 schema 决定字段形状；null-schema 模型返回 None（不透传）
+    // 注意：它是请求顶层字段（与 conversationState 并列），不属于 userInputMessage
     let model_schema = model_registry.and_then(|r| r.additional_fields_schema_for(&req.model));
-    if let Some(fields) = build_additional_model_request_fields(req, model_schema.as_ref()) {
+    let additional_model_request_fields =
+        build_additional_model_request_fields(req, model_schema.as_ref());
+    if let Some(fields) = &additional_model_request_fields {
         tracing::debug!(model = %req.model, ?fields, "透传 additionalModelRequestFields");
-        user_input = user_input.with_additional_model_request_fields(fields);
     }
 
     let current_message = CurrentMessage::new(user_input);
@@ -617,6 +701,7 @@ pub fn convert_request(
         compression_stats,
         tool_name_map,
         model_id,
+        additional_model_request_fields,
     })
 }
 
@@ -1537,12 +1622,12 @@ fn build_history(
         generate_thinking_prefix(req)
     };
 
-    // 历史 assistant 的 thinking 块是否以 `<thinking>` 标签内联回正文：
+    // 历史 assistant 的 thinking 块如何回传：
     // - 老模型的思考本来就是正文里的 `<thinking>` 标签（由上面的前缀诱导），内联保持格式一致；
-    // - 结构化思考的新模型（reasoningContentEvent）不能内联：上游只认正文，模型会看到"自己"
-    //   把原始推理写进了可见回复，几轮之后触发安全分类器以 REASONING_EXTRACTION 拒答
-    //   （2026-11-11 实测 opus-5.5：内联 2 轮即拒，去掉后同场景 5 轮正常）。
-    //   上游历史消息没有承载推理的字段，只能省略（官方 API 也会丢弃读不了的 thinking 块）。
+    // - 结构化思考的新模型（reasoningContentEvent）与官方 Kiro 客户端一致，放进
+    //   `assistantResponseMessage.reasoningContent`（带签名原样回传）。绝不能内联进正文：
+    //   模型会看到"自己"把原始推理写进了可见回复，几轮后被以 REASONING_EXTRACTION 拒答
+    //   （2026-11-11 实测 opus-5.5：内联 2 轮即拒）。
     let inline_thinking = !structured_thinking;
 
     // 仅在开启分块写入策略且请求包含 Write/Edit 工具时注入
@@ -1677,6 +1762,7 @@ fn build_history(
         let mut assistant_count = 0usize;
         let mut synthetic_count = 0usize;
         let mut image_count_in_history = 0usize;
+        let mut reasoning_count = 0usize;
 
         // system 消息产生的合成配对
         if req
@@ -1693,12 +1779,18 @@ fn build_history(
                     user_count += 1;
                     image_count_in_history += u.user_input_message.images.len();
                 }
-                Message::Assistant(_) => assistant_count += 1,
+                Message::Assistant(a) => {
+                    assistant_count += 1;
+                    if a.assistant_response_message.reasoning_content.is_some() {
+                        reasoning_count += 1;
+                    }
+                }
             }
         }
 
         tracing::debug!(
             history_len = history.len(),
+            reasoning_messages = reasoning_count,
             user_messages = user_count,
             assistant_messages = assistant_count,
             synthetic_pairs = synthetic_count,
@@ -1823,16 +1915,85 @@ fn merge_user_messages(
     })
 }
 
+/// 消息中最后一个推理块（thinking / redacted_thinking）
+enum LastReasoningBlock {
+    Thinking {
+        text: String,
+        signature: Option<String>,
+    },
+    Redacted {
+        data: Option<String>,
+    },
+}
+
+impl LastReasoningBlock {
+    /// 按官方 Kiro 客户端规则转为可回传的推理：
+    /// 屏蔽推理 → `redactedContent`；有文本且有签名 → `reasoningText`；否则不回传
+    fn into_forwardable(self) -> Option<ReasoningContent> {
+        match self {
+            Self::Redacted { data: Some(data) } if !data.is_empty() => {
+                Some(ReasoningContent::RedactedContent(data))
+            }
+            Self::Thinking {
+                text,
+                signature: Some(signature),
+            } if !text.is_empty() && !signature.is_empty() => {
+                Some(ReasoningContent::ReasoningText(ReasoningText {
+                    text,
+                    signature,
+                }))
+            }
+            Self::Thinking { text, .. } => {
+                if !text.is_empty() {
+                    tracing::debug!("历史 thinking 块缺少签名，不回传上游");
+                }
+                None
+            }
+            Self::Redacted { .. } => None,
+        }
+    }
+}
+
 /// 转换 assistant 消息
 ///
-/// `inline_thinking`：是否把 thinking 块以 `<thinking>` 标签内联进正文（仅老模型），
-/// 否则省略 thinking 块，见 `build_history` 中的说明。
+/// `inline_thinking`：历史 thinking 的回传方式，见 `build_history` 中的说明：
+/// - true（老模型）：以 `<thinking>` 标签内联进正文
+/// - false（结构化思考的新模型）：放入 `reasoningContent`，绝不进正文
 fn convert_assistant_message(
     msg: &super::types::Message,
     tool_name_map: &mut HashMap<String, String>,
     inline_thinking: bool,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
+    let (mut converted, had_reasoning_block) =
+        convert_assistant_message_raw(msg, tool_name_map, inline_thinking)?;
+    finalize_assistant_content(
+        &mut converted.assistant_response_message,
+        had_reasoning_block,
+    );
+    Ok(converted)
+}
+
+/// 只有推理、且推理无法回传时，不留完全空的 assistant 消息
+fn finalize_assistant_content(assistant: &mut AssistantMessage, had_reasoning_block: bool) {
+    if had_reasoning_block
+        && assistant.reasoning_content.is_none()
+        && assistant.content.trim().is_empty()
+        && assistant.tool_uses.as_ref().is_none_or(|t| t.is_empty())
+    {
+        assistant.content = ".".to_string();
+    }
+}
+
+/// 转换 assistant 消息（不做空内容兜底，供单条 / 合并路径共用）
+///
+/// 第二个返回值表示消息中是否出现过推理块（thinking / redacted_thinking）
+fn convert_assistant_message_raw(
+    msg: &super::types::Message,
+    tool_name_map: &mut HashMap<String, String>,
+    inline_thinking: bool,
+) -> Result<(HistoryAssistantMessage, bool), ConversionError> {
     let mut thinking_content = String::new();
+    let mut last_reasoning: Option<LastReasoningBlock> = None;
     let mut text_content = String::new();
     let mut tool_uses = Vec::new();
 
@@ -1845,9 +2006,16 @@ fn convert_assistant_message(
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
                     match block.block_type.as_str() {
                         "thinking" => {
-                            if let Some(thinking) = block.thinking {
-                                thinking_content.push_str(&thinking);
-                            }
+                            let text = block.thinking.unwrap_or_default();
+                            thinking_content.push_str(&text);
+                            last_reasoning = Some(LastReasoningBlock::Thinking {
+                                text,
+                                signature: block.signature,
+                            });
+                        }
+                        "redacted_thinking" => {
+                            last_reasoning =
+                                Some(LastReasoningBlock::Redacted { data: block.data });
                         }
                         "text" => {
                             if let Some(text) = block.text {
@@ -1933,32 +2101,39 @@ fn convert_assistant_message(
         _ => {}
     }
 
-    // 组合 thinking 和 text 内容
-    // 格式: <thinking>思考内容</thinking>\n\ntext内容
-    let final_content = if !thinking_content.is_empty() && inline_thinking {
-        if !text_content.is_empty() {
+    // 老模型：thinking 以 `<thinking>` 标签内联进正文（格式: <thinking>思考</thinking>\n\ntext）
+    // 新模型：推理走结构化 reasoningContent，正文只放文本
+    let had_reasoning_block = last_reasoning.is_some();
+    let (final_content, reasoning) = if inline_thinking {
+        let content = if thinking_content.is_empty() {
+            text_content
+        } else if text_content.is_empty() {
+            format!("<thinking>{}</thinking>", thinking_content)
+        } else {
             format!(
                 "<thinking>{}</thinking>\n\n{}",
                 thinking_content, text_content
             )
-        } else {
-            format!("<thinking>{}</thinking>", thinking_content)
-        }
-    } else if !thinking_content.is_empty() && text_content.is_empty() && tool_uses.is_empty() {
-        // 只有 thinking 的回复省略思考后不留完全空的 assistant 消息
-        ".".to_string()
+        };
+        (content, None)
     } else {
-        text_content
+        (
+            text_content,
+            last_reasoning.and_then(LastReasoningBlock::into_forwardable),
+        )
     };
 
-    let mut assistant = AssistantMessage::new(final_content);
+    let mut assistant = AssistantMessage::new(final_content).with_reasoning_content(reasoning);
     if !tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(tool_uses);
     }
 
-    Ok(HistoryAssistantMessage {
-        assistant_response_message: assistant,
-    })
+    Ok((
+        HistoryAssistantMessage {
+            assistant_response_message: assistant,
+        },
+        had_reasoning_block,
+    ))
 }
 
 /// 合并多个连续的 assistant 消息为一条
@@ -1975,15 +2150,24 @@ fn merge_assistant_messages(
 
     let mut all_tool_uses: Vec<ToolUseEntry> = Vec::new();
     let mut content_parts: Vec<String> = Vec::new();
+    // 与官方客户端一致：每条消息只回传最后一段推理（findLast），
+    // 若最后一段不可回传则整条消息不带推理
+    let mut reasoning: Option<ReasoningContent> = None;
+    let mut had_reasoning_block = false;
 
     for msg in messages {
-        let converted = convert_assistant_message(msg, tool_name_map, inline_thinking)?;
+        let (converted, msg_had_reasoning) =
+            convert_assistant_message_raw(msg, tool_name_map, inline_thinking)?;
         let am = converted.assistant_response_message;
         if !am.content.trim().is_empty() {
             content_parts.push(am.content);
         }
         if let Some(tus) = am.tool_uses {
             all_tool_uses.extend(tus);
+        }
+        if msg_had_reasoning {
+            had_reasoning_block = true;
+            reasoning = am.reasoning_content;
         }
     }
 
@@ -1993,10 +2177,11 @@ fn merge_assistant_messages(
         content_parts.join("\n\n")
     };
 
-    let mut assistant = AssistantMessage::new(content);
+    let mut assistant = AssistantMessage::new(content).with_reasoning_content(reasoning);
     if !all_tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(all_tool_uses);
     }
+    finalize_assistant_content(&mut assistant, had_reasoning_block);
     Ok(HistoryAssistantMessage {
         assistant_response_message: assistant,
     })
@@ -2320,26 +2505,253 @@ mod tests {
                 .history
                 .iter()
                 .filter_map(|m| match m {
-                    Message::Assistant(a) => Some(a.assistant_response_message.content.clone()),
+                    Message::Assistant(a) => Some(a.assistant_response_message.clone()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
         };
+        let signed = |text: &str| {
+            Some(ReasoningContent::ReasoningText(ReasoningText {
+                text: text.to_string(),
+                signature: "sig".to_string(),
+            }))
+        };
 
-        // 结构化思考的新模型：思考不进正文（否则触发 REASONING_EXTRACTION 拒答）；
-        // 只有 thinking 的回复留 "." 而不是空消息
-        let texts = assistant_texts("claude-opus-5-5");
-        assert!(texts.iter().all(|t| !t.contains("<thinking>")), "{texts:?}");
-        assert_eq!(texts, vec!["".to_string(), ".".to_string()]);
+        // 结构化思考的新模型：思考走 reasoningContent（与官方客户端一致），绝不进正文
+        // （进正文会触发 REASONING_EXTRACTION 拒答）；只有思考的回复正文为空
+        let msgs = assistant_texts("claude-opus-5-5");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "");
+        assert_eq!(msgs[0].reasoning_content, signed("I should grep it."));
+        assert!(msgs[0].tool_uses.is_some());
+        assert_eq!(msgs[1].content, "");
+        assert_eq!(msgs[1].reasoning_content, signed("Nothing found."));
 
-        // 老模型：保持内联标签（history[0] 是注入思考前缀后的系统消息配对）
-        let texts = assistant_texts("claude-sonnet-4-5");
+        // 老模型：保持内联标签（history[0] 是注入思考前缀后的系统消息配对），不带 reasoningContent
+        let msgs = assistant_texts("claude-sonnet-4-5");
+        let texts: Vec<_> = msgs[1..].iter().map(|m| m.content.clone()).collect();
         assert_eq!(
-            texts[1..],
+            texts,
             [
                 "<thinking>I should grep it.</thinking>".to_string(),
                 "<thinking>Nothing found.</thinking>".to_string()
             ]
+        );
+        assert!(msgs.iter().all(|m| m.reasoning_content.is_none()));
+    }
+
+    fn msg(role: &str, content: serde_json::Value) -> super::super::types::Message {
+        super::super::types::Message {
+            role: role.to_string(),
+            content,
+        }
+    }
+
+    #[test]
+    fn test_fold_system_messages() {
+        // Claude Code 的形态：[user, system(环境信息)] —— 以前被当作 prefill 截掉
+        let folded = fold_system_messages(&[
+            msg("user", serde_json::json!("hello")),
+            msg("system", serde_json::json!("# Environment\n - Shell: zsh")),
+        ]);
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0].role, "user");
+        assert_eq!(
+            folded[0].content,
+            serde_json::json!([
+                {"type": "text", "text": "hello"},
+                {"type": "text", "text": "<system-reminder>\n# Environment\n - Shell: zsh\n</system-reminder>"}
+            ])
+        );
+
+        // 工具轮：[.., assistant(tool_use), user(tool_result), system(提醒)] → 追加到 tool_result 那条 user
+        let folded = fold_system_messages(&[
+            msg("user", serde_json::json!("q")),
+            msg(
+                "assistant",
+                serde_json::json!([{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}]),
+            ),
+            msg(
+                "user",
+                serde_json::json!([{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]),
+            ),
+            msg(
+                "system",
+                serde_json::json!([{"type": "text", "text": "reminder"}]),
+            ),
+        ]);
+        assert_eq!(folded.len(), 3);
+        let last = folded[2].content.as_array().unwrap();
+        assert_eq!(last[0]["type"], "tool_result");
+        assert_eq!(
+            last[1]["text"],
+            "<system-reminder>\nreminder\n</system-reminder>"
+        );
+
+        // 在 assistant 之后、下一条 user 之前 → 前置到下一条 user
+        let folded = fold_system_messages(&[
+            msg("user", serde_json::json!("a")),
+            msg("assistant", serde_json::json!("b")),
+            msg("system", serde_json::json!("note")),
+            msg("user", serde_json::json!("c")),
+        ]);
+        assert_eq!(folded.len(), 3);
+        assert_eq!(
+            folded[2].content[0]["text"],
+            "<system-reminder>\nnote\n</system-reminder>"
+        );
+        assert_eq!(folded[2].content[1]["text"], "c");
+
+        // 空内容（如仅调整 effort 的条目）忽略
+        let folded = fold_system_messages(&[
+            msg("user", serde_json::json!("a")),
+            msg("system", serde_json::json!([])),
+        ]);
+        assert_eq!(folded[0].content, serde_json::json!("a"));
+    }
+
+    #[test]
+    fn test_trailing_system_message_reaches_current_message() {
+        let mut req = req_with_thinking(Some("adaptive"), Some("high"));
+        req.messages = vec![
+            msg("user", serde_json::json!("look at app.py")),
+            msg("system", serde_json::json!("# Environment\n - Shell: zsh")),
+        ];
+        let r = convert_request(&req, &CompressionConfig::default(), None).unwrap();
+        let content = &r
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+        assert!(content.contains("look at app.py"), "{content}");
+        assert!(
+            content.contains("Shell: zsh"),
+            "系统消息不应再被当作 prefill 丢弃: {content}"
+        );
+    }
+
+    /// 结构化模式下单条 assistant 消息的转换
+    fn convert_structured(content: serde_json::Value) -> AssistantMessage {
+        let msg = super::super::types::Message {
+            role: "assistant".to_string(),
+            content,
+        };
+        convert_assistant_message(&msg, &mut HashMap::new(), false)
+            .unwrap()
+            .assistant_response_message
+    }
+
+    #[test]
+    fn test_structured_reasoning_follows_official_client_rules() {
+        // 无签名：不回传；只有思考时补 "."
+        let m = convert_structured(serde_json::json!([
+            {"type": "thinking", "thinking": "no sig"}
+        ]));
+        assert_eq!(m.reasoning_content, None);
+        assert_eq!(m.content, ".");
+
+        // 空签名同样不回传（上游会 400 THINKING_SIGNATURE_INVALID）
+        let m = convert_structured(serde_json::json!([
+            {"type": "thinking", "thinking": "x", "signature": ""},
+            {"type": "text", "text": "answer"}
+        ]));
+        assert_eq!(m.reasoning_content, None);
+        assert_eq!(m.content, "answer");
+
+        // 签名但思考文本为空（display=omitted）：不回传
+        let m = convert_structured(serde_json::json!([
+            {"type": "thinking", "thinking": "", "signature": "sig"},
+            {"type": "text", "text": "answer"}
+        ]));
+        assert_eq!(m.reasoning_content, None);
+
+        // redacted_thinking → redactedContent
+        let m = convert_structured(serde_json::json!([
+            {"type": "redacted_thinking", "data": "QUJD"},
+            {"type": "text", "text": "answer"}
+        ]));
+        assert_eq!(
+            m.reasoning_content,
+            Some(ReasoningContent::RedactedContent("QUJD".to_string()))
+        );
+
+        // 多段推理只取最后一段（findLast）；最后一段不可回传则整条不带推理
+        let m = convert_structured(serde_json::json!([
+            {"type": "thinking", "thinking": "first", "signature": "s1"},
+            {"type": "thinking", "thinking": "second", "signature": "s2"},
+            {"type": "text", "text": "answer"}
+        ]));
+        assert_eq!(
+            m.reasoning_content,
+            Some(ReasoningContent::ReasoningText(ReasoningText {
+                text: "second".to_string(),
+                signature: "s2".to_string()
+            }))
+        );
+        let m = convert_structured(serde_json::json!([
+            {"type": "thinking", "thinking": "first", "signature": "s1"},
+            {"type": "thinking", "thinking": "unsigned"},
+            {"type": "text", "text": "answer"}
+        ]));
+        assert_eq!(m.reasoning_content, None);
+        assert!(!m.content.contains("first"), "推理绝不进正文");
+    }
+
+    #[test]
+    fn test_reasoning_content_wire_shape() {
+        let m = convert_structured(serde_json::json!([
+            {"type": "thinking", "thinking": "think", "signature": "sig"},
+            {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}}
+        ]));
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(
+            v["reasoningContent"],
+            serde_json::json!({"reasoningText": {"text": "think", "signature": "sig"}})
+        );
+        let m = convert_structured(serde_json::json!([
+            {"type": "redacted_thinking", "data": "QUJD"},
+            {"type": "text", "text": "a"}
+        ]));
+        assert_eq!(
+            serde_json::to_value(&m).unwrap()["reasoningContent"],
+            serde_json::json!({"redactedContent": "QUJD"})
+        );
+        // 无推理时不输出该字段
+        let m = convert_structured(serde_json::json!([{"type": "text", "text": "a"}]));
+        assert!(
+            serde_json::to_value(&m)
+                .unwrap()
+                .get("reasoningContent")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_merged_assistant_messages_keep_last_reasoning() {
+        let a = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "thinking", "thinking": "early", "signature": "s1"},
+                {"type": "text", "text": "part one"}
+            ]),
+        };
+        let b = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "thinking", "thinking": "late", "signature": "s2"},
+                {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}
+            ]),
+        };
+        let merged = merge_assistant_messages(&[&a, &b], &mut HashMap::new(), false)
+            .unwrap()
+            .assistant_response_message;
+        assert_eq!(merged.content, "part one");
+        assert_eq!(
+            merged.reasoning_content,
+            Some(ReasoningContent::ReasoningText(ReasoningText {
+                text: "late".to_string(),
+                signature: "s2".to_string()
+            }))
         );
     }
 

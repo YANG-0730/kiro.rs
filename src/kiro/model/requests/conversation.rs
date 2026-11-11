@@ -123,12 +123,6 @@ pub struct UserInputMessage {
     /// 消息来源（通常为 "AI_EDITOR"）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
-    /// 额外模型请求字段（thinking / output_config.effort / reasoning 等）
-    ///
-    /// 仅当模型支持且客户端有对应配置时才写入。经验证，只有放在
-    /// `userInputMessage` 层级才对上游生效；null-schema 模型会静默忽略，安全。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub additional_model_request_fields: Option<serde_json::Value>,
 }
 
 impl UserInputMessage {
@@ -141,14 +135,7 @@ impl UserInputMessage {
             images: Vec::new(),
             documents: Vec::new(),
             origin: Some("AI_EDITOR".to_string()),
-            additional_model_request_fields: None,
         }
-    }
-
-    /// 设置额外模型请求字段
-    pub fn with_additional_model_request_fields(mut self, fields: serde_json::Value) -> Self {
-        self.additional_model_request_fields = Some(fields);
-        self
     }
 
     /// 设置消息上下文
@@ -369,6 +356,9 @@ pub struct AssistantMessage {
     /// 工具使用列表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_uses: Option<Vec<ToolUseEntry>>,
+    /// 该轮的推理内容（结构化回传，与官方 Kiro 客户端一致；每条消息至多一段）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<ReasoningContent>,
 }
 
 impl AssistantMessage {
@@ -377,6 +367,7 @@ impl AssistantMessage {
         Self {
             content: content.into(),
             tool_uses: None,
+            reasoning_content: None,
         }
     }
 
@@ -385,6 +376,39 @@ impl AssistantMessage {
         self.tool_uses = Some(tool_uses);
         self
     }
+
+    /// 设置推理内容
+    pub fn with_reasoning_content(mut self, reasoning: Option<ReasoningContent>) -> Self {
+        self.reasoning_content = reasoning;
+        self
+    }
+}
+
+/// 历史推理内容（上游 `ReasoningContent` union，二选一）
+///
+/// 官方 Kiro CLI 3.x（`@kiro/agent`）的历史构建规则：
+/// - 有文本且有签名 → `{"reasoningText":{"text","signature"}}`
+/// - 被屏蔽的推理 → `{"redactedContent":"<base64>"}`
+/// - 无签名的推理不回传（上游会 400 `THINKING_SIGNATURE_INVALID`）
+///
+/// 推理绝不能拼进 `content` 正文：上游会认为模型把内部推理写进了可见回复，
+/// 以 `REASONING_EXTRACTION` 拒答。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReasoningContent {
+    /// 带签名的推理文本
+    ReasoningText(ReasoningText),
+    /// 被屏蔽的推理（base64）
+    RedactedContent(String),
+}
+
+/// 带签名的推理文本
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReasoningText {
+    /// 推理文本（必须与上游下发的原文一致）
+    pub text: String,
+    /// 上游签名（必须原样回传）
+    pub signature: String,
 }
 
 #[cfg(test)]

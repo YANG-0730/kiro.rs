@@ -88,7 +88,7 @@ AppState {
 - 同优先级内先用仍有基础额度的凭据，全部进入超额后才用超额（超额另行计费，基础额度月底作废）；亲和绑定在超额凭据上的会话，若同优先级（或更高）还有基础额度凭据会改绑。跨月后对超额中凭据补查一次余额，避免整月误判
 - 请求失败时 `report_failure()` 触发故障转移到下一个可用凭据
 - 冷却分类管理：`FailureLimit` / `InsufficientBalance` / `ModelUnavailable` / `QuotaExceeded`
-- `MODEL_TEMPORARILY_UNAVAILABLE`（上游模型级过载）与凭据无关：不禁用/不冷却凭据，单请求最多 4 次、1s→2s→4s 退避重试，仍失败返回 529 `overloaded_error` 交给客户端重试
+- `MODEL_TEMPORARILY_UNAVAILABLE` / `INSUFFICIENT_MODEL_CAPACITY`（上游模型级过载 / 容量不足）与凭据无关：不禁用/不冷却凭据，单请求最多 4 次、1s→2s→4s 退避重试，仍失败返回 529 `overloaded_error` 交给客户端重试
 
 ## API 端点
 
@@ -109,11 +109,12 @@ AppState {
 5. **安全**: 使用 `subtle` 库进行常量时间比较防止时序攻击；Admin API Key 空字符串视为未配置
 6. **Prefill 处理**: Claude 4.x 已弃用 assistant prefill，末尾 assistant 消息被静默丢弃
 7. **sensitive-logs 特性**: 编译时 feature flag，启用后输出 token 用量诊断日志和请求体大小（默认关闭，仅用于排障）
-8. **网络错误分类**: 连接关闭/重置、发送失败等网络错误被归类为瞬态上游错误，返回 502（不记录请求体）
+8. **网络错误分类**: 连接关闭/重置、发送失败等网络错误被归类为瞬态上游错误，返回 502（不记录请求体）。对话 API 的 HTTP Client 不设整体超时（只设 30s 连接超时 + 300s 读空闲超时，与官方 CLI 一致），否则超过时限的长回复会被截断
 9. **Rust edition**: 项目使用 Rust 2024 edition
 10. **图片处理**: GIF 会被抽帧并重编码为 JPEG 静态帧序列（最多 20 帧、最多 5fps），以降低请求体大小并提升内容识别效果。图片缩放规则：长边超过 4000px 或总像素超过 400 万时等比缩放
 11. **上游限制（2026-10-12 实测）**: 请求体约 29~30MiB（`maxRequestBodyBytes` 默认 29MiB，超出本地返回 413 `request_too_large`，与官方一致）、单请求图片 100 张（`MAX_TOTAL_IMAGES`，超出时丢弃最旧的历史图片）、工具定义 ≥2MB 均可；真正的硬上限是模型上下文窗口。上游其余 400 透传为 400，不再变成 502。Write/Edit 分块写入策略（`compression.chunkedWritePolicy`）默认关闭：实测上游可完整返回单次 2600+ 行的 Write，不再需要"每次 ≤50 行"约束
 12. **端点与版本截止**: 默认 `defaultEndpoint=cli`（上报 Kiro CLI 2.37.1）。2026-11-10 起上游对旧 target `AmazonQDeveloperStreamingService.SendMessage` 及无 target 的 `/mcp` 一律返回 403 `FEATURE_NOT_SUPPORTED`（"This version of Kiro is no longer supported"，与版本号无关）；现用 `AmazonCodeWhispererStreamingService.GenerateAssistantResponse` / `.InvokeMCP`，二者要求 profileArn（API 放请求体、MCP 放 `x-amzn-kiro-profile-arn` 头），IdC 凭据缺失时经 `ListAvailableProfiles` 自动获取并回写。2027-01-15 起上游拒绝 CLI ≤ 2.5.0。该 403 不计入凭据失败、直接返回 502，避免版本截止时把整个号池禁用。可选端点 `cli3` 模拟官方 CLI 3.x：对话由其内嵌 Node 引擎 KAS 发往新服务 KiroRuntimeService（`runtime.{region}.kiro.dev`，awsJson 1.0，Content-Type 必须为 `application/x-amz-json-1.0`，API/MCP 的 profileArn 都放请求体），UA 为 `KiroCLI/3.1.0 KAS/0.66.91 os/linux md/appVersion-3.1.0`；余额/模型列表仍走 q 端点。appVersion 3.x 只有配合这种 JS UA 才被接受，套在 Rust CLI 的 UA 上会被拒。`ide` 端点上报 0.11.107 已不可用，不要改回 ide。Token 刷新（AWS SSO OIDC）不带版本号，不受影响
-13. **document / thinking**: Anthropic `document` 块（PDF 等）转为 `currentMessage.documents[]`（上游仅认当前消息、最多 5 个、名称字符受限，历史/超额文档转为占位文本）。schema 含 `thinking` 的新模型只用结构化字段 `additionalModelRequestFields` 控制思考，不再注入 `<thinking_mode>` 标签；老模型仍靠标签。客户端未设置 thinking/effort 时不下发，交由上游默认。历史 assistant 的 thinking 块：结构化思考的新模型直接省略（内联成 `<thinking>` 正文会让模型以为自己把推理写进了回复，几轮后被上游以 `REASONING_EXTRACTION` 拒答），老模型仍内联。上游拒答经 `metadataEvent.stopDetails.refusal` 下发，映射为 `stop_reason: "refusal"` + `stop_details`（不再是空回复）
-14. **输入压缩**（`compression.enabled`，生产默认关闭）: 当请求体接近 `maxRequestBodyBytes` 时，自动执行多层压缩（空白压缩 → thinking 截断 → tool_result 截断 → tool_use input 截断 → 历史截断），并自动修复 tool_use/tool_result 配对以避免上游 400 错误
-15. **上游 400 排障**: 若遇到 `Improperly formed request` 错误，参考 `docs/troubleshooting/400-improperly-formed-request.md` 和 `tools/test_400_improperly_formed.py` 进行诊断
+13. **会话中途的 `role:"system"` 消息**: Claude Code 对新模型把环境信息（工作目录 / 平台 / Shell）和每轮提醒放在 `messages` 里的 `role:"system"` 条目（通常紧跟最后一条 user）。Kiro 只有 user / assistant，转换时以 `<system-reminder>` 包裹折叠进相邻 user 消息（不能当 prefill 丢弃）
+14. **document / thinking**: Anthropic `document` 块（PDF 等）转为 `currentMessage.documents[]`（上游仅认当前消息、最多 5 个、名称字符受限，历史/超额文档转为占位文本）。schema 含 `thinking` 的新模型只用结构化字段 `additionalModelRequestFields` 控制思考（thinking.type / display、output_config.effort），不再注入 `<thinking_mode>` 标签；老模型仍靠标签。**该字段是请求顶层成员**（与 `conversationState` / `profileArn` 并列，见官方 Smithy 模型），旧版放在 `userInputMessage` 里会被上游静默忽略（2026-11-11 A/B 实测：effort / display 均不生效）。客户端未设置 thinking/effort 时不下发，交由上游默认。历史 assistant 的 thinking 块：结构化思考的新模型与官方 Kiro CLI 3.x（`@kiro/agent`）一致，放进 `assistantResponseMessage.reasoningContent`（`{reasoningText:{text,signature}}` 或 `{redactedContent}`，每条消息只取最后一段，无签名/空文本不回传），绝不拼进正文（内联 `<thinking>` 会被上游以 `REASONING_EXTRACTION` 拒答）；上游会验签，`THINKING_SIGNATURE_INVALID` 时去掉全部历史推理重试一次。响应侧按"签名封口"切分推理段，签名在块结束前一次性下发（`signature_delta`），`redactedContent` 映射为 `redacted_thinking`。老模型仍内联 `<thinking>`。上游拒答经 `metadataEvent.stopDetails.refusal` 下发，映射为 `stop_reason: "refusal"` + `stop_details`（不再是空回复）
+15. **输入压缩**（`compression.enabled`，生产默认关闭）: 当请求体接近 `maxRequestBodyBytes` 时，自动执行多层压缩（空白压缩 → thinking 截断 → tool_result 截断 → tool_use input 截断 → 历史截断），并自动修复 tool_use/tool_result 配对以避免上游 400 错误
+16. **上游 400 排障**: 若遇到 `Improperly formed request` 错误，参考 `docs/troubleshooting/400-improperly-formed-request.md` 和 `tools/test_400_improperly_formed.py` 进行诊断

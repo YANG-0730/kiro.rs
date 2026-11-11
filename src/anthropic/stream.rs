@@ -381,9 +381,13 @@ impl SseStateManager {
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
-        // 如果是 tool_use 块，先关闭之前的文本块
         if block_type == "tool_use" {
             self.has_tool_use = true;
+        }
+
+        // Anthropic 内容块必须顺序出现：开始非文本块（tool_use / thinking / redacted_thinking）
+        // 前先关闭仍打开的文本块；之后再来的正文会由 create_text_delta_events 开新文本块
+        if block_type != "text" {
             for (block_index, block) in self.active_blocks.iter_mut() {
                 if block.block_type == "text" && block.started && !block.stopped {
                     // 自动发送 content_block_stop 关闭文本块
@@ -530,6 +534,63 @@ impl SseStateManager {
     }
 }
 
+/// 非流式路径的结构化推理累积
+///
+/// 分段语义与流式路径（`StreamContext::process_reasoning_content`）一致：
+/// `signature` 帧封口当前段（多帧拼接），封口后再来的文本属于新的一段；
+/// `redactedContent` 帧单独成 `redacted_thinking` 块。
+#[derive(Debug, Default)]
+pub(crate) struct ReasoningAccumulator {
+    blocks: Vec<serde_json::Value>,
+    text: String,
+    signature: String,
+    sealed: bool,
+}
+
+impl ReasoningAccumulator {
+    /// 累积一帧 reasoningContentEvent
+    pub(crate) fn push(&mut self, event: &crate::kiro::model::events::ReasoningContentEvent) {
+        if let Some(data) = event.redacted_content.as_deref()
+            && !data.is_empty()
+        {
+            self.flush();
+            self.blocks
+                .push(json!({ "type": "redacted_thinking", "data": data }));
+        }
+        if let Some(text) = event.text.as_deref()
+            && !text.is_empty()
+        {
+            if self.sealed {
+                self.flush();
+            }
+            self.text.push_str(text);
+        }
+        if let Some(signature) = event.signature.as_deref()
+            && !signature.is_empty()
+        {
+            self.signature.push_str(signature);
+            self.sealed = true;
+        }
+    }
+
+    fn flush(&mut self) {
+        if !self.text.is_empty() || !self.signature.is_empty() {
+            self.blocks.push(json!({
+                "type": "thinking",
+                "thinking": std::mem::take(&mut self.text),
+                "signature": std::mem::take(&mut self.signature)
+            }));
+        }
+        self.sealed = false;
+    }
+
+    /// 结束累积，返回按到达顺序排列的 thinking / redacted_thinking 块
+    pub(crate) fn finish(mut self) -> Vec<serde_json::Value> {
+        self.flush();
+        self.blocks
+    }
+}
+
 /// 流处理上下文
 pub struct StreamContext {
     /// SSE 状态管理器
@@ -562,6 +623,14 @@ pub struct StreamContext {
     pub thinking_block_index: Option<i32>,
     /// 结构化推理块索引（新模型 reasoningContentEvent 专用，与内联 thinking 互斥）
     pub reasoning_block_index: Option<i32>,
+    /// 当前推理段已收到的签名（段结束时一次性下发）
+    reasoning_signature: String,
+    /// 当前推理段的签名帧数（诊断用）
+    reasoning_signature_frames: u32,
+    /// 当前推理段是否已被签名封口（之后的推理文本属于新段）
+    reasoning_sealed: bool,
+    /// 上一个推理块是否在没有签名的情况下被关闭（正文 / tool_use 先于签名到达）
+    reasoning_closed_unsigned: bool,
     /// 上游模型上下文窗口大小（来自 ListAvailableModels 的 maxInputTokens）；
     /// None 表示 registry 未命中，回退到 `get_context_window_size` 静态判断
     pub context_window: Option<i32>,
@@ -602,6 +671,10 @@ impl StreamContext {
             thinking_extracted: false,
             thinking_block_index: None,
             reasoning_block_index: None,
+            reasoning_signature: String::new(),
+            reasoning_signature_frames: 0,
+            reasoning_sealed: false,
+            reasoning_closed_unsigned: false,
             context_window: None,
             text_block_index: None,
             metering: None,
@@ -741,9 +814,13 @@ impl StreamContext {
                     self.state_manager.set_refusal(stop_details);
                 } else {
                     tracing::debug!(upstream_stop_reason = ?metadata.stop_reason, "收到 metadataEvent");
+                    if let Some(reason) = metadata.anthropic_stop_reason() {
+                        self.state_manager.set_stop_reason(reason);
+                    }
                 }
                 Vec::new()
             }
+            Event::InitialResponse => Vec::new(),
             Event::Unknown {
                 event_type,
                 payload_preview,
@@ -794,19 +871,63 @@ impl StreamContext {
     /// 处理结构化推理内容事件（新模型的 reasoningContentEvent）
     ///
     /// 新模型（opus-5 / sonnet-5 / opus-4.8 等）通过独立事件流返回思考内容，
-    /// 与老模型在正文中内联 `<thinking>` 标签的机制互斥。这里将其映射为
-    /// Anthropic 的 `thinking` 内容块：
-    /// - 首个 `text` 帧触发 `content_block_start(type=thinking)`
-    /// - 后续 `text` 帧转为 `thinking_delta`
-    /// - `signature` 帧转为 `signature_delta`
+    /// 与老模型在正文中内联 `<thinking>` 标签的机制互斥。按官方 Kiro 客户端
+    /// （`@kiro/agent`）的语义切分推理段，并映射为 Anthropic 内容块：
+    /// - `text` 帧累积为当前段的 `thinking_delta`
+    /// - `signature` 帧封口当前段（缓存，段结束时一次性发 `signature_delta`，
+    ///   与官方 API 一致：签名是 thinking 块最后一个 delta）
+    /// - 封口后再来 `text` → 新的一段，开新的 thinking 块
+    /// - `redactedContent` 帧 → 独立的 `redacted_thinking` 块
     ///
-    /// 推理块在首个正文（assistantResponseEvent）或 tool_use 到达前关闭
-    /// （见 `close_reasoning_block_if_open`）。
+    /// 签名必须完整、原样到达客户端：客户端下一轮会把 thinking 块连同签名
+    /// 回传，代理再放进 `reasoningContent` 发回上游验签。
     fn process_reasoning_content(
         &mut self,
         reasoning: &crate::kiro::model::events::ReasoningContentEvent,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
+
+        // 屏蔽推理：独立的 redacted_thinking 块（start 即携带完整 data，随即 stop）
+        if let Some(data) = reasoning.redacted_content.as_deref()
+            && !data.is_empty()
+        {
+            events.extend(self.close_reasoning_block_if_open());
+            let idx = self.state_manager.next_block_index();
+            events.extend(self.state_manager.handle_content_block_start(
+                idx,
+                "redacted_thinking",
+                json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {
+                        "type": "redacted_thinking",
+                        "data": data
+                    }
+                }),
+            ));
+            if let Some(stop) = self.state_manager.handle_content_block_stop(idx) {
+                events.push(stop);
+            }
+        }
+
+        let text = reasoning.text.as_deref().filter(|t| !t.is_empty());
+        let signature = reasoning.signature.as_deref().filter(|s| !s.is_empty());
+        if text.is_none() && signature.is_none() {
+            return events;
+        }
+
+        // 已封口（收到过签名）的段之后又来文本：结束旧段，开新段
+        if text.is_some() && self.reasoning_sealed {
+            events.extend(self.close_reasoning_block_if_open());
+        }
+
+        // 迟到的签名：它所属的推理块已因正文 / tool_use 先到而无签名关闭，
+        // SSE 无法回补到已关闭的块；不为它单独造一个空 thinking 块
+        if text.is_none() && self.reasoning_block_index.is_none() && self.reasoning_closed_unsigned
+        {
+            tracing::debug!("推理签名晚于正文到达，所属 thinking 块已关闭，丢弃该签名");
+            return events;
+        }
 
         // 按需创建 thinking 块
         let index = if let Some(idx) = self.reasoning_block_index {
@@ -831,9 +952,7 @@ impl StreamContext {
         };
 
         // text 增量 → thinking_delta
-        if let Some(text) = &reasoning.text
-            && !text.is_empty()
-        {
+        if let Some(text) = text {
             self.output_tokens += estimate_tokens(text);
             if let Some(delta) = self.state_manager.handle_content_block_delta(
                 index,
@@ -850,37 +969,64 @@ impl StreamContext {
             }
         }
 
-        // signature 帧 → signature_delta
-        if let Some(signature) = &reasoning.signature
-            && !signature.is_empty()
-            && let Some(delta) = self.state_manager.handle_content_block_delta(
-                index,
-                json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {
-                        "type": "signature_delta",
-                        "signature": signature
-                    }
-                }),
-            )
-        {
-            events.push(delta);
+        // signature 帧：缓存并封口，段结束时一次性下发
+        if let Some(signature) = signature {
+            self.reasoning_signature.push_str(signature);
+            self.reasoning_signature_frames += 1;
+            self.reasoning_sealed = true;
         }
 
         events
     }
 
+    /// 上游流异常中断时调用：丢弃尚未确认完整的签名，推理块按无签名关闭
+    ///
+    /// 不完整的签名会被客户端原样保存并在后续每一轮回传，导致上游
+    /// THINKING_SIGNATURE_INVALID；无签名的 thinking 块则只是不回传。
+    pub fn discard_pending_reasoning_signature(&mut self) {
+        if !self.reasoning_signature.is_empty() {
+            tracing::warn!("上游流中断，丢弃未确认完整的推理签名");
+            self.reasoning_signature.clear();
+            self.reasoning_signature_frames = 0;
+        }
+    }
+
     /// 若结构化推理块处于打开状态，先关闭它
     ///
-    /// 在正文文本或 tool_use 开始前调用，确保 thinking 块先于其他内容块结束，
-    /// 符合 Anthropic 的内容块顺序约定。
+    /// 在正文文本、tool_use、新推理段或流结束前调用：先下发缓存的完整签名
+    /// （`signature_delta`），再 `content_block_stop`，符合 Anthropic 的内容块顺序约定。
     fn close_reasoning_block_if_open(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
-        if let Some(idx) = self.reasoning_block_index.take()
-            && let Some(stop_event) = self.state_manager.handle_content_block_stop(idx)
-        {
-            events.push(stop_event);
+        if let Some(idx) = self.reasoning_block_index.take() {
+            let signature = std::mem::take(&mut self.reasoning_signature);
+            if self.reasoning_signature_frames > 1 {
+                tracing::debug!(
+                    frames = self.reasoning_signature_frames,
+                    signature_len = signature.len(),
+                    "推理签名分多帧到达，已拼接"
+                );
+            }
+            self.reasoning_signature_frames = 0;
+            self.reasoning_sealed = false;
+            self.reasoning_closed_unsigned = signature.is_empty();
+            if !signature.is_empty()
+                && let Some(delta) = self.state_manager.handle_content_block_delta(
+                    idx,
+                    json!({
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {
+                            "type": "signature_delta",
+                            "signature": signature
+                        }
+                    }),
+                )
+            {
+                events.push(delta);
+            }
+            if let Some(stop_event) = self.state_manager.handle_content_block_stop(idx) {
+                events.push(stop_event);
+            }
         }
         events
     }
@@ -1233,6 +1379,9 @@ impl StreamContext {
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
+
+        // 结构化推理块仍打开（只有推理、或推理后流即结束）：先下发缓存的签名再关闭
+        events.extend(self.close_reasoning_block_if_open());
 
         // Flush thinking_buffer 中的剩余内容
         if self.thinking_enabled && !self.thinking_buffer.is_empty() {
@@ -2636,6 +2785,226 @@ mod tests {
             "signature": signature,
         }))
         .unwrap()
+    }
+
+    fn reasoning_ctx() -> StreamContext {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5-5",
+            1,
+            zero_cache_usage(),
+            true,
+            HashMap::new(),
+        );
+        let _ = ctx.generate_initial_events();
+        ctx
+    }
+
+    fn feed_reasoning(
+        ctx: &mut StreamContext,
+        text: Option<&str>,
+        signature: Option<&str>,
+    ) -> Vec<SseEvent> {
+        ctx.process_kiro_event(&Event::ReasoningContent(reasoning_event(text, signature)))
+    }
+
+    /// 签名缓存到推理段结束时一次性下发，紧挨着 content_block_stop；
+    /// 多帧签名按到达顺序拼接；封口后的推理文本开新块（与官方 Kiro 客户端分段一致）
+    #[test]
+    fn test_reasoning_signature_emitted_once_and_segments_split() {
+        let mut ctx = reasoning_ctx();
+        let mut events = Vec::new();
+        events.extend(feed_reasoning(&mut ctx, Some("first"), None));
+        events.extend(feed_reasoning(&mut ctx, None, Some("SIG-A")));
+        events.extend(feed_reasoning(&mut ctx, None, Some("SIG-B")));
+        // 封口后又来推理文本 → 新的一段
+        events.extend(feed_reasoning(&mut ctx, Some("second"), None));
+        events.extend(feed_reasoning(&mut ctx, None, Some("SIG-C")));
+        events.extend(ctx.generate_final_events());
+
+        let starts: Vec<i64> = events
+            .iter()
+            .filter(|e| e.event == "content_block_start")
+            .map(|e| e.data["index"].as_i64().unwrap())
+            .collect();
+        assert_eq!(starts.len(), 2, "两段推理应为两个 thinking 块");
+
+        let sigs: Vec<(i64, &str)> = events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
+            })
+            .map(|e| {
+                (
+                    e.data["index"].as_i64().unwrap(),
+                    e.data["delta"]["signature"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(sigs, vec![(starts[0], "SIG-ASIG-B"), (starts[1], "SIG-C")]);
+
+        // 每个 signature_delta 后紧跟同一块的 content_block_stop
+        for (i, e) in events.iter().enumerate() {
+            if e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta" {
+                let next = &events[i + 1];
+                assert_eq!(next.event, "content_block_stop");
+                assert_eq!(next.data["index"], e.data["index"]);
+            }
+        }
+    }
+
+    /// 正文之后又来新的推理段：先关闭正文块再开 thinking 块（块不能交叠），
+    /// 之后的正文开新的文本块
+    #[test]
+    fn test_reasoning_after_text_closes_text_block_first() {
+        let mut ctx = reasoning_ctx();
+        let mut events = feed_reasoning(&mut ctx, Some("plan"), None);
+        events.extend(feed_reasoning(&mut ctx, None, Some("SIG1")));
+        let text: crate::kiro::model::events::AssistantResponseEvent =
+            serde_json::from_value(serde_json::json!({"content": "progress note"})).unwrap();
+        events.extend(ctx.process_kiro_event(&Event::AssistantResponse(text)));
+        events.extend(feed_reasoning(&mut ctx, Some("more"), None));
+        events.extend(feed_reasoning(&mut ctx, None, Some("SIG2")));
+        let text2: crate::kiro::model::events::AssistantResponseEvent =
+            serde_json::from_value(serde_json::json!({"content": "final"})).unwrap();
+        events.extend(ctx.process_kiro_event(&Event::AssistantResponse(text2)));
+        events.extend(ctx.generate_final_events());
+
+        // 任一时刻至多一个打开的块，且 start/stop 严格交替
+        let mut open: Option<i64> = None;
+        let mut order = Vec::new();
+        for e in &events {
+            match e.event.as_str() {
+                "content_block_start" => {
+                    assert!(open.is_none(), "块交叠: {:?} 仍打开时开始新块", open);
+                    open = e.data["index"].as_i64();
+                    order.push(
+                        e.data["content_block"]["type"]
+                            .as_str()
+                            .unwrap()
+                            .to_string(),
+                    );
+                }
+                "content_block_delta" => {
+                    assert_eq!(open, e.data["index"].as_i64(), "delta 写入了非当前块");
+                }
+                "content_block_stop" => {
+                    assert_eq!(open, e.data["index"].as_i64());
+                    open = None;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(order, vec!["thinking", "text", "thinking", "text"]);
+    }
+
+    /// 迟到的签名（所属推理块已因正文先到而无签名关闭）不再造一个空 thinking 块
+    #[test]
+    fn test_late_signature_after_text_is_dropped() {
+        let mut ctx = reasoning_ctx();
+        let mut events = feed_reasoning(&mut ctx, Some("abc"), None);
+        let text: crate::kiro::model::events::AssistantResponseEvent =
+            serde_json::from_value(serde_json::json!({"content": "Hi"})).unwrap();
+        events.extend(ctx.process_kiro_event(&Event::AssistantResponse(text)));
+        events.extend(feed_reasoning(&mut ctx, None, Some("LATE")));
+        events.extend(ctx.generate_final_events());
+        let thinking_blocks = events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking"
+            })
+            .count();
+        assert_eq!(thinking_blocks, 1);
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.data["delta"]["type"] == "signature_delta")
+        );
+    }
+
+    /// 只有签名、此前没有任何推理块（display=omitted 的形态）：仍开块承载签名
+    #[test]
+    fn test_signature_only_reasoning_opens_block() {
+        let mut ctx = reasoning_ctx();
+        let mut events = feed_reasoning(&mut ctx, None, Some("SIG"));
+        events.extend(ctx.generate_final_events());
+        assert!(events.iter().any(|e| e.data["delta"]["signature"] == "SIG"));
+    }
+
+    /// 上游流中断：未确认完整的签名不下发
+    #[test]
+    fn test_partial_signature_discarded_on_stream_abort() {
+        let mut ctx = reasoning_ctx();
+        let mut events = feed_reasoning(&mut ctx, Some("think"), None);
+        events.extend(feed_reasoning(&mut ctx, None, Some("PART")));
+        ctx.discard_pending_reasoning_signature();
+        events.extend(ctx.generate_final_events());
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.data["delta"]["type"] == "signature_delta")
+        );
+        assert!(events.iter().any(|e| e.event == "content_block_stop"));
+    }
+
+    /// 只有推理、流即结束：结束时也要下发签名
+    #[test]
+    fn test_reasoning_only_stream_flushes_signature_at_end() {
+        let mut ctx = reasoning_ctx();
+        let mut events = feed_reasoning(&mut ctx, Some("think"), None);
+        events.extend(feed_reasoning(&mut ctx, None, Some("SIG")));
+        events.extend(ctx.generate_final_events());
+        assert!(events.iter().any(|e| {
+            e.event == "content_block_delta" && e.data["delta"]["signature"] == "SIG"
+        }));
+        let stops = events
+            .iter()
+            .filter(|e| e.event == "content_block_stop")
+            .count();
+        assert_eq!(stops, 1);
+    }
+
+    /// redactedContent → 独立的 redacted_thinking 块
+    #[test]
+    fn test_redacted_reasoning_maps_to_redacted_thinking_block() {
+        let mut ctx = reasoning_ctx();
+        let redacted: crate::kiro::model::events::ReasoningContentEvent =
+            serde_json::from_value(serde_json::json!({"redactedContent": "QUJD"})).unwrap();
+        let mut events = ctx.process_kiro_event(&Event::ReasoningContent(redacted));
+        events.extend(ctx.generate_final_events());
+        let start = events
+            .iter()
+            .find(|e| e.event == "content_block_start")
+            .unwrap();
+        assert_eq!(
+            start.data["content_block"],
+            json!({"type": "redacted_thinking", "data": "QUJD"})
+        );
+        assert!(
+            !events.iter().any(|e| e.event == "content_block_delta"),
+            "redacted_thinking 没有 delta"
+        );
+    }
+
+    /// 非流式累积与流式分段语义一致
+    #[test]
+    fn test_reasoning_accumulator_segments() {
+        let mut acc = ReasoningAccumulator::default();
+        acc.push(&reasoning_event(Some("a"), None));
+        acc.push(&reasoning_event(Some("b"), None));
+        acc.push(&reasoning_event(None, Some("S1")));
+        acc.push(&reasoning_event(None, Some("S2")));
+        acc.push(&reasoning_event(Some("c"), None));
+        let redacted: crate::kiro::model::events::ReasoningContentEvent =
+            serde_json::from_value(serde_json::json!({"redactedContent": "QUJD"})).unwrap();
+        acc.push(&redacted);
+        assert_eq!(
+            acc.finish(),
+            vec![
+                json!({"type": "thinking", "thinking": "ab", "signature": "S1S2"}),
+                json!({"type": "thinking", "thinking": "c", "signature": ""}),
+                json!({"type": "redacted_thinking", "data": "QUJD"}),
+            ]
+        );
     }
 
     /// 结构化推理事件（新模型）→ Anthropic thinking 块，且在正文前正确关闭

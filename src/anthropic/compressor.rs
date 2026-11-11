@@ -10,7 +10,7 @@
 //! 4. tool_use input 截断
 //! 5. 历史截断
 
-use crate::kiro::model::requests::conversation::{ConversationState, Message};
+use crate::kiro::model::requests::conversation::{ConversationState, Message, ReasoningContent};
 use crate::model::config::CompressionConfig;
 
 /// 压缩统计信息
@@ -171,8 +171,29 @@ fn compress_string_field(field: &mut String) -> usize {
 fn compress_thinking_pass(state: &mut ConversationState, strategy: &str) -> usize {
     let mut saved = 0usize;
 
-    for msg in &mut state.history {
+    // truncate 保留最近一条 assistant（进行中的工具循环）的结构化推理，只丢更早的
+    let last_assistant = state
+        .history
+        .iter()
+        .rposition(|m| matches!(m, Message::Assistant(_)));
+
+    for (idx, msg) in state.history.iter_mut().enumerate() {
         if let Message::Assistant(assistant_msg) = msg {
+            // 结构化推理（reasoningContent）带签名，无法截断（截断后验签必然失败），只能整段丢弃：
+            // discard 全部丢弃；truncate 保留最近一条
+            let keep_latest = strategy == "truncate" && Some(idx) == last_assistant;
+            if matches!(strategy, "discard" | "truncate")
+                && !keep_latest
+                && let Some(reasoning) = assistant_msg
+                    .assistant_response_message
+                    .reasoning_content
+                    .take()
+            {
+                saved += match reasoning {
+                    ReasoningContent::ReasoningText(r) => r.text.len() + r.signature.len(),
+                    ReasoningContent::RedactedContent(d) => d.len(),
+                };
+            }
             let content = &mut assistant_msg.assistant_response_message.content;
             let original_len = content.len();
 
@@ -1024,6 +1045,53 @@ mod tests {
         } else {
             panic!("expected Assistant message");
         }
+    }
+
+    #[test]
+    fn test_thinking_compression_drops_structured_reasoning() {
+        fn state_with_reasoning() -> ConversationState {
+            let mut state = make_simple_state(
+                vec![("u1", "older answer"), ("u2", "latest answer")],
+                "current",
+            );
+            for msg in &mut state.history {
+                if let Message::Assistant(a) = msg {
+                    a.assistant_response_message.reasoning_content =
+                        Some(ReasoningContent::ReasoningText(ReasoningText {
+                            text: "long reasoning".to_string(),
+                            signature: "sig".to_string(),
+                        }));
+                }
+            }
+            state
+        }
+        fn reasoning_flags(state: &ConversationState) -> Vec<bool> {
+            state
+                .history
+                .iter()
+                .filter_map(|m| match m {
+                    Message::Assistant(a) => {
+                        Some(a.assistant_response_message.reasoning_content.is_some())
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        // discard：全部丢弃（带签名的推理无法截断）
+        let mut state = state_with_reasoning();
+        assert!(compress_thinking_pass(&mut state, "discard") > 0);
+        assert_eq!(reasoning_flags(&state), vec![false, false]);
+
+        // truncate：保留最近一条（进行中的工具循环），只丢更早的
+        let mut state = state_with_reasoning();
+        assert!(compress_thinking_pass(&mut state, "truncate") > 0);
+        assert_eq!(reasoning_flags(&state), vec![false, true]);
+
+        // keep：全部保留
+        let mut state = state_with_reasoning();
+        compress_thinking_pass(&mut state, "keep");
+        assert_eq!(reasoning_flags(&state), vec![true, true]);
     }
 
     #[test]

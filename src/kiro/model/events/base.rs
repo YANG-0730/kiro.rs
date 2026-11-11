@@ -23,6 +23,8 @@ pub enum EventType {
     ContextUsage,
     /// 元数据事件（停止原因 / 拒答详情）
     Metadata,
+    /// 流开头的初始响应（cli3 每次都会发 `{"conversationId":""}`），无需处理
+    InitialResponse,
     /// 未知事件类型
     Unknown,
 }
@@ -37,6 +39,7 @@ impl EventType {
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
             "metadataEvent" => Self::Metadata,
+            "initial-response" => Self::InitialResponse,
             _ => Self::Unknown,
         }
     }
@@ -50,6 +53,7 @@ impl EventType {
             Self::Metering => "meteringEvent",
             Self::ContextUsage => "contextUsageEvent",
             Self::Metadata => "metadataEvent",
+            Self::InitialResponse => "initial-response",
             Self::Unknown => "unknown",
         }
     }
@@ -86,6 +90,8 @@ pub enum Event {
     ContextUsage(super::ContextUsageEvent),
     /// 元数据（停止原因 / 拒答详情）
     Metadata(super::MetadataEvent),
+    /// 流开头的初始响应（无需处理）
+    InitialResponse,
     /// 未知事件（保留事件类型与 payload 预览，便于排查上游新增事件）
     Unknown {
         /// 原始 `:event-type` 头
@@ -152,6 +158,7 @@ impl Event {
                 let payload = super::MetadataEvent::from_frame(&frame)?;
                 Ok(Self::Metadata(payload))
             }
+            EventType::InitialResponse => Ok(Self::InitialResponse),
             EventType::Unknown => Ok(Self::Unknown {
                 event_type: event_type_str.to_string(),
                 payload_preview: frame

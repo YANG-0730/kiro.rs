@@ -987,6 +987,7 @@ pub async fn post_messages(
     let mut kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: state.profile_arn.clone(),
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
     let mut request_body = match serde_json::to_string(&kiro_request) {
@@ -1288,6 +1289,8 @@ fn create_sse_stream(
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
+                            // 流不完整：签名可能缺帧，不能当作完整签名下发
+                            ctx.discard_pending_reasoning_signature();
                             // 发送最终事件并结束
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -1379,9 +1382,8 @@ async fn handle_non_stream_request(
     }
 
     let mut text_content = String::new();
-    // 结构化推理内容（新模型 reasoningContentEvent）：thinking 文本与结束签名
-    let mut reasoning_content = String::new();
-    let mut reasoning_signature: Option<String> = None;
+    // 结构化推理（新模型 reasoningContentEvent），分段语义与流式路径一致
+    let mut reasoning = super::stream::ReasoningAccumulator::default();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
@@ -1406,13 +1408,8 @@ async fn handle_non_stream_request(
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
                         }
-                        Event::ReasoningContent(reasoning) => {
-                            if let Some(text) = reasoning.text {
-                                reasoning_content.push_str(&text);
-                            }
-                            if let Some(sig) = reasoning.signature {
-                                reasoning_signature = Some(sig);
-                            }
+                        Event::ReasoningContent(event) => {
+                            reasoning.push(&event);
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
@@ -1549,8 +1546,12 @@ async fn handle_non_stream_request(
                                     upstream_stop_reason = ?metadata.stop_reason,
                                     "收到 metadataEvent"
                                 );
+                                if let Some(reason) = metadata.anthropic_stop_reason() {
+                                    stop_reason = reason.to_string();
+                                }
                             }
                         }
+                        Event::InitialResponse => {}
                         Event::Unknown {
                             event_type,
                             payload_preview,
@@ -1586,24 +1587,24 @@ async fn handle_non_stream_request(
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
 
+    let mut reasoning_blocks = reasoning.finish();
+
     // 老模型（无 reasoningContentEvent）把思考以内联 `<thinking>` 写进正文：与流式路径一致，
-    // 客户端开启 thinking 时拆成独立的 thinking 块
-    if reasoning_content.is_empty()
+    // 客户端开启 thinking 时拆成独立的 thinking 块（无签名）
+    if reasoning_blocks.is_empty()
         && context.thinking_enabled
         && let Some((thinking, rest)) = super::stream::split_inline_thinking(&text_content)
     {
-        reasoning_content = thinking;
+        reasoning_blocks.push(json!({
+            "type": "thinking",
+            "thinking": thinking,
+            "signature": ""
+        }));
         text_content = rest;
     }
 
-    // 结构化推理块（新模型）置于最前，符合 Anthropic 内容块顺序约定
-    if !reasoning_content.is_empty() {
-        content.push(json!({
-            "type": "thinking",
-            "thinking": reasoning_content,
-            "signature": reasoning_signature.unwrap_or_default()
-        }));
-    }
+    // 推理块置于最前，符合 Anthropic 内容块顺序约定
+    content.extend(reasoning_blocks);
 
     if !text_content.is_empty() {
         content.push(json!({
@@ -2074,6 +2075,7 @@ mod tests {
                 ))
                 .with_history(vec![KiroMessage::user("history", "model")]),
             profile_arn: None,
+            additional_model_request_fields: None,
         };
         if let KiroMessage::User(user) = &mut kiro_request.conversation_state.history[0] {
             user.user_input_message.images = vec![KiroImage::from_base64("png", big.clone())];

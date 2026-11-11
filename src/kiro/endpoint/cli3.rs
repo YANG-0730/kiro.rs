@@ -3,7 +3,7 @@
 //! 官方 CLI 3.x 的对话由内嵌的 Node 引擎 KAS（`@kiro/agent`）发出，走新服务
 //! KiroRuntimeService：`https://runtime.{region}.kiro.dev/`，awsJson 1.0
 //! （`X-Amz-Target: KiroRuntimeService.*`，Content-Type 必须是 `application/x-amz-json-1.0`）。
-//! 响应仍是 AWS event stream（额外的 `initial-response` / `metadataEvent` 由解析器忽略）。
+//! 响应仍是 AWS event stream（开头的 `initial-response` 被忽略；`metadataEvent` 携带停止原因 / 拒答详情）。
 //! API 与 MCP 都要求请求体带 profileArn。余额 / 模型列表仍走 `q.{region}` 的旧接口。
 
 use reqwest::RequestBuilder;
