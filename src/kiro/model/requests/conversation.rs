@@ -84,6 +84,28 @@ impl ConversationState {
         }
         removed
     }
+
+    /// 清除历史消息中的文档附件（保留 current_message 的文档），
+    /// 并在该条消息正文里留占位说明，返回清除数量
+    pub fn remove_history_documents(&mut self) -> usize {
+        let mut removed = 0;
+        for msg in &mut self.history {
+            if let Message::User(user_msg) = msg {
+                let m = &mut user_msg.user_input_message;
+                for doc in m.documents.drain(..) {
+                    removed += 1;
+                    if !m.content.is_empty() {
+                        m.content.push('\n');
+                    }
+                    m.content.push_str(&format!(
+                        "[Document omitted: {} - removed to fit the request size limit; re-read the file if its content is needed]",
+                        doc.name
+                    ));
+                }
+            }
+        }
+        removed
+    }
 }
 
 /// 当前消息容器
@@ -419,6 +441,34 @@ pub struct ReasoningText {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_remove_history_documents_keeps_current() {
+        let doc = |name: &str| KiroDocument {
+            format: "pdf".to_string(),
+            name: name.to_string(),
+            source: KiroImageSource {
+                bytes: "JVBERi0x".to_string(),
+            },
+        };
+        let mut hist_user = HistoryUserMessage::new("earlier", "m");
+        hist_user.user_input_message.documents = vec![doc("report")];
+        let mut current = UserInputMessage::new("now", "m");
+        current.documents = vec![doc("current")];
+        let mut state = ConversationState::new("c")
+            .with_current_message(CurrentMessage::new(current))
+            .with_history(vec![Message::User(hist_user)]);
+        assert_eq!(state.remove_history_documents(), 1);
+        if let Message::User(u) = &state.history[0] {
+            assert!(u.user_input_message.documents.is_empty());
+            assert!(
+                u.user_input_message
+                    .content
+                    .contains("Document omitted: report")
+            );
+        }
+        assert_eq!(state.current_message.user_input_message.documents.len(), 1);
+    }
 
     #[test]
     fn test_conversation_state_new() {

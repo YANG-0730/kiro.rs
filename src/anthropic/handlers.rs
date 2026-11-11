@@ -254,8 +254,19 @@ fn is_transient_upstream_error(err: &Error) -> bool {
         || is_network_error(&s)
 }
 
+/// 上游模型级过载（与 provider 的过载判定一致，重试用尽后应返回 529 overloaded_error）
 fn is_model_overloaded_error(err: &Error) -> bool {
-    err.to_string().contains("MODEL_TEMPORARILY_UNAVAILABLE")
+    let s = err.to_string();
+    // provider 过载重试路径的最终错误都带该标记
+    s.contains("模型暂时不可用")
+        || [
+            "MODEL_TEMPORARILY_UNAVAILABLE",
+            "INSUFFICIENT_MODEL_CAPACITY",
+            "SERVICE_REQUEST_RATE_EXCEEDED",
+            "unexpectedly high load",
+        ]
+        .iter()
+        .any(|m| s.contains(m))
 }
 
 /// 若错误来自上游 400 Bad Request，返回其中的上游说明（`400 Bad Request` 之后的部分）
@@ -404,6 +415,7 @@ fn adaptive_shrink_request_body(
         .any(|msg| match msg {
             crate::kiro::model::requests::conversation::Message::User(u) => {
                 !u.user_input_message.images.is_empty()
+                    || !u.user_input_message.documents.is_empty()
             }
             _ => false,
         });
@@ -486,8 +498,9 @@ fn adaptive_shrink_request_body(
                 message_content_max_chars =
                     (message_content_max_chars * 3 / 4).max(ADAPTIVE_MIN_MESSAGE_CONTENT_MAX_CHARS);
             } else if !history_images_removed && has_history_images {
-                // 第四层：仅清除历史图片，保留 current_message 图片
-                let removed = kiro_request.conversation_state.remove_history_images();
+                // 第四层：清除历史图片与历史文档（PDF 等），保留 current_message 的附件
+                let removed = kiro_request.conversation_state.remove_history_images()
+                    + kiro_request.conversation_state.remove_history_documents();
                 if removed > 0 {
                     history_images_removed = true;
                     changed = true;
@@ -2317,6 +2330,18 @@ mod tests {
             ),
         );
         assert_eq!(response.status().as_u16(), 529);
+    }
+
+    #[test]
+    fn test_all_overload_reasons_map_to_529() {
+        for e in [
+            "流式 API 请求失败（模型暂时不可用）: 429 Too Many Requests {\"reason\":\"SERVICE_REQUEST_RATE_EXCEEDED\"}",
+            "流式 API 请求失败（模型暂时不可用）: 429 Too Many Requests {\"reason\":\"INSUFFICIENT_MODEL_CAPACITY\"}",
+            "流式 API 请求失败（模型暂时不可用）: 500 Internal Server Error Encountered unexpectedly high load",
+        ] {
+            let r = map_kiro_provider_error_to_response("{}", anyhow::anyhow!("{}", e));
+            assert_eq!(r.status().as_u16(), 529, "{e}");
+        }
     }
 
     async fn error_body(response: Response) -> serde_json::Value {

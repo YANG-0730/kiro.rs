@@ -433,6 +433,12 @@ pub fn convert_request(
             &req.messages
         };
 
+    // 至少要有一条 user 消息（只有 system / assistant 的请求无效；
+    // 折叠后为空时若不拦截，下面取最后一条消息会 panic）
+    if !source_messages.iter().any(|m| m.role == "user") {
+        return Err(ConversionError::EmptyMessages);
+    }
+
     // 2.5. 预处理 prefill：如果末尾是 assistant，静默丢弃并截断到最后一条 user
     // 原因：Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持
     let messages: &[_] = if source_messages
@@ -514,8 +520,8 @@ pub fn convert_request(
         &mut remaining_image_budget,
     )?;
     // 文档名在整个请求内唯一（当前消息先占名，历史中的同名文档会加后缀）
-    let mut used_document_names = std::collections::HashSet::new();
-    let kiro_documents = attach_documents(documents, &mut text_content, &mut used_document_names);
+    let mut document_budget = DocumentBudget::new();
+    let kiro_documents = attach_documents(documents, &mut text_content, &mut document_budget);
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
@@ -536,7 +542,7 @@ pub fn convert_request(
         req,
         messages,
         BuildHistoryContext {
-            used_document_names: &mut used_document_names,
+            document_budget: &mut document_budget,
             model_id: &model_id,
             structured_thinking,
             compression_config,
@@ -976,6 +982,45 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
 /// 单请求文档上限（Kiro 实测：5 个通过，6 个返回 "Input is too long"）
 const MAX_DOCUMENTS: usize = 5;
 
+/// 整个请求的文档预算：名称去重 + 总数不超过 `MAX_DOCUMENTS`
+///
+/// 当前消息先占名额；历史文档超额时从最旧的开始换成占位说明（与历史图片超额策略一致）。
+struct DocumentBudget {
+    used_names: std::collections::HashSet<String>,
+    remaining: usize,
+    /// 历史中需要跳过（换成占位）的最旧文档数，由 build_history 计算
+    skip_oldest: usize,
+}
+
+impl DocumentBudget {
+    fn new() -> Self {
+        Self {
+            used_names: std::collections::HashSet::new(),
+            remaining: MAX_DOCUMENTS,
+            skip_oldest: 0,
+        }
+    }
+}
+
+/// 统计一组消息中会作为附件上送的 base64 文档数（含 tool_result 内嵌文档）
+fn count_base64_documents(messages: &[super::types::Message]) -> usize {
+    let is_base64 = |d: &DocumentPayload| matches!(d, DocumentPayload::Base64 { .. });
+    messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| m.content.as_array())
+        .flatten()
+        .map(|item| match item.get("type").and_then(|t| t.as_str()) {
+            Some("document") => usize::from(is_base64(&parse_document_block(item))),
+            Some("tool_result") => extract_tool_result_documents(&item.get("content").cloned())
+                .iter()
+                .filter(|d| is_base64(d))
+                .count(),
+            _ => 0,
+        })
+        .sum()
+}
+
 /// 文档名长度上限（Kiro 实测：200 通过，201 返回 INVALID_DOCUMENT_NAME）
 const MAX_DOCUMENT_NAME_CHARS: usize = 200;
 
@@ -1196,17 +1241,25 @@ fn document_placeholder_text(doc: &DocumentPayload, reason: &str) -> String {
 fn attach_documents(
     documents: Vec<DocumentPayload>,
     text_content: &mut String,
-    used_names: &mut std::collections::HashSet<String>,
+    budget: &mut DocumentBudget,
 ) -> Vec<KiroDocument> {
     let mut out: Vec<KiroDocument> = Vec::new();
     let mut notes = Vec::new();
     for doc in documents {
         match doc {
+            DocumentPayload::Base64 { .. } if budget.skip_oldest > 0 => {
+                budget.skip_oldest -= 1;
+                notes.push(document_placeholder_text(
+                    &doc,
+                    "omitted to stay within the per-request document limit; re-read the file if its content is needed",
+                ));
+            }
             DocumentPayload::Base64 {
                 ref format,
                 ref title,
                 ref data,
-            } if out.len() < MAX_DOCUMENTS => {
+            } if budget.remaining > 0 => {
+                budget.remaining -= 1;
                 let base = title
                     .as_deref()
                     .map(sanitize_document_name)
@@ -1214,7 +1267,7 @@ fn attach_documents(
                     .unwrap_or_else(|| format!("document {}", out.len() + 1));
                 let mut name = base.clone();
                 let mut n = 2;
-                while !used_names.insert(name.to_lowercase()) {
+                while !budget.used_names.insert(name.to_lowercase()) {
                     // 加后缀前先截短，保证总长不超过上游 200 字符上限
                     let suffix = format!(" ({})", n);
                     let keep = MAX_DOCUMENT_NAME_CHARS - suffix.chars().count();
@@ -1683,7 +1736,7 @@ fn has_write_or_edit_tool(req: &MessagesRequest) -> bool {
 
 struct BuildHistoryContext<'a> {
     /// 整个请求内已使用的文档名（历史与当前消息共享，保证唯一）
-    used_document_names: &'a mut std::collections::HashSet<String>,
+    document_budget: &'a mut DocumentBudget,
     model_id: &'a str,
     /// 模型是否通过结构化字段（additionalModelRequestFields.thinking）控制思考；
     /// 是则不再注入 `<thinking_mode>` 系统提示标签，避免重复
@@ -1702,7 +1755,7 @@ fn build_history(
     ctx: BuildHistoryContext<'_>,
 ) -> Result<Vec<Message>, ConversionError> {
     let BuildHistoryContext {
-        used_document_names,
+        document_budget,
         model_id,
         structured_thinking,
         compression_config,
@@ -1799,6 +1852,9 @@ fn build_history(
         .map(|m| count_images_in_content(&m.content))
         .sum();
     let mut skip_oldest = history_image_total.saturating_sub(*remaining_image_budget);
+    // 文档同理：当前消息已占用部分名额，历史超额时从最旧的文档开始换成占位
+    document_budget.skip_oldest = count_base64_documents(&messages[..history_end_index])
+        .saturating_sub(document_budget.remaining);
 
     // 收集并配对消息
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
@@ -1824,7 +1880,7 @@ fn build_history(
                     total_image_count,
                     remaining_image_budget,
                     &mut skip_oldest,
-                    used_document_names,
+                    document_budget,
                 )?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
@@ -1849,7 +1905,7 @@ fn build_history(
             total_image_count,
             remaining_image_budget,
             &mut skip_oldest,
-            used_document_names,
+            document_budget,
         )?;
         history.push(Message::User(merged_user));
 
@@ -1954,7 +2010,7 @@ fn merge_user_messages(
     total_image_count: usize,
     remaining_image_budget: &mut usize,
     skip_oldest_images: &mut usize,
-    used_document_names: &mut std::collections::HashSet<String>,
+    document_budget: &mut DocumentBudget,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut all_images = Vec::new();
@@ -1986,7 +2042,7 @@ fn merge_user_messages(
     // 历史中的文档与官方客户端一致随该条消息附加（documents[]），模型后续轮次仍能看到；
     // 文本文档内联、超额或不支持的来源留占位说明
     let mut joined = content_parts.join("\n");
-    let history_documents = attach_documents(all_documents, &mut joined, used_document_names);
+    let history_documents = attach_documents(all_documents, &mut joined, document_budget);
     let content = joined;
     // 历史 user 消息尽量避免主动补 "."：
     // 若只有非文本载荷，则保留空字符串让真实结构(images/tool_results)表达语义；
@@ -2767,6 +2823,21 @@ mod tests {
             msg("system", serde_json::json!([])),
         ]);
         assert_eq!(folded[0].content, serde_json::json!("a"));
+    }
+
+    #[test]
+    fn test_system_only_messages_rejected_without_panic() {
+        let mut req = req_with_thinking(None, None);
+        req.messages = vec![msg("system", serde_json::json!("env info"))];
+        assert!(matches!(
+            convert_request(&req, &CompressionConfig::default(), None),
+            Err(ConversionError::EmptyMessages)
+        ));
+        req.messages = vec![msg("system", serde_json::json!(""))];
+        assert!(matches!(
+            convert_request(&req, &CompressionConfig::default(), None),
+            Err(ConversionError::EmptyMessages)
+        ));
     }
 
     #[test]
@@ -3890,7 +3961,7 @@ mod tests {
             2,
             "超额的 2 个留占位说明"
         );
-        // 历史中的文档与官方客户端一致随该条历史消息附加（2026-11-11 实测 cli / cli3 均可读）
+        // 单请求文档上限是整个请求的：当前消息已占满 5 个名额，历史文档换成占位
         let hist = r
             .conversation_state
             .history
@@ -3900,17 +3971,82 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert_eq!(hist.documents.len(), 1);
+        assert!(hist.documents.is_empty());
         assert!(
-            !hist.content.contains("Document omitted"),
+            hist.content.contains("Document omitted: old"),
             "{}",
             hist.content
         );
-        // 文档名在整个请求内唯一
-        assert!(
-            !names.contains(&hist.documents[0].name.to_lowercase()),
-            "历史文档名与当前消息文档名冲突"
+        let _ = names;
+    }
+
+    #[test]
+    fn test_history_documents_share_request_budget_newest_first() {
+        use super::super::types::Message as AnthropicMessage;
+        let pdf = |t: &str| {
+            serde_json::json!({"type": "document", "title": t,
+            "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0x"}})
+        };
+        let m = |role: &str, content: serde_json::Value| AnthropicMessage {
+            role: role.to_string(),
+            content,
+        };
+        let req = doc_req(vec![
+            m(
+                "user",
+                serde_json::json!([pdf("h1"), pdf("h2"), {"type": "text", "text": "a"}]),
+            ),
+            m("assistant", serde_json::json!("ok")),
+            m(
+                "user",
+                serde_json::json!([pdf("h3"), {"type": "text", "text": "b"}]),
+            ),
+            m("assistant", serde_json::json!("ok")),
+            m(
+                "user",
+                serde_json::json!([pdf("c1"), pdf("c2"), pdf("c3"), {"type": "text", "text": "go"}]),
+            ),
+        ]);
+        let r = convert_request(&req, &CompressionConfig::default(), None).unwrap();
+        let current = &r
+            .conversation_state
+            .current_message
+            .user_input_message
+            .documents;
+        let hist: Vec<_> = r
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|m| match m {
+                Message::User(h) => Some(h.user_input_message.clone()),
+                _ => None,
+            })
+            .collect();
+        let hist_docs: usize = hist.iter().map(|h| h.documents.len()).sum();
+        assert_eq!(current.len(), 3);
+        assert_eq!(
+            current.len() + hist_docs,
+            MAX_DOCUMENTS,
+            "整个请求最多 5 个文档"
         );
+        // 最旧的 h1 被换成占位，较新的 h2 / h3 保留
+        assert!(
+            hist[0].content.contains("Document omitted: h1"),
+            "{}",
+            hist[0].content
+        );
+        assert_eq!(hist[0].documents.len(), 1);
+        assert_eq!(hist[1].documents.len(), 1);
+        // 名称在整个请求内唯一
+        let mut names: Vec<String> = current
+            .iter()
+            .chain(hist.iter().flat_map(|h| h.documents.iter()))
+            .map(|d| d.name.to_lowercase())
+            .collect();
+        let total = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), total);
     }
 
     #[test]

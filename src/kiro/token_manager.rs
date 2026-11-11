@@ -2144,6 +2144,7 @@ impl MultiTokenManager {
                             .await
                         {
                             Ok(creds) => {
+                                self.clear_refresh_failure_cooldown(id);
                                 let mut entries = self.entries.lock();
                                 if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                                     entry.refresh_failure_count = 0;
@@ -2183,14 +2184,17 @@ impl MultiTokenManager {
                                     }
                                     entries.iter().any(|e| !e.disabled && e.id != id)
                                 };
-                                // 短冷却：让后续请求先用其他凭据，避免认证服务短暂抖动时
-                                // 连续几个请求都在同一凭据上刷新失败而把它禁用
-                                self.cooldown_manager
-                                    .set_cooldown(id, CooldownReason::TokenRefreshFailed);
+                                // 有其他可用凭据时短冷却：后续请求先用其他凭据，避免认证服务短暂
+                                // 抖动时连续几个请求都在同一凭据上刷新失败而把它禁用。
+                                // 只剩这一个凭据时不冷却（冷却只会让所有请求一起失败）
+                                if has_available {
+                                    self.cooldown_manager
+                                        .set_cooldown(id, CooldownReason::TokenRefreshFailed);
+                                }
                                 tracing::warn!(
                                     credential_id = id,
                                     has_available,
-                                    "凭据 Token 刷新失败（已短暂冷却）: {}",
+                                    "凭据 Token 刷新失败: {}",
                                     err
                                 );
                                 return Err(err);
@@ -2644,6 +2648,17 @@ impl MultiTokenManager {
         }
         drop(entries);
         self.affinity.remove_by_credential(id);
+    }
+
+    /// Token 刷新成功后解除因刷新失败设置的冷却（其他原因的冷却保持不变）
+    fn clear_refresh_failure_cooldown(&self, id: u64) {
+        if matches!(
+            self.cooldown_manager.check_cooldown(id),
+            Some((CooldownReason::TokenRefreshFailed, _))
+        ) {
+            self.cooldown_manager.clear_cooldown(id);
+            tracing::info!(credential_id = id, "Token 刷新已恢复，解除刷新失败冷却");
+        }
     }
 
     /// 上游因"拒答过多"临时限制该账号（kirodotdev/Kiro #12310，按账号 + 模型生效）：
@@ -3350,6 +3365,7 @@ impl MultiTokenManager {
 
         let proxy = self.proxy.read().clone();
         let new_creds = refresh_token_with_id(&credentials, &config, proxy.as_ref(), id).await?;
+        self.clear_refresh_failure_cooldown(id);
 
         {
             let mut entries = self.entries.lock();
@@ -3830,6 +3846,7 @@ impl MultiTokenManager {
         let proxy = self.proxy.read().clone();
         match refresh_token_with_id(&credentials, &config, proxy.as_ref(), id).await {
             Ok(new_creds) => {
+                self.clear_refresh_failure_cooldown(id);
                 // 更新凭据
                 {
                     let mut entries = self.entries.lock();
