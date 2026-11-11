@@ -511,12 +511,36 @@ pub(crate) async fn get_usage_limits(
         machine_id: &machine_id,
         config,
     };
-    let usage = endpoint.usage_request_parts(&ctx)?;
-
     let client = build_client(proxy, 60, config.tls_backend)?;
-    let mut request = client.get(&usage.url);
-    for (name, value) in usage.headers {
-        request = request.header(name, value);
+
+    // 与官方 CLI 3.x 一致优先走控制面（management.{region}.kiro.dev）；失败回退 q 端点旧接口
+    if let Some(cp) = endpoint.control_plane_parts(&ctx) {
+        let mut url = format!("{}/Get-Usage-Limits?origin={}", cp.base_url, cp.origin);
+        if let Some(arn) = credentials.profile_arn.as_deref() {
+            url.push_str(&format!("&profileArn={}", urlencoding::encode(arn)));
+        }
+        match send_usage_limits_request(&client, &url, &cp.headers).await {
+            Ok(data) => {
+                tracing::debug!("使用额度经控制面获取");
+                return Ok(data);
+            }
+            Err(e) => tracing::warn!("控制面 Get-Usage-Limits 失败，回退 q 端点: {}", e),
+        }
+    }
+
+    let usage = endpoint.usage_request_parts(&ctx)?;
+    send_usage_limits_request(&client, &usage.url, &usage.headers).await
+}
+
+/// 发送一次使用额度查询并解析（控制面与 q 端点响应结构相同）
+async fn send_usage_limits_request(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &[(&'static str, String)],
+) -> anyhow::Result<UsageLimitsResponse> {
+    let mut request = client.get(url);
+    for (name, value) in headers {
+        request = request.header(*name, value.clone());
     }
 
     let response = request.send().await?;
@@ -620,36 +644,66 @@ pub(crate) async fn fetch_available_models(
         machine_id: &machine_id,
         config,
     };
+    let client = build_client(proxy, 30, config.tls_backend)?;
+    // 与官方客户端一致：有 profileArn 就带上（不再只限 Social）
+    let profile_query = credentials
+        .profile_arn
+        .as_deref()
+        .map(|arn| format!("&profileArn={}", urlencoding::encode(arn)))
+        .unwrap_or_default();
 
-    let host = format!(
-        "q.{}.amazonaws.com",
-        credentials.effective_api_region(config)
-    );
-    // origin 与对话请求一致：cli / cli3 是 KIRO_CLI（官方 CLI 以自身 origin 查询可用模型）
+    // 与官方 CLI 3.x 一致优先走控制面（management.{region}.kiro.dev）；失败回退 q 端点旧接口
+    if let Some(cp) = endpoint.control_plane_parts(&ctx) {
+        let base_url = format!(
+            "{}/List-Available-Models?origin={}{}",
+            cp.base_url, cp.origin, profile_query
+        );
+        match list_available_models_paged(&client, &base_url, &cp.headers).await {
+            Ok(data) => {
+                tracing::debug!(models = data.models.len(), "模型列表经控制面获取");
+                return Ok(data);
+            }
+            Err(e) => tracing::warn!("控制面 List-Available-Models 失败，回退 q 端点: {}", e),
+        }
+    }
+
+    // q 端点旧接口；origin 与对话请求一致：cli / cli3 是 KIRO_CLI
     let origin = match endpoint.name() {
         crate::kiro::endpoint::IDE_ENDPOINT_NAME => "AI_EDITOR",
         _ => "KIRO_CLI",
     };
-    let mut base_url = format!("https://{}/ListAvailableModels?origin={}", host, origin);
-    // 与官方客户端一致：有 profileArn 就带上（不再只限 Social）
-    if let Some(arn) = credentials.profile_arn.as_deref() {
-        base_url.push_str(&format!("&profileArn={}", urlencoding::encode(arn)));
-    }
-
+    let base_url = format!(
+        "https://q.{}.amazonaws.com/ListAvailableModels?origin={}{}",
+        credentials.effective_api_region(config),
+        origin,
+        profile_query
+    );
     let usage = endpoint.usage_request_parts(&ctx)?;
-    let client = build_client(proxy, 30, config.tls_backend)?;
+    let data = list_available_models_paged(&client, &base_url, &usage.headers).await?;
+    tracing::debug!(
+        origin,
+        models = data.models.len(),
+        "ListAvailableModels 拉取完成"
+    );
+    Ok(data)
+}
 
-    // 分页：官方客户端最多翻 10 页
+/// 分页拉取可用模型（官方客户端最多翻 10 页）；控制面与 q 端点响应结构相同
+async fn list_available_models_paged(
+    client: &reqwest::Client,
+    base_url: &str,
+    headers: &[(&'static str, String)],
+) -> anyhow::Result<crate::kiro::model::available_models::ListAvailableModelsResponse> {
     const MAX_PAGES: usize = 10;
     let mut all: Option<crate::kiro::model::available_models::ListAvailableModelsResponse> = None;
     let mut next_token: Option<String> = None;
     for _ in 0..MAX_PAGES {
         let url = match next_token.as_deref() {
             Some(t) => format!("{}&nextToken={}", base_url, urlencoding::encode(t)),
-            None => base_url.clone(),
+            None => base_url.to_string(),
         };
         let mut request = client.get(&url);
-        for (name, value) in usage.headers.iter() {
+        for (name, value) in headers {
             request = request.header(*name, value.clone());
         }
 
@@ -685,11 +739,6 @@ pub(crate) async fn fetch_available_models(
     }
     let mut data = all.ok_or_else(|| anyhow::anyhow!("ListAvailableModels 无结果"))?;
     data.next_token = None;
-    tracing::debug!(
-        origin,
-        models = data.models.len(),
-        "ListAvailableModels 拉取完成"
-    );
     Ok(data)
 }
 

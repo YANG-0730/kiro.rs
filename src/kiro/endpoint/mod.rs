@@ -21,6 +21,18 @@ pub struct UsageRequestParts {
     pub headers: Vec<(&'static str, String)>,
 }
 
+/// Kiro 控制面服务（KiroControlPlaneBearer，`management.{region}.kiro.dev`，REST-JSON）
+///
+/// 官方 CLI 3.x 的余额（`GET /Get-Usage-Limits`）与模型列表（`GET /List-Available-Models`）
+/// 走这里，参数都在 query 中。
+pub struct ControlPlaneParts {
+    /// 形如 `https://management.us-east-1.kiro.dev`
+    pub base_url: String,
+    /// 请求的 origin（官方 CLI 为 KIRO_CLI）
+    pub origin: &'static str,
+    pub headers: Vec<(&'static str, String)>,
+}
+
 pub trait KiroEndpoint: Send + Sync {
     fn name(&self) -> &'static str;
 
@@ -39,6 +51,11 @@ pub trait KiroEndpoint: Send + Sync {
     }
 
     fn usage_request_parts(&self, ctx: &RequestContext<'_>) -> anyhow::Result<UsageRequestParts>;
+
+    /// 控制面服务（余额 / 模型列表）；None 表示只走 q 端点的旧接口
+    fn control_plane_parts(&self, _ctx: &RequestContext<'_>) -> Option<ControlPlaneParts> {
+        None
+    }
 
     fn is_monthly_request_limit(&self, body: &str) -> bool {
         default_is_monthly_request_limit(body)

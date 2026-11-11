@@ -10,7 +10,7 @@ use reqwest::RequestBuilder;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use uuid::Uuid;
 
-use super::{CliEndpoint, KiroEndpoint, RequestContext, UsageRequestParts};
+use super::{CliEndpoint, ControlPlaneParts, KiroEndpoint, RequestContext, UsageRequestParts};
 use crate::kiro::model::credentials::KiroCredentials;
 
 pub const CLI3_ENDPOINT_NAME: &str = "cli3";
@@ -29,6 +29,8 @@ const Q_JS_SDK_VERSION: &str = "3.1031.0";
 /// UA 的 SDK 部分的 OS 段：KAS 运行在 Linux 上（与客户端部分的 `os/linux` 一致，
 /// 不再用 config.system_version，避免出现 win32 / linux 自相矛盾的 UA）
 const SDK_OS: &str = "linux#6.8.0";
+/// 控制面客户端 `@amzn/kiro-control-plane-bearer-client` 的版本（UA 用）
+const CONTROL_PLANE_CLIENT_VERSION: &str = "1.0.0";
 /// KRS 请求的 agentMode（Smithy 模型绑定到 `x-amzn-kiro-agent-mode` 头），官方 CLI 为 vibe
 const KRS_AGENT_MODE: &str = "vibe";
 
@@ -174,6 +176,36 @@ impl KiroEndpoint for Cli3Endpoint {
             }
         }
         Ok(serde_json::to_string(&request)?)
+    }
+
+    /// 与官方 CLI 3.2.0 一致：余额 / 模型列表走控制面 `management.{region}.kiro.dev`
+    /// （KiroControlPlaneBearerClient：Bearer + TokenType 头，origin=KIRO_CLI）
+    fn control_plane_parts(&self, ctx: &RequestContext<'_>) -> Option<ControlPlaneParts> {
+        let mut headers = vec![
+            ("Accept", "application/json".to_string()),
+            (
+                "x-amz-user-agent",
+                self.x_amz_user_agent(CONTROL_PLANE_CLIENT_VERSION),
+            ),
+            (
+                "user-agent",
+                self.user_agent(ctx, "kirocontrolplanebearer", CONTROL_PLANE_CLIENT_VERSION),
+            ),
+            ("amz-sdk-invocation-id", Uuid::new_v4().to_string()),
+            ("amz-sdk-request", "attempt=1; max=3".to_string()),
+            ("Authorization", format!("Bearer {}", ctx.token)),
+        ];
+        if let Some(token_type) = Self::token_type(ctx.credentials) {
+            headers.push(("TokenType", token_type.to_string()));
+        }
+        Some(ControlPlaneParts {
+            base_url: format!(
+                "https://management.{}.kiro.dev",
+                ctx.credentials.effective_api_region(ctx.config)
+            ),
+            origin: CLI3_ORIGIN,
+            headers,
+        })
     }
 
     fn usage_request_parts(&self, ctx: &RequestContext<'_>) -> anyhow::Result<UsageRequestParts> {

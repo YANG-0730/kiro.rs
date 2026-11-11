@@ -1664,6 +1664,41 @@ mod tests {
     }
 
     #[test]
+    fn test_cli3_control_plane_matches_official_client() {
+        let config = Config::default();
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_method = Some("idc".to_string());
+        credentials.profile_arn =
+            Some("arn:aws:codewhisperer:eu-central-1:123456789012:profile/X".to_string());
+        let machine_id = "a".repeat(64);
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "test_token",
+            machine_id: &machine_id,
+            config: &config,
+        };
+        let cp = Cli3Endpoint::new().control_plane_parts(&ctx).unwrap();
+        // 区域取自 profileArn，与官方路由一致
+        assert_eq!(cp.base_url, "https://management.eu-central-1.kiro.dev");
+        assert_eq!(cp.origin, "KIRO_CLI");
+        let header = |n: &str| {
+            cp.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(n))
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            header("authorization").as_deref(),
+            Some("Bearer test_token")
+        );
+        assert_eq!(header("tokentype").as_deref(), Some("SSO_OIDC"));
+        let ua = header("user-agent").unwrap();
+        assert!(ua.contains(" api/kirocontrolplanebearer#1.0.0 "), "{ua}");
+        // cli 端点（模拟 CLI 2.x）不走控制面
+        assert!(CliEndpoint::new().control_plane_parts(&ctx).is_none());
+    }
+
+    #[test]
     fn test_cli3_endpoint_uses_kiro_runtime_service() {
         let config = Config::default();
         let mut credentials = KiroCredentials::default();
