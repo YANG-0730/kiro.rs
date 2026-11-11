@@ -232,13 +232,28 @@ impl KiroCredentials {
     }
 
     /// 获取有效的 API Region（用于 API 请求和额度查询）
-    /// 优先级：凭据.api_region > 凭据.region > config.api_region > config.region
+    /// 优先级：凭据.api_region > profileArn 中的 region > 凭据.region > config.api_region > config.region
+    ///
+    /// profileArn 的 region 就是该 profile 所在的服务区域（官方客户端按它路由）；
+    /// 凭据.region 是 SSO / OIDC 认证所在区域，两者可能不同。
     pub fn effective_api_region<'a>(&'a self, config: &'a Config) -> &'a str {
         self.api_region
             .as_deref()
             .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.profile_arn_region())
             .or_else(|| self.region.as_deref().filter(|s| !s.trim().is_empty()))
             .unwrap_or(config.effective_api_region())
+    }
+
+    /// 从 profileArn（`arn:aws:codewhisperer:{region}:{account}:profile/{id}`）解析 region
+    fn profile_arn_region(&self) -> Option<&str> {
+        let arn = self.profile_arn.as_deref()?;
+        let mut parts = arn.split(':');
+        if parts.next()? != "arn" {
+            return None;
+        }
+        let region = parts.nth(2)?;
+        (!region.is_empty() && region.contains('-')).then_some(region)
     }
 
     /// 获取有效的代理配置
@@ -332,6 +347,26 @@ impl KiroCredentials {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_api_region_prefers_profile_arn_region() {
+        let config = Config::default();
+        let mut c = KiroCredentials {
+            region: Some("us-west-2".into()),
+            profile_arn: Some("arn:aws:codewhisperer:eu-central-1:123456789012:profile/ABC".into()),
+            ..Default::default()
+        };
+        assert_eq!(c.effective_api_region(&config), "eu-central-1");
+        c.api_region = Some("us-east-1".into());
+        assert_eq!(
+            c.effective_api_region(&config),
+            "us-east-1",
+            "显式 api_region 仍优先"
+        );
+        c.api_region = None;
+        c.profile_arn = Some("not-an-arn".into());
+        assert_eq!(c.effective_api_region(&config), "us-west-2");
+    }
     use crate::model::config::Config;
 
     #[test]

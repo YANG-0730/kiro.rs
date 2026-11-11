@@ -4,13 +4,14 @@ use serde::{Deserialize, Serialize};
 
 /// GET /ListAvailableModels 响应
 ///
-/// 上游还会返回 `defaultModel` / `nextToken` 等字段，但当前按 union 取
-/// 全部 `models`，不依赖默认模型与分页（模型量小，单页返回），故只解析
-/// `models`，其余字段由 serde 忽略。
+/// 上游还会返回 `defaultModel` 等字段，由 serde 忽略；`nextToken` 用于分页
+/// （官方客户端最多翻 10 页，见 `fetch_available_models`）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListAvailableModelsResponse {
     pub models: Vec<AvailableModelEntry>,
+    #[serde(default)]
+    pub next_token: Option<String>,
 }
 
 /// 单个可用模型条目

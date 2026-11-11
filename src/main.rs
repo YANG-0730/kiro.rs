@@ -12,7 +12,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
-use kiro::endpoint::{Cli3Endpoint, CliEndpoint, IdeEndpoint, KiroEndpoint};
+use kiro::endpoint::{
+    CLI_ENDPOINT_NAME, Cli3Endpoint, CliEndpoint, IDE_ENDPOINT_NAME, KiroEndpoint,
+};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -76,10 +78,27 @@ async fn main() {
 
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
 
+    // `ide` 端点上报的 IDE 0.11.107 已被上游截止（2026-11-09 起拒绝 IDE < 0.11.133，
+    // 其 target-less /mcp 也已 403），不再注册；旧配置 / 凭据里的 ide 自动迁移为 cli
+    {
+        let mut cfg = config.write();
+        if cfg.default_endpoint == IDE_ENDPOINT_NAME {
+            tracing::warn!("defaultEndpoint=ide 已不可用（上游已拒绝该版本），自动改用 cli");
+            cfg.default_endpoint = CLI_ENDPOINT_NAME.to_string();
+        }
+    }
+    for cred in credentials_list.iter_mut() {
+        if cred.endpoint.as_deref() == Some(IDE_ENDPOINT_NAME) {
+            tracing::warn!(
+                credential_id = ?cred.id,
+                "凭据 endpoint=ide 已不可用（上游已拒绝该版本），自动改用 cli"
+            );
+            cred.endpoint = Some(CLI_ENDPOINT_NAME.to_string());
+        }
+    }
+
     let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
     {
-        let ide: Arc<dyn KiroEndpoint> = Arc::new(IdeEndpoint::new());
-        endpoints.insert(ide.name().to_string(), ide);
         let cli: Arc<dyn KiroEndpoint> = Arc::new(CliEndpoint::new());
         endpoints.insert(cli.name().to_string(), cli);
         let cli3: Arc<dyn KiroEndpoint> = Arc::new(Cli3Endpoint::new());

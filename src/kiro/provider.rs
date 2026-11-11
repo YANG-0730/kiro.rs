@@ -1697,6 +1697,14 @@ mod tests {
             "KiroRuntimeService.GenerateAssistantResponse"
         );
         assert_eq!(built.headers().get("tokentype").unwrap(), "SSO_OIDC");
+        let ua = built.headers().get("user-agent").unwrap().to_str().unwrap();
+        assert!(ua.starts_with("aws-sdk-js/1.0.0 "), "{ua}");
+        assert!(ua.contains(" api/kiroruntime#1.0.0 "), "{ua}");
+        assert!(ua.contains(" os/linux#"), "SDK 段不应再出现 win32: {ua}");
+        assert_eq!(
+            built.headers().get("x-amzn-kiro-agent-mode").unwrap(),
+            "vibe"
+        );
         assert!(
             built
                 .headers()
@@ -1704,7 +1712,9 @@ mod tests {
                 .unwrap()
                 .to_str()
                 .unwrap()
-                .ends_with("KiroCLI/3.1.0 KAS/0.66.91 os/linux md/appVersion-3.1.0")
+                .ends_with(
+                    "KiroCLI/3.2.0 KAS/0.66.95 os/linux md/appVersion-3.2.0 app/AmazonQ-For-CLI"
+                )
         );
 
         let mcp = endpoint

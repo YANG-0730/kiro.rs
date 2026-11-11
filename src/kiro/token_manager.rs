@@ -626,46 +626,71 @@ pub(crate) async fn fetch_available_models(
         "q.{}.amazonaws.com",
         credentials.effective_api_region(config)
     );
-    let mut url = format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host);
-
-    // Social 认证需要 profileArn，IdC 不需要
-    if !matches!(
-        credentials.auth_method.as_deref(),
-        Some("builder-id") | Some("idc")
-    ) {
-        if let Some(arn) = credentials.profile_arn.as_deref() {
-            url.push_str(&format!("&profileArn={}", urlencoding::encode(arn)));
-        }
+    // origin 与对话请求一致：cli / cli3 是 KIRO_CLI（官方 CLI 以自身 origin 查询可用模型）
+    let origin = match endpoint.name() {
+        crate::kiro::endpoint::IDE_ENDPOINT_NAME => "AI_EDITOR",
+        _ => "KIRO_CLI",
+    };
+    let mut base_url = format!("https://{}/ListAvailableModels?origin={}", host, origin);
+    // 与官方客户端一致：有 profileArn 就带上（不再只限 Social）
+    if let Some(arn) = credentials.profile_arn.as_deref() {
+        base_url.push_str(&format!("&profileArn={}", urlencoding::encode(arn)));
     }
 
     let usage = endpoint.usage_request_parts(&ctx)?;
     let client = build_client(proxy, 30, config.tls_backend)?;
-    let mut request = client.get(&url);
-    for (name, value) in usage.headers {
-        request = request.header(name, value);
-    }
 
-    let response = request.send().await?;
-    let status = response.status();
-    if !status.is_success() {
-        let body_text = response.text().await.unwrap_or_default();
-        bail!(
-            "ListAvailableModels 失败: {} {}",
-            status,
-            &body_text[..body_text.len().min(200)]
-        );
-    }
+    // 分页：官方客户端最多翻 10 页
+    const MAX_PAGES: usize = 10;
+    let mut all: Option<crate::kiro::model::available_models::ListAvailableModelsResponse> = None;
+    let mut next_token: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let url = match next_token.as_deref() {
+            Some(t) => format!("{}&nextToken={}", base_url, urlencoding::encode(t)),
+            None => base_url.clone(),
+        };
+        let mut request = client.get(&url);
+        for (name, value) in usage.headers.iter() {
+            request = request.header(*name, value.clone());
+        }
 
-    let body_text = response.text().await?;
-    let data: crate::kiro::model::available_models::ListAvailableModelsResponse =
-        serde_json::from_str(&body_text).map_err(|e| {
-            tracing::error!(
-                "ListAvailableModels JSON 解析失败: {}，原始响应前200字符: {}",
-                e,
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            bail!(
+                "ListAvailableModels 失败: {} {}",
+                status,
                 &body_text[..body_text.len().min(200)]
             );
-            anyhow::anyhow!("JSON 解析失败: {}", e)
-        })?;
+        }
+
+        let body_text = response.text().await?;
+        let page: crate::kiro::model::available_models::ListAvailableModelsResponse =
+            serde_json::from_str(&body_text).map_err(|e| {
+                tracing::error!(
+                    "ListAvailableModels JSON 解析失败: {}，原始响应前200字符: {}",
+                    e,
+                    &body_text[..body_text.len().min(200)]
+                );
+                anyhow::anyhow!("JSON 解析失败: {}", e)
+            })?;
+        next_token = page.next_token.clone().filter(|t| !t.is_empty());
+        match all.as_mut() {
+            Some(acc) => acc.models.extend(page.models),
+            None => all = Some(page),
+        }
+        if next_token.is_none() {
+            break;
+        }
+    }
+    let mut data = all.ok_or_else(|| anyhow::anyhow!("ListAvailableModels 无结果"))?;
+    data.next_token = None;
+    tracing::debug!(
+        origin,
+        models = data.models.len(),
+        "ListAvailableModels 拉取完成"
+    );
     Ok(data)
 }
 

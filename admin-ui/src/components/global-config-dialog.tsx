@@ -288,7 +288,6 @@ export function GlobalConfigDialog({ open, onOpenChange }: GlobalConfigDialogPro
                   onChange={(e) => setDefaultEndpoint(e.target.value)}
                   disabled={isPending}
                 >
-                  <option value="ide">ide</option>
                   <option value="cli">cli</option>
                   <option value="cli3">cli3（CLI 3.x / KAS）</option>
                 </select>
